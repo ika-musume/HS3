@@ -2154,9 +2154,13 @@ wire    fpc_ce    = i_REDIRECT_VALID || branch_redirect || i_req_fire;  //fetch_
 wire    fpc_selbr = branch_redirect;      //fetch_pc source: branch target (over pc+2)
 wire    fp_ce     = i_req_fire || if_accept;                //fetch_pending capture
 wire    drop_ce   = i_REDIRECT_VALID || wb_fault_kill || branch_redirect || if_accept;
+//accept arm: a request FIRED at a branch-redirect edge still carries the old fetch_pc
+//(the target loads at this edge) - mark it dropped, else its response inserts as if it
+//were the branch target and a wrong-path instruction RETIRES (found by the cacheable
+//squash sweep: the +3-ahead slot leaked on every full-speed taken branch).
 wire    drop_d    = i_REDIRECT_VALID ? (if_accept ? 1'b0 : fetch_pending) :
                     wb_fault_kill    ? fetch_pending :
-                    if_accept        ? 1'b0 :
+                    if_accept        ? (branch_redirect && i_req_fire) :
                                        (fetch_pending || i_req_fire);   //fetch_drop next value
 wire    agu_hold_sel = agu_hold_base && !ma_complete; //agu_base_q source: MA 2nd-access addr
 wire    agu_ce    = agu_hold_sel || idex_allow;       //agu_base_q capture (hold-load | advance)

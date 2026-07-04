@@ -470,15 +470,29 @@ always_comb begin
             tag_we[2] = store_wb_qual && hit_w[2] && !tag_rdata[2][19];
             tag_we[3] = store_wb_qual && hit_w[3] && !tag_rdata[3][19];
         end
-        if(state == S_IFILL_WAIT && I_BUS.rsp_valid && I_BUS.rsp_ready &&
-           !I_BUS.rsp_fault && fill_word == 2'd3) begin
-            tag_wdata       = {1'b1, 1'b0, tag_of(cur_addr)};
-            tag_we[cur_way] = 1'b1;
+        //Fill tag update: completion validates the line. A mid-line FAULT instead
+        //INVALIDATES the victim way: earlier beats already overwrote its data words,
+        //and the old tag would otherwise stay valid over the half-filled line - a
+        //later access to the old address would hit CORRUPT data (victim-integrity golden).
+        if(state == S_IFILL_WAIT && I_BUS.rsp_valid && I_BUS.rsp_ready) begin
+            if(I_BUS.rsp_fault) begin
+                tag_wdata       = 21'd0;                    //kill V (and U) of the victim way
+                tag_we[cur_way] = 1'b1;
+            end
+            else if(fill_word == 2'd3) begin
+                tag_wdata       = {1'b1, 1'b0, tag_of(cur_addr)};
+                tag_we[cur_way] = 1'b1;
+            end
         end
-        if(state == S_DFILL_WAIT && I_BUS.rsp_valid && I_BUS.rsp_ready &&
-           !I_BUS.rsp_fault && fill_word == 2'd3) begin
-            tag_wdata       = {1'b1, cur_write, tag_of(cur_addr)};  //U=1 for write-allocate
-            tag_we[cur_way] = 1'b1;
+        if(state == S_DFILL_WAIT && I_BUS.rsp_valid && I_BUS.rsp_ready) begin
+            if(I_BUS.rsp_fault) begin
+                tag_wdata       = 21'd0;
+                tag_we[cur_way] = 1'b1;
+            end
+            else if(fill_word == 2'd3) begin
+                tag_wdata       = {1'b1, cur_write, tag_of(cur_addr)};  //U=1 for write-allocate
+                tag_we[cur_way] = 1'b1;
+            end
         end
         if(state == S_MMTAG_WR) begin
             //Memory-mapped tag write. Associative keeps tag+LRU, sets V/U only;
@@ -1089,8 +1103,8 @@ always_ff @(posedge i_CLK or negedge i_RST_n) begin
                 if(I_BUS.rsp_valid && I_BUS.rsp_ready) begin
                     mem_pending <= 1'b0;
                     if(I_BUS.rsp_fault) begin
-                        //A prefetch silently abandons a faulting fill (no exception);
-                        //the line is left invalid (tag not yet written).
+                        //A prefetch silently abandons a faulting fill (no exception).
+                        //The victim way is invalidated at this edge (tag control block).
                         rsp_rdata   <= 32'd0;
                         rsp_fault_d <= cur_pref ? 1'b0 : 1'b1;
                         rsp_valid_d <= 1'b1;
