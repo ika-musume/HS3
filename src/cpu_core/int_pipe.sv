@@ -213,7 +213,6 @@ end
 ifid_t  ifid;
 idex_t  idex, id_decode;
 exma_t  exma, ex_result;
-exma_t  ex_fwd_view;      //PRE-scrub view of ex_result for the ID forward selects only
 mawb_t  mawb;             //registered WB packet; commits after one full WB cycle
 mawb_t  ma_result;        //combinational MA-completion packet for MA/WB and forwarding
 
@@ -248,6 +247,27 @@ logic           ma_second_pending_agu; //the MAC/RMW second access is presenting
 //WB-fault flush); its only load is l_is_data_agu. The single-consumer idex.agu_en_mode
 //needs no copy - the AGU reads the packet field directly.
 (* preserve *) logic            idex_is_data_agu;
+
+//EX-head forward state (one set per operand port a/b/st). The lane pick is latched
+//at issue from REGISTERED compares (fwd_lane_pick). The WB view: a producer's word
+//is readable from the registered mawb packet for exactly ONE cycle (mawb zeroes on
+//non-completing cycles), so that cycle also DEPOSITS it reg->reg into the shadow
+//and flips fwd_dep_*; a longer-held consumer keeps reading the shadow. No live
+//cache/completion term enters any of these CEs, D-legs, or selects.
+fwd_lane_t      fwd_lane_a, fwd_lane_b, fwd_lane_st;    //EX-head patch source per port
+logic           fwd_wbsel_a, fwd_wbsel_b, fwd_wbsel_st; //REGISTERED "read the WB view" pick:
+                                                        //set at issue for a load release, or at
+                                                        //the producer's drain edge (exma_allow)
+                                                        //under a held consumer; self-holding
+logic           fwd_dep_a, fwd_dep_b, fwd_dep_st;       //WB word deposited in the shadow
+                                                        //(= wbsel one held-cycle later)
+logic   [31:0]  fwd_shadow_a, fwd_shadow_b, fwd_shadow_st; //deposited operand words
+//AGU-cluster duplicates of the port-a/b forward state (the ma_second_pending_agu /
+//idex_is_data_agu pattern): the AGU address mux selects read ONLY these copies so
+//the fitter can place them at the adder; D-cones mirror the originals exactly.
+(* preserve *) fwd_lane_t fwd_lane_a_agu, fwd_lane_b_agu;
+(* preserve *) logic      fwd_wbsel_a_agu, fwd_wbsel_b_agu;
+(* preserve *) logic      fwd_dep_a_agu,  fwd_dep_b_agu;
 
 assign  o_FETCH_PC = fetch_pc;
 
@@ -1243,45 +1263,37 @@ assign  ex_advance = idex.valid && ex_complete && exma_allow && !wb_kill_issue;
 logic   [31:0]  id_src_a_value, id_src_b_value, id_store_value;
 logic   [31:0]  id_mem_step;     //decoded transfer byte count for predecrement
 
-//EX-forward qualifier: valid, non-flushed EX result only. The advance handshake
-//(ex_complete=req_ready, exma_allow=ma_complete) is deliberately excluded - the ID/EX
-//capture clock-enable (idex_allow) already gates on it, so re-testing it in the value
-//select only drags the deep req_ready/ma_complete cone onto the forwarding mux.
-//PER-PORT (* keep *) duplicates (idex_allow_op* pattern): one shared copy fed all nine
-//forward selects and paid cross-cluster routing; each copy now places at its port.
-(* keep *) wire ex_fwd_en_a  = idex.valid && !(wb_valid && mawb.fault);
-(* keep *) wire ex_fwd_en_b  = idex.valid && !(wb_valid && mawb.fault);
-(* keep *) wire ex_fwd_en_st = idex.valid && !(wb_valid && mawb.fault);
 
 //===========================================================================================
-//  Operand select - LAST-LEVEL flat mux: every LATE (cen_n) word crosses exactly ONE level
+//  Operand select - LAST-LEVEL flat mux: every LATE word crosses exactly ONE level
 //===========================================================================================
-//THREE half-cycle-late data sources exist: the two GPR BRAM read words (DOA/DOB, read on
-//cen_n) and the MA load word (ld_word, response + aligner). The old chain buried the BRAM
-//words 5-7 levels deep (decoded_gpr_value -> wb overrides -> nonload_forward -> final mux).
-//Here EVERY early candidate (EX/MA forward, WB lanes, R0 mirrors, GBR/PC/imm/PREDEC
-//overrides) collapses into one early value per source, and the final mux per source is a
-//single 4:1 {ld_word, DOA, DOB, early} - one ALM level for all three late words. Selects
-//are registered-field compares (early); the DOA/DOB routing compares hz ids against the
-//cen_n read-context addresses - 1 LUT, in step with the RAM data it routes.
+//TWO late data sources remain: the GPR BRAM read words (DOA/DOB). The old third late
+//word (the MA load ld_word) and the LIVE EX-result tail no longer enter this mux at
+//all - they moved to the EX-head lanes (fwd_lane_*): the load word DEPOSITS into a
+//shadow register at its completion edge, and the EX producer's result is read from
+//the EX/MA packet one cycle later. Every early candidate here (MA forward, WB lanes,
+//R0 mirrors, GBR/PC/imm/PREDEC overrides) is a REGISTERED field, so this cone carries
+//no ALU or cache term. Final mux per source: {DOA, DOB, early} - one ALM level;
+//the DOA/DOB routing compares hz ids against the live read addresses (1 LUT).
 
-//The single late load input (shared; each source keys it with ld_hit_*). load_value
-//DIRECTLY, not ma_result.gpr0_data: ld_take implies exma.mem_op==MEM_LOAD, so the
-//(MEM_LOAD ? load_value : gpr0_data) mux in ma_result is redundant on this leg.
-wire [31:0] ld_word    = load_value;
+//MA (non-load) forward shadows - the "did the MA producer already win" selects.
+//The EX live tail and the MA load word are GONE from this mux (EX-head lanes).
+wire        ma_take_a  = ma_take_only(ifid.pd.a_used,  hz_a_id,  exma);
+wire        ma_take_b  = ma_take_only(ifid.pd.b_used,  hz_b_id,  exma);
+wire        ma_take_st = ma_take_only(ifid.pd.st_used, hz_st_id, exma);
 
-//MA load-forward select - EARLY, registered-field compares ONLY. Completion (wb-ready)
-//and fault are deliberately absent (see load_forward_active): an incomplete load keeps
-//id_issue blocked via the exma-load interlock, so a speculative pick lands only in an
-//idex packet with valid=0; a faulting load's consumer is squashed by the exception flush.
-wire        ld_hit_a   = load_forward_active(ifid.pd.a_used,  hz_a_id,  ex_fwd_en_a,  ex_fwd_view, exma);
-wire        ld_hit_b   = load_forward_active(ifid.pd.b_used,  hz_b_id,  ex_fwd_en_b,  ex_fwd_view, exma);
-wire        ld_hit_st  = load_forward_active(ifid.pd.st_used, hz_st_id, ex_fwd_en_st, ex_fwd_view, exma);
-
-//EX/MA (non-load) forward shadows - the "did an older result already win" selects.
-wire        nl_take_a  = nonload_take(ifid.pd.a_used,  hz_a_id,  ex_fwd_en_a,  ex_fwd_view, exma);
-wire        nl_take_b  = nonload_take(ifid.pd.b_used,  hz_b_id,  ex_fwd_en_b,  ex_fwd_view, exma);
-wire        nl_take_st = nonload_take(ifid.pd.st_used, hz_st_id, ex_fwd_en_st, ex_fwd_view, exma);
+//EX-head lane picks (registered compares; latched into fwd_lane_* at issue). The
+//address-op overrides mirror the sel_* steering below: GBR/PC bases never patch
+//(source a), GBR-INDEX rides source A's RAW pick (the R0 forward), and the
+//PREDEC / immediate legs never patch.
+fwd_lane_t  id_lane_a_raw, id_lane_a, id_lane_b, id_lane_st;
+assign  id_lane_a_raw = fwd_lane_pick(ifid.pd.a_used, hz_a_id, idex, exma);
+assign  id_lane_a  = (ifid.pd.agbr || ifid.pd.apc) ? FWD_NONE : id_lane_a_raw;
+assign  id_lane_b  = ifid.pd.pdec ? FWD_NONE :
+                     ifid.pd.gbrx ? id_lane_a_raw :
+                                    fwd_lane_pick(ifid.pd.b_used, hz_b_id, idex, exma);
+assign  id_lane_st = (ifid.pd.gbrx || !ifid.pd.st_used) ? FWD_NONE :
+                     fwd_lane_pick(ifid.pd.st_used, hz_st_id, idex, exma);
 
 //WB-lane in-flight overrides: the LIVE lanes (writing the file at the coming edge) plus
 //the one-cycle SHADOW lanes (wrote at the last edge - the same edge this read's address
@@ -1332,11 +1344,12 @@ wire [31:0] early_base_st = (ifid.pd.st_used && wb1_we_opst && gpr_wb1_dst == hz
                             (hz_st_id == 5'd0) ? gpr_r0_bank0 :
                             (hz_st_id == 5'd8) ? gpr_r0_bank1 : 32'd0;
 
-//EARLY value per source: EX > MA > base residue (nonload_forward, proven priority). The
-//EX leg is the live ALU tail (10 ns budget) - it crosses this mux + the final 4:1 only.
-wire [31:0] early_src_a  = nonload_forward(early_base_a,  ifid.pd.a_used,  hz_a_id,  ex_fwd_en_a,  ex_fwd_view, exma);
-wire [31:0] early_src_b  = nonload_forward(early_base_b,  ifid.pd.b_used,  hz_b_id,  ex_fwd_en_b,  ex_fwd_view, exma);
-wire [31:0] early_src_st = nonload_forward(early_base_st, ifid.pd.st_used, hz_st_id, ex_fwd_en_st, ex_fwd_view, exma);
+//EARLY value per source: MA > base residue. The EX live tail is GONE from here
+//(EX-head lanes read the registered exma packet at the consumer's own EX cycle),
+//so every input of this mux is a REGISTERED field - no ALU/cache cone remains.
+wire [31:0] early_src_a  = ma_forward(early_base_a,  ifid.pd.a_used,  hz_a_id,  exma);
+wire [31:0] early_src_b  = ma_forward(early_base_b,  ifid.pd.b_used,  hz_b_id,  exma);
+wire [31:0] early_src_st = ma_forward(early_base_st, ifid.pd.st_used, hz_st_id, exma);
 
 //BRAM word routing: which read port carries this source id (port A wins on a double
 //match, = decoded_gpr_value's order). Compares run against the LIVE read addresses, NOT
@@ -1351,14 +1364,16 @@ wire        dob_hit_b  = hz_b_id  == gpr_read1_address;
 wire        doa_hit_st = hz_st_id == gpr_read0_address;
 wire        dob_hit_st = hz_st_id == gpr_read1_address;
 
-//Source resolution WITHOUT the addr_op overrides (= the old fwd_result/nl chain order:
-//ld > doa > dob > early; every forward/WB hit falls through to the early leg).
-wire        src_doa_a  = !nl_take_a  && !wb_hit_a  && !ld_hit_a  && doa_hit_a;
-wire        src_dob_a  = !nl_take_a  && !wb_hit_a  && !ld_hit_a  && !doa_hit_a  && dob_hit_a;
-wire        src_doa_b  = !nl_take_b  && !wb_hit_b  && !ld_hit_b  && doa_hit_b;
-wire        src_dob_b  = !nl_take_b  && !wb_hit_b  && !ld_hit_b  && !doa_hit_b  && dob_hit_b;
-wire        src_doa_st = !nl_take_st && !wb_hit_st && !ld_hit_st && doa_hit_st;
-wire        src_dob_st = !nl_take_st && !wb_hit_st && !ld_hit_st && !doa_hit_st && dob_hit_st;
+//Source resolution WITHOUT the addr_op overrides (doa > dob > early; an MA-forward
+//or WB hit falls through to the early leg). An EX-forward or load hit no longer
+//steers here: the stale RAM/early word lands in idex.src_* and the EX-head lane
+//overrides it at the consumer's EX, so this cone carries no idex/ex compare.
+wire        src_doa_a  = !ma_take_a  && !wb_hit_a  && doa_hit_a;
+wire        src_dob_a  = !ma_take_a  && !wb_hit_a  && !doa_hit_a  && dob_hit_a;
+wire        src_doa_b  = !ma_take_b  && !wb_hit_b  && doa_hit_b;
+wire        src_dob_b  = !ma_take_b  && !wb_hit_b  && !doa_hit_b  && dob_hit_b;
+wire        src_doa_st = !ma_take_st && !wb_hit_st && doa_hit_st;
+wire        src_dob_st = !ma_take_st && !wb_hit_st && !doa_hit_st && dob_hit_st;
 
 //addr_op overrides. GBR-INDEX redirects src_b onto SOURCE A's resolution (the R0 forward,
 //old ovr_b_val=fwd_result_a) - done by steering b's SELECTS to a's, so no extra level.
@@ -1372,49 +1387,45 @@ wire        addr_b_pdec = ifid.pd.pdec;
 wire        st_use_imm  = ifid.pd.gbrx || !ifid.pd.st_used;
 
 //Final-mux selects (2-bit priority encoders, EARLY) and the collapsed early legs.
-wire [1:0]  sel_a  = (!addr_a_ovr && ld_hit_a ) ? 2'd0 :
-                     (!addr_a_ovr && src_doa_a) ? 2'd1 :
+//The ld_word input is GONE (2'd0 unreachable): the load word deposits into the
+//EX-head shadow register instead, so only the two GPR BRAM words remain late.
+wire [1:0]  sel_a  = (!addr_a_ovr && src_doa_a) ? 2'd1 :
                      (!addr_a_ovr && src_dob_a) ? 2'd2 : 2'd3;
 wire [31:0] early_a_final  = addr_a_gbr ? i_GBR :
                              addr_a_pc  ? 32'd0 : early_src_a;    //PC-rel addr rides the immediate
 
 wire [1:0]  sel_b  = addr_b_pdec                                          ? 2'd3 :
-                     (addr_b_gbrx ? ld_hit_a  : ifid.pd.b_used && ld_hit_b ) ? 2'd0 :
                      (addr_b_gbrx ? src_doa_a : ifid.pd.b_used && src_doa_b) ? 2'd1 :
                      (addr_b_gbrx ? src_dob_a : ifid.pd.b_used && src_dob_b) ? 2'd2 : 2'd3;
 wire [31:0] early_b_final  = addr_b_pdec    ? (~id_mem_step + 32'd1) :    //-step for @-Rn
                              addr_b_gbrx    ? early_src_a :
                              ifid.pd.b_used ? early_src_b : id_decode.immediate;
 
-wire [1:0]  sel_st = (!st_use_imm && ld_hit_st ) ? 2'd0 :
-                     (!st_use_imm && src_doa_st) ? 2'd1 :
+wire [1:0]  sel_st = (!st_use_imm && src_doa_st) ? 2'd1 :
                      (!st_use_imm && src_dob_st) ? 2'd2 : 2'd3;
 wire [31:0] early_st_final = st_use_imm ? id_decode.immediate : early_src_st;
 
 //Flat muxes as EXPLICIT case statements (one always_comb per source) so each maps to a
-//single 4:1 - one ALM level per bit. ALL THREE late words are direct data inputs.
+//single ALM level per bit. BOTH late words (the GPR BRAM ports) are direct data inputs.
 always_comb begin
     case(sel_a)
-        2'd0:    id_src_a_value = ld_word;          //MA load forward (late)
         2'd1:    id_src_a_value = gpr_read_data_a;  //GPR BRAM port A (late)
         2'd2:    id_src_a_value = gpr_read_data_b;  //GPR BRAM port B (late)
-        default: id_src_a_value = early_a_final;    //forwards/WB/mirrors/GBR/PC (early)
+        default: id_src_a_value = early_a_final;    //MA-forward/WB/mirrors/GBR/PC (early)
     endcase
 end
 always_comb begin
     case(sel_b)
-        2'd0:    id_src_b_value = ld_word;          //MA load forward (late; GBR-index = a's)
         2'd1:    id_src_b_value = gpr_read_data_a;  //GPR BRAM port A (late)
         2'd2:    id_src_b_value = gpr_read_data_b;  //GPR BRAM port B (late)
-        default: id_src_b_value = early_b_final;    //PREDEC step/forwards/imm (early)
+        default: id_src_b_value = early_b_final;    //PREDEC step/MA-forward/imm (early)
     endcase
 end
 always_comb begin
     case(sel_st)
-        2'd0:    id_store_value = ld_word;          //MA load forward (late)
         2'd1:    id_store_value = gpr_read_data_a;  //GPR BRAM port A (late)
         2'd2:    id_store_value = gpr_read_data_b;  //GPR BRAM port B (late)
-        default: id_store_value = early_st_final;   //forwards/imm (early)
+        default: id_store_value = early_st_final;   //MA-forward/imm (early)
     endcase
 end
 
@@ -1492,9 +1503,45 @@ logic   [31:0]  shdyn_s0, shdyn_s1, shdyn_s2, shdyn_s3, shdyn_s4; //barrel stage
 logic   [31:0]  shdyn_shifted;        //barrel output before output reversal
 logic   [31:0]  shdyn_result;         //final SHAD/SHLD result in natural bit order
 
-assign ex_a     = idex.src_a_value;
-assign ex_b     = idex.src_b_value;
-assign ex_store = idex.store_value;
+//EX-head operand patch - the registered forward lanes replace the old ID-mux LIVE
+//legs (the ex_result ALU tail and the ld_word aligner).
+//WB-view leg per port: the producer's word read from the registered mawb packet on
+//its one live cycle (lane FWD_WB at issue = load release; or a G0/G1 producer that
+//drained under a held consumer - fwd_wbsel_* REGISTERS that decision at the drain
+//edge), then from the deposited shadow. Selects are single FFs and the data legs
+//are FFs, so the hot G0/G1/idex legs cross ONE 4:1 level and the WB leg two.
+wire [31:0] fwd_mawb_word_a  = fwd_lane_a  == FWD_EXMA_G1 ? mawb.gpr1_data : mawb.gpr0_data;
+wire [31:0] fwd_mawb_word_b  = fwd_lane_b  == FWD_EXMA_G1 ? mawb.gpr1_data : mawb.gpr0_data;
+wire [31:0] fwd_mawb_word_st = fwd_lane_st == FWD_EXMA_G1 ? mawb.gpr1_data : mawb.gpr0_data;
+wire [31:0] fwd_wb_a  = fwd_dep_a  ? fwd_shadow_a  : fwd_mawb_word_a;
+wire [31:0] fwd_wb_b  = fwd_dep_b  ? fwd_shadow_b  : fwd_mawb_word_b;
+wire [31:0] fwd_wb_st = fwd_dep_st ? fwd_shadow_st : fwd_mawb_word_st;
+//AGU-cluster twins of the a/b WB folds, from the (* preserve *) duplicates, so
+//the address mux places at the adder (32-bit data legs are shared nets).
+wire [31:0] agu_wb_a = fwd_dep_a_agu ? fwd_shadow_a :
+                       (fwd_lane_a_agu == FWD_EXMA_G1 ? mawb.gpr1_data : mawb.gpr0_data);
+wire [31:0] agu_wb_b = fwd_dep_b_agu ? fwd_shadow_b :
+                       (fwd_lane_b_agu == FWD_EXMA_G1 ? mawb.gpr1_data : mawb.gpr0_data);
+always_comb begin
+    case(fwd_wbsel_a ? FWD_WB : fwd_lane_a)
+        FWD_EXMA_G0: ex_a = exma.gpr0_data;      //producer result, one stage ahead
+        FWD_EXMA_G1: ex_a = exma.gpr1_data;      //producer address update
+        FWD_WB:      ex_a = fwd_wb_a;            //mawb word / deposited shadow
+        default:     ex_a = idex.src_a_value;    //ID-resolved operand
+    endcase
+    case(fwd_wbsel_b ? FWD_WB : fwd_lane_b)
+        FWD_EXMA_G0: ex_b = exma.gpr0_data;
+        FWD_EXMA_G1: ex_b = exma.gpr1_data;
+        FWD_WB:      ex_b = fwd_wb_b;
+        default:     ex_b = idex.src_b_value;
+    endcase
+    case(fwd_wbsel_st ? FWD_WB : fwd_lane_st)
+        FWD_EXMA_G0: ex_store = exma.gpr0_data;
+        FWD_EXMA_G1: ex_store = exma.gpr1_data;
+        FWD_WB:      ex_store = fwd_wb_st;
+        default:     ex_store = idex.store_value;
+    endcase
+end
 
 always_comb begin
     //Forward the older EX/MA T value, including a completing byte-memory test.
@@ -1754,11 +1801,27 @@ always_comb begin
         default:   ea_step = 32'd4;
     endcase
 
-    ea_addr_base     = agu_base_q;  //single registered net into the AGU base (= idex.src_a_value,
-                                    //or the held MAC/RMW second-access address while dispatching)
-    ea_addr_addend   = ex_b;        //registered operand straight to i_AGU_B; the AGU en-gate (driven
-                                    //by the PRE-DECODED idex.agu_en_mode) NULLs it for REG/POSTINC/MAC,
-                                    //so no EX addr_op decode sits on the addend -> o_ADDR carry cone.
+    //AGU base: agu_base_q keeps the idex.src_a leg role (same D/CE plus the MAC/RMW
+    //second-access hold-load); the EX-head lanes patch it exactly like ex_a. A
+    //second-access DISPATCH forces the held address via ma_second_pending_agu
+    //(= second_access && !req_sent, both FFs), so no live handshake rides this
+    //select; the lane/dep terms read the AGU-cluster (* preserve *) duplicates.
+    case(ma_second_pending_agu ? FWD_NONE : (fwd_wbsel_a_agu ? FWD_WB : fwd_lane_a_agu))
+        FWD_EXMA_G0: ea_addr_base = exma.gpr0_data;
+        FWD_EXMA_G1: ea_addr_base = exma.gpr1_data;
+        FWD_WB:      ea_addr_base = agu_wb_a;
+        default:     ea_addr_base = agu_base_q;   //ID-resolved base / held 2nd-access addr
+    endcase
+    //Addend: same lane patch on the b port, from its own AGU-cluster duplicates
+    //(ea_addr_addend used to alias ex_b; a shared net dragged the ALU cluster's
+    //placement onto the adder). The en-gate (PRE-DECODED idex.agu_en_mode) still
+    //NULLs it for REG/POSTINC/MAC, so no EX addr_op decode sits on the carry cone.
+    case(fwd_wbsel_b_agu ? FWD_WB : fwd_lane_b_agu)
+        FWD_EXMA_G0: ea_addr_addend = exma.gpr0_data;
+        FWD_EXMA_G1: ea_addr_addend = exma.gpr1_data;
+        FWD_WB:      ea_addr_addend = agu_wb_b;
+        default:     ea_addr_addend = idex.src_b_value;
+    endcase
     ea_update_addend = ea_step;
 
     //effective_addr is exactly that one sum (= ex_a when the addend is zero), so no
@@ -1981,19 +2044,6 @@ always_comb begin
     end
 end
 
-//PRE-scrub forward view: the scrub above zeroes gpr*_we/mem_op under ex_result.fault,
-//which folds address_error = the live AGU output - so every ID forward select consuming
-//those FIELDS inherited the AGU cone even after its explicit fault test was cut (fit5:
-//AGU -> ex_g1/ex_take -> sel_b survived round 5a). The view restores the registered idex
-//controls for the nine forward selects ONLY; the EX/MA capture keeps the scrubbed
-//ex_result, so a faulting instruction still cannot change architectural state. Discard
-//argument as in load_forward_active: the flushed ID consumer never retires the value.
-always_comb begin
-    ex_fwd_view         = ex_result;
-    ex_fwd_view.gpr0_we = idex.gpr0_we;
-    ex_fwd_view.gpr1_we = idex.gpr1_we;
-    ex_fwd_view.mem_op  = idex.mem_op;
-end
 
 
 ///////////////////////////////////////////////////////////
@@ -2414,6 +2464,21 @@ always_ff @(posedge i_CLK or negedge i_RST_n) begin
         ifid.pd          <= '0;
         idex.valid          <= 1'b0;
         idex.delay_slot     <= 1'b0;
+        fwd_lane_a          <= FWD_NONE;   //EX-head lane picks (shadow words = R7 strip)
+        fwd_lane_b          <= FWD_NONE;
+        fwd_lane_st         <= FWD_NONE;
+        fwd_lane_a_agu      <= FWD_NONE;
+        fwd_lane_b_agu      <= FWD_NONE;
+        fwd_wbsel_a         <= 1'b0;
+        fwd_wbsel_b         <= 1'b0;
+        fwd_wbsel_st        <= 1'b0;
+        fwd_wbsel_a_agu     <= 1'b0;
+        fwd_wbsel_b_agu     <= 1'b0;
+        fwd_dep_a           <= 1'b0;
+        fwd_dep_b           <= 1'b0;
+        fwd_dep_st          <= 1'b0;
+        fwd_dep_a_agu       <= 1'b0;
+        fwd_dep_b_agu       <= 1'b0;
         idex.src_a_used     <= 1'b0;
         idex.src_a_id       <= 5'd0;
         idex.src_b_used     <= 1'b0;
@@ -2555,6 +2620,21 @@ always_ff @(posedge i_CLK or negedge i_RST_n) begin
         if(i_REDIRECT_VALID) begin
             idex          <= '0;
             idex_is_data_agu <= 1'b0;
+            fwd_lane_a    <= FWD_NONE;
+            fwd_lane_b    <= FWD_NONE;
+            fwd_lane_st   <= FWD_NONE;
+            fwd_lane_a_agu<= FWD_NONE;
+            fwd_lane_b_agu<= FWD_NONE;
+            fwd_wbsel_a   <= 1'b0;
+            fwd_wbsel_b   <= 1'b0;
+            fwd_wbsel_st  <= 1'b0;
+            fwd_wbsel_a_agu <= 1'b0;
+            fwd_wbsel_b_agu <= 1'b0;
+            fwd_dep_a     <= 1'b0;
+            fwd_dep_b     <= 1'b0;
+            fwd_dep_st    <= 1'b0;
+            fwd_dep_a_agu <= 1'b0;
+            fwd_dep_b_agu <= 1'b0;
             exma          <= '0;
             mawb          <= '0;
             fault_hold    <= 1'b0;
@@ -2720,12 +2800,67 @@ always_ff @(posedge i_CLK or negedge i_RST_n) begin
                                                            : exma.mem_addr)
                                            : id_src_a_value;
 
+            //EX-head forward state. Lanes latch at issue. fwd_wbsel_* REGISTERS the
+            //"read the WB view" pick so the operand/AGU mux selects are single FFs:
+            //set at issue for a load release (id_lane == FWD_WB), or at the
+            //producer's drain edge (exma_allow under a held consumer; self-holds).
+            //The shadow captures the mawb word on the first wbsel cycle (reg->reg,
+            //CE from FFs only); fwd_dep_* = wbsel one held-cycle later flips the
+            //fold from the one-live-cycle mawb word to the parked shadow. The deep
+            //idex_allow/exma_allow cones ride ONLY these 1-bit Ds.
+            if(!fwd_dep_a  && fwd_wbsel_a ) fwd_shadow_a  <= fwd_mawb_word_a;
+            if(!fwd_dep_b  && fwd_wbsel_b ) fwd_shadow_b  <= fwd_mawb_word_b;
+            if(!fwd_dep_st && fwd_wbsel_st) fwd_shadow_st <= fwd_mawb_word_st;
+            if(idex_allow) begin
+                fwd_lane_a      <= id_lane_a;
+                fwd_lane_b      <= id_lane_b;
+                fwd_lane_st     <= id_lane_st;
+                fwd_lane_a_agu  <= id_lane_a;
+                fwd_lane_b_agu  <= id_lane_b;
+                fwd_wbsel_a     <= id_lane_a  == FWD_WB;
+                fwd_wbsel_b     <= id_lane_b  == FWD_WB;
+                fwd_wbsel_st    <= id_lane_st == FWD_WB;
+                fwd_wbsel_a_agu <= id_lane_a  == FWD_WB;
+                fwd_wbsel_b_agu <= id_lane_b  == FWD_WB;
+                fwd_dep_a       <= 1'b0;
+                fwd_dep_b       <= 1'b0;
+                fwd_dep_st      <= 1'b0;
+                fwd_dep_a_agu   <= 1'b0;
+                fwd_dep_b_agu   <= 1'b0;
+            end
+            else begin
+                //held consumer: the drain edge switches the port to the WB view
+                if(fwd_lane_a  != FWD_NONE && exma_allow) begin
+                    fwd_wbsel_a <= 1'b1; fwd_wbsel_a_agu <= 1'b1; end
+                if(fwd_lane_b  != FWD_NONE && exma_allow) begin
+                    fwd_wbsel_b <= 1'b1; fwd_wbsel_b_agu <= 1'b1; end
+                if(fwd_lane_st != FWD_NONE && exma_allow) fwd_wbsel_st <= 1'b1;
+                if(fwd_wbsel_a ) begin fwd_dep_a  <= 1'b1; fwd_dep_a_agu <= 1'b1; end
+                if(fwd_wbsel_b ) begin fwd_dep_b  <= 1'b1; fwd_dep_b_agu <= 1'b1; end
+                if(fwd_wbsel_st) fwd_dep_st <= 1'b1;
+            end
+
             //Recognized WB fault kills younger packets and blocks further requests.
             //u_ma_seq clears its own state from ma_flush (= this same condition).
             //ifid / fetch_drop moved to the railed capture block below (folded in).
             if(wb_valid && mawb.fault) begin
                 idex          <= '0;
                 idex_is_data_agu <= 1'b0;
+                fwd_lane_a    <= FWD_NONE;
+                fwd_lane_b    <= FWD_NONE;
+                fwd_lane_st   <= FWD_NONE;
+                fwd_lane_a_agu<= FWD_NONE;
+                fwd_lane_b_agu<= FWD_NONE;
+                fwd_wbsel_a   <= 1'b0;
+                fwd_wbsel_b   <= 1'b0;
+                fwd_wbsel_st  <= 1'b0;
+                fwd_wbsel_a_agu <= 1'b0;
+                fwd_wbsel_b_agu <= 1'b0;
+                fwd_dep_a     <= 1'b0;
+                fwd_dep_b     <= 1'b0;
+                fwd_dep_st    <= 1'b0;
+                fwd_dep_a_agu <= 1'b0;
+                fwd_dep_b_agu <= 1'b0;
                 exma          <= '0;
                 mawb          <= '0;
                 mac_started       <= 1'b0;
