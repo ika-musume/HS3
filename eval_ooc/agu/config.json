@@ -1,0 +1,23 @@
+{
+  "project_name": "agu",
+  "top_module": "agu_ooc_top",
+  "top_source": "agu_ooc_top.sv",
+  "sources": [
+    "../../src/cpu_core/agu.sv",
+    "agu_ooc_top.sv"
+  ],
+  "clock_port": "i_CLK_p",
+  "clock_ports": [
+    "i_CLK_p"
+  ],
+  "reset_ports": [],
+  "clock_mhz": 200.0,
+  "critical_paths": 20,
+  "quartus": {
+    "family": "Cyclone V",
+    "device": "5CSEBA6U23I7",
+    "docker_image": "raetro/quartus:17.0",
+    "revision": "agu_quartus_ooc",
+    "run_name": "quartus_cyclonev_agu_200"
+  }
+}

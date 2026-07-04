@@ -1,0 +1,18 @@
+`verilator_config
+//lint waivers scoped to simulation-only files - design sources under src/
+//stay fully linted, any warning there still fails the build
+
+//testbenches: opcode-builder helpers use sloppy widths; HS3_tb dmem has two
+//clocked writer blocks (grid-aligned vs SDRAM-side) that never overlap
+lint_off -rule WIDTHEXPAND -file "*_tb.sv"
+lint_off -rule WIDTHTRUNC  -file "*_tb.sv"
+lint_off -rule MULTIDRIVEN -file "*_tb.sv"
+
+//vendor memory models (patched copies, recipe in sim/models/*.verilator.patch)
+lint_off -rule WIDTHEXPAND -file "*/sim/models/*"
+lint_off -rule WIDTHTRUNC  -file "*/sim/models/*"
+lint_off -rule RISEFALLDLY -file "*/sim/models/*"
+lint_off -rule INITIALDLY  -file "*/sim/models/*"
+lint_off -rule MULTIDRIVEN -file "*/sim/models/*"
+lint_off -rule REALCVT     -file "*/sim/models/*"
+lint_off -rule UNSIGNED    -file "*/sim/models/*"
