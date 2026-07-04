@@ -144,9 +144,9 @@ bubble (the no-bubbles rule).
 
 | Workload | Retires / cycles | IPC | Meaning |
 |---|---|---|---|
-| Straight-line NOPs, **non-cacheable** (P2 bypass) | 201 / 706 | **0.285** | front-end fetch ceiling with the halfword-reuse buffer |
-| Dependent add loop, **cacheable hit** | 1147 / 1167 | **0.983** | ≈ 1.0; the 1.7 % gap is the 2 taken-branch bubbles per iteration |
-| 100 %-store loop, **cacheable hit** | 418 / 827 | **0.505** | the 0.5 unified-single-port ceiling (each store = 1 fetch + 1 data-port cycle) |
+| Straight-line NOPs, **non-cacheable** (P2 bypass) | 201 / 706 | **0.284** | front-end fetch ceiling with the halfword-reuse buffer |
+| Dependent add loop, **cacheable hit** | 1137 / 1167 | **0.974** | ≈ 1.0; the 2.6 % gap is the 2 taken-branch bubbles per iteration |
+| 100 %-store loop, **cacheable hit** | 414 / 848 | **0.488** | the 0.5 unified-single-port ceiling (each store = 1 fetch + 1 data-port cycle) |
 
 The bypass path was lifted 0.199 → 0.285 by a **halfword-reuse buffer** (`ibyp_buf_*`
 in `cache.sv`): a non-cacheable longword read serves its sibling halfword from a
@@ -327,25 +327,43 @@ false-paths on the M10K RDW arcs):
 | Configuration | Worst slack @ 10 ns | Fmax |
 |---|---|---|
 | Core only, single-clock port (sclk fit4) | −2.556 ns | 79.64 MHz |
-| Core only, after operand/hazard predecode (rounds 5–7) | −2.085 ns (seed 3) | **82.75 MHz** |
-| Full SoC + peripherals (RTC session) | −2.329 ns | 81.11 MHz |
+| Core only, pre-forwarding baseline (seed 3) | −2.488 ns | 80.08 MHz |
+| Core only, **EX-head forwarding (v3, seed 3)** | −2.472 ns | **80.18 MHz** |
+| Full SoC + peripherals (RTC session, seed 3) | −2.273 ns | 81.11 MHz |
+| Full SoC + peripherals (**v3, seed 3**) | −2.252 ns | **81.62 MHz** |
 
-The remaining walls are the **architecture's protected single-cycle loops** — they
-cannot be pipelined without inserting a bubble, which the IPC-first rule forbids:
+> The older "82.75 MHz (rounds 5–7)" figure is **not reproducible** on the current
+> tree under the same flow — ~80.1 MHz is the real core-only baseline. Judge progress
+> by worst-slack and cone composition, not coarse Fmax (fit noise is ±0.4 ns; seeds
+> 1/5/7 all fitted worse than seed 3 on v3). The 85 MHz gate corresponds to worst
+> slack ≥ **−1.765 ns** @ 10 ns.
 
-1. **ALU→forward loop:** `idex.alu_op` → dynamic shifter → `alu_result` → EX-forward
-   → operand-select → operand capture (a full-budget path by design).
-2. **Load-use loop:** cache tag-compare → `ld_word` (aligner) → operand forward — the
-   1-cycle load-use path.
-3. **MA-forward loop:** `exma.*` → `idex.src` — the memory-stage result forward.
+**EX-head forwarding (v3)** moved the live forwarding legs (the `ex_result` ALU tail
+and the `ld_word` load aligner) out of the ID operand mux and onto per-port
+*registered lanes* patched at the head of EX (with WB-view deposit shadows). Every
+forward mux-select is now a single FF and every data leg launches from a register.
+This deleted the three protected forwarding loops from every top-20 path — but it is
+timing-neutral overall (bit-exact, IPC-identical), because the plateau is now set by
+two **cache-side** walls at the same depth. Both are single-cycle protected loops:
+they cannot be pipelined without a bubble, which the IPC-first rule forbids.
 
-Three independent experiments confirmed saturation: max CAD effort produced a
-bit-identical result; class-kill rounds only rotate the plateau ±0.4 ns; and a clean
-structural kill of the worst class (async-read MLAB GPR) *net-regressed* because it
-congested the operand LAB neighborhood. The operand cluster is congestion-bound, not
-logic-bound. Plausible remaining levers toward 100 MHz: a LogicLock floorplan pin of
-the operand cluster, or a C6 speed grade if the board allows — **not** an operand-
-capture pipeline beat (that would break cycle accuracy).
+1. **Wall A — I-response → GPR read-ahead** (~−2.4…−2.5 ns; ~10 levels, ~60 %
+   interconnect): cache I-side response formation (`bram_addr` → RAM `q` / way select
+   / word select → `rsp_inst`) → predecode (`nx_inst` / `pd_fetch`) → the 2R2W GPR
+   read-ahead address (`portb_address_reg`). The read-ahead must capture at the IF/ID
+   edge (operands are needed during ID), so no bubble is allowed.
+2. **Wall B — request → cache FSM/captures** (~−2.2…−2.5 ns; SoC worst): the request
+   cone (`mawb.gpr0_data`, `fwd_*_agu`, `second_access_agu`, `exma.valid`) → AGU adder
+   → `req_addr` / `req_valid` → cache lookup index and FSM next-state
+   (`S_FLUSH` / `S_DBYP_REQ` / `S_STORE_WR`) plus the write-through bypass captures
+   (`byp_q`). The AGU's +1-level WB-leg tax lands on this cone.
+
+Levers under investigation toward 100 MHz: shorten the cache I-response way/word
+select feeding predecode, or feed the GPR read-ahead from a narrower early slice of
+the response (Wall A); shallow-grant / late-select the FSM next-state on a narrow
+index decode, or cut the request carry-chain high bits out of the FSM cone (Wall B).
+Fallbacks remain a LogicLock floorplan pin or a C6 speed grade — **not** an operand-
+or address-capture pipeline beat (that would break cycle accuracy).
 
 ---
 
