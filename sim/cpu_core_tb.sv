@@ -169,8 +169,11 @@ logic           mem_is_data;     //captured: serviced transaction is a data acce
 logic           mem_is_fault;
 integer         mem_wait_cnt;
 
-//I/D discriminator for the shared bus (test probe into the DUT's cache FSM).
-wire            req_is_data = u_dut.u_cache.cur_is_data;
+//I/D discriminator for the shared bus (test probe into the DUT's cache FSM). A WRITE
+//is always data-side: a background wb-buffer drain dispatches from an idle edge where
+//cur_is_data holds junk (speculative capture), and a mislabeled drain write would be
+//dropped here, masking DUT coherency bugs. Reads keep the cur_is_data label (fills).
+wire            req_is_data = u_dut.u_cache.cur_is_data || MEM_BUS.req_write;
 
 assign MEM_BUS.req_ready = !mem_pending && !MEM_BUS.rsp_valid;
 
@@ -681,7 +684,7 @@ endtask
 task automatic bench_ipc_store(input integer nstores, input integer iters);
     integer idx, j, loop_idx, bf_idx, sentinel_idx, disp, guard;
     begin
-        cacheable_bootstrap;
+        cacheable_bootstrap(8'h09);   // write-back mode
         idx = 'h20;
         imem[idx] = 16'hE702;                  idx = idx + 1; // MOV   #2,R7
         imem[idx] = 16'h4718;                  idx = idx + 1; // SHLL8 R7      ; R7 = 0x200 (cacheable)
@@ -728,17 +731,18 @@ endtask
 //cacheable P0 longword (dmem index 0x40) distinct from the P0 code at 0x40 (byte addr).
 //
 //Shared bootstrap: run from P2 (bypass) at reset, enable the unified cache, JMP to P0.
-task automatic cacheable_bootstrap;
+//ccr_val picks the write policy: 8'h09 = CE|CF (write-back), 8'h0B = CE|WT|CF (write-through).
+task automatic cacheable_bootstrap(input logic [7:0] ccr_val);
     begin
         clear_imem;
-        imem[0] = 16'hE0EC; // MOV   #0xEC,R0  ; R0 = 0xFFFFFFEC (CCR); 0xEC sign-extends
-        imem[1] = 16'hE109; // MOV   #9,R1     ; CCR.CE=1 | CCR.CF=1 (flush stale lines first)
-        imem[2] = 16'h2012; // MOV.L R1,@R0    ; enable the unified cache + flush
-        imem[3] = 16'h0009; // NOP             ; let the CCR write settle
-        imem[4] = 16'h0009; // NOP
-        imem[5] = 16'hE240; // MOV   #0x40,R2  ; P0 cacheable entry (byte addr 0x40 = idx 0x20)
-        imem[6] = 16'h422B; // JMP   @R2
-        imem[7] = 16'h0009; // NOP             ; JMP delay slot
+        imem[0] = 16'hE0EC;             // MOV   #0xEC,R0  ; R0 = 0xFFFFFFEC (CCR); 0xEC sign-extends
+        imem[1] = 16'hE100 | ccr_val;   // MOV   #ccr,R1   ; CCR.CE=1 | CCR.CF=1 (flush stale lines first)
+        imem[2] = 16'h2012;             // MOV.L R1,@R0    ; enable the unified cache + flush
+        imem[3] = 16'h0009;             // NOP             ; let the CCR write settle
+        imem[4] = 16'h0009;             // NOP
+        imem[5] = 16'hE240;             // MOV   #0x40,R2  ; P0 cacheable entry (byte addr 0x40 = idx 0x20)
+        imem[6] = 16'h422B;             // JMP   @R2
+        imem[7] = 16'h0009;             // NOP             ; JMP delay slot
     end
 endtask
 
@@ -750,7 +754,7 @@ task automatic test_cached_store_load_spaced;
     integer idx;
     begin
         begin_test("Cacheable D$: store-allocate then spaced load hit (no fwd)");
-        cacheable_bootstrap;
+        cacheable_bootstrap(8'h09);   // write-back mode
         idx = 'h20;
         imem[idx] = 16'hE701; idx = idx + 1; // MOV   #1,R7
         imem[idx] = 16'h4718; idx = idx + 1; // SHLL8 R7       ; R7 = 0x100
@@ -778,7 +782,7 @@ task automatic test_cached_store_load_fwd;
     integer idx;
     begin
         begin_test("Cacheable D$: back-to-back store->load hit (store-to-load fwd)");
-        cacheable_bootstrap;
+        cacheable_bootstrap(8'h09);   // write-back mode
         idx = 'h20;
         imem[idx] = 16'hE701; idx = idx + 1; // MOV   #1,R7
         imem[idx] = 16'h4718; idx = idx + 1; // SHLL8 R7       ; R7 = 0x100
@@ -804,7 +808,7 @@ task automatic test_cached_store_hit_load;
     integer idx;
     begin
         begin_test("Cacheable D$: store-hit then back-to-back load (RDW)");
-        cacheable_bootstrap;
+        cacheable_bootstrap(8'h09);   // write-back mode
         idx = 'h20;
         imem[idx] = 16'hE701; idx = idx + 1; // MOV   #1,R7
         imem[idx] = 16'h4718; idx = idx + 1; // SHLL8 R7       ; R7 = 0x100
@@ -819,6 +823,152 @@ task automatic test_cached_store_hit_load;
         run_until_retire('h28, 40000);
         chk("cacheable store-hit then load -> R2", gpr(2), 32'h0000_003C);
         do_reset;  // clear CCR.CE for the rest of the suite
+        end_test;
+    end
+endtask
+
+//GOLDEN D - byte store then back-to-back longword load (mixed-lane RDW compose). The
+//byte hit commits ONE strobed lane at the resolve edge; the load's read captures at that
+//same edge, so cache_mem o_DO must compose the bypassed lane (0x3C) over three RAM lanes.
+//Goldens B/C are MOV.L-only (all-lane bypass); this gates the partial byp_q compose.
+task automatic test_cached_byte_store_fwd;
+    integer idx;
+    begin
+        begin_test("Cacheable D$: byte store then back-to-back load (mixed-lane RDW)");
+        cacheable_bootstrap(8'h09);   // write-back mode
+        idx = 'h20;
+        imem[idx] = 16'hE701; idx = idx + 1; // MOV   #1,R7
+        imem[idx] = 16'h4718; idx = idx + 1; // SHLL8 R7       ; R7 = 0x100
+        imem[idx] = 16'hE15A; idx = idx + 1; // MOV   #0x5A,R1
+        imem[idx] = 16'h2712; idx = idx + 1; // MOV.L R1,@R7   ; store-allocate @0x100 = 0x0000005A
+        imem[idx] = 16'hE33C; idx = idx + 1; // MOV   #0x3C,R3
+        imem[idx] = 16'h2730; idx = idx + 1; // MOV.B R3,@R7   ; byte hit: BE lane 3 only = 0x3C
+        imem[idx] = 16'h6272; idx = idx + 1; // MOV.L @R7,R2   ; back-to-back load -> 0x3C00005A
+        imem[idx] = 16'h0009; idx = idx + 1; // NOP
+        imem[idx] = 16'h0009; idx = idx + 1; // NOP            ; sentinel (idx 0x28)
+        do_reset;
+        run_until_retire('h28, 40000);
+        chk("byte-store then load composes lanes -> R2", gpr(2), 32'h3C00_005A);
+        do_reset;
+        end_test;
+    end
+endtask
+
+//Self-modify visibility threshold (instructions ahead of the store): targets k < K were
+//already fetched when the store commits and execute STALE (real SH pipelines prefetch the
+//same way); targets k >= K are fetched at/after the commit edge and MUST run the new
+//opcode (unified array + the same-edge RDW bypass on the I side). Locked 2026-07-05:
+//only the instruction directly after the store is prefetched past the commit edge.
+localparam integer SELFMOD_K = 2;
+
+//GOLDEN E - self-modifying code distance sweep (I-side coherency law). MOV.W pokes a new
+//opcode k instructions ahead of the store, INSIDE the store's own line - resident by
+//construction, since the store itself was fetched from it (a store MISS would
+//write-allocate from dmem and shadow the code line: keep the poke in a resident line).
+task automatic test_cached_selfmod_sweep;
+    integer k;
+    logic [31:0] r6;
+    begin
+        begin_test("Self-modify sweep: MOV.W pokes opcode k ahead; new opcode from k>=K");
+        for(k = 1; k <= 7; k = k + 1) begin
+            cacheable_bootstrap(8'h09);   // write-back mode
+            //Setup line at bytes 0x40-0x4F; store line at 0x50-0x5F. Unlisted slots
+            //stay NOP (clear_imem). Guard BRA stops past-sentinel retires.
+            imem['h20]     = 16'hE1E6;                  // MOV   #0xE6,R1 ; sign-extends
+            imem['h21]     = 16'h4118;                  // SHLL8 R1
+            imem['h22]     = 16'h7102;                  // ADD   #2,R1    ; R1 low 16 = 0xE602 = MOV #2,R6
+            imem['h23]     = 16'hE250 | ((2*k) & 8'hFF);// MOV   #(0x50+2k),R2 ; poke target byte addr
+            imem['h24]     = 16'hE600;                  // MOV   #0,R6
+            imem['h28]     = 16'h2211;                  // MOV.W R1,@R2   ; poke k slots ahead (write HIT)
+            imem['h28 + k] = 16'hE601;                  //   target: OLD opcode = MOV #1,R6
+            imem['h31]     = 16'h0009;                  // NOP            ; sentinel (byte 0x62)
+            imem['h32]     = 16'hAFFE;                  // BRA self       ; guard spin
+            do_reset;
+            run_until_retire('h31, 40000);
+            r6 = gpr(6);
+            $display("      k=%0d -> R6=%0d (%s opcode)", k, r6, (r6 == 32'd2) ? "new" : "old");
+            if(k < SELFMOD_K) chk($sformatf("k=%0d executes stale opcode", k), r6, 32'd1);
+            else              chk($sformatf("k=%0d executes new opcode",   k), r6, 32'd2);
+        end
+        do_reset;
+        end_test;
+    end
+endtask
+
+//GOLDEN F - redirect into the just-modified line. Pass 1 executes the target line
+//(making it resident, R6=1), pokes the NEW opcode into that same line, then BRA back:
+//the redirect fetch trails the store commit by only 1-2 cycles and must return the new
+//halfword (same-edge RDW bypass or the freshly written RAM cell). Pass 2's CMP exits.
+//WT mode (ccr 0x0B) additionally parks the refetch across the S_STORE_WR excursion.
+task automatic test_cached_selfmod_branch(input logic [7:0] ccr_val, input string label);
+    begin
+        begin_test(label);
+        cacheable_bootstrap(ccr_val);
+        imem['h20] = 16'hE1E6;  // MOV   #0xE6,R1
+        imem['h21] = 16'h4118;  // SHLL8 R1
+        imem['h22] = 16'h7102;  // ADD   #2,R1    ; R1 low 16 = 0xE602 = MOV #2,R6
+        imem['h23] = 16'hE262;  // MOV   #0x62,R2 ; poke target byte address
+        imem['h24] = 16'hE600;  // MOV   #0,R6
+        //Target line, bytes 0x60-0x6F: target + check + store + loop-back in ONE line.
+        imem['h30] = 16'h0009;  // NOP            ; BRA re-entry (byte 0x60)
+        imem['h31] = 16'hE601;  // MOV   #1,R6    ; the target halfword (byte 0x62)
+        imem['h32] = 16'h0009;  // NOP
+        imem['h33] = 16'h6063;  // MOV   R6,R0
+        imem['h34] = 16'h8802;  // CMP/EQ #2,R0   ; T=1 only after the new opcode ran
+        imem['h35] = 16'h8903;  // BT    byte 0x74 (exit)
+        imem['h36] = 16'h2211;  // MOV.W R1,@R2   ; poke byte 0x62 (this very line - resident)
+        imem['h37] = 16'hAFF7;  // BRA   byte 0x60; redirect into the just-modified line
+        imem['h38] = 16'h0009;  // NOP            ; BRA delay slot
+        imem['h3A] = 16'h0009;  // NOP            ; sentinel/exit (byte 0x74)
+        imem['h3B] = 16'hAFFE;  // BRA self       ; guard spin
+        do_reset;
+        run_until_retire('h3A, 40000);
+        chk("redirect fetch returns the poked opcode -> R6", gpr(6), 32'd2);
+        do_reset;
+        end_test;
+    end
+endtask
+
+//GOLDEN G - write-back buffer alias. A dirty line is evicted into the wb buffer and the
+//SAME line is reloaded before the background drain can complete (back-to-back MA ops;
+//a drain slot needs a request-free edge, and a full drain takes ~12 cycles). The refill
+//must observe the not-yet-drained store data - a fill straight from external memory
+//returns stale zeros. The dirty data sits in word 3, which drains LAST, so even a
+//partially slipped-in drain cannot mask a stale fill. The spaced re-read gates that a
+//stale refill does not PERSIST after the drain finally lands (lost-update detector).
+task automatic test_cached_wb_alias;
+    integer idx, sentinel;
+    begin
+        begin_test("Cacheable D$: dirty evict then immediate reload (wb-buffer alias)");
+        cacheable_bootstrap(8'h09);   // write-back mode
+        idx = 'h20;
+        imem[idx] = 16'hE101; idx = idx + 1; // MOV   #1,R1
+        imem[idx] = 16'h4118; idx = idx + 1; // SHLL8 R1      ; R1 = 0x100 = line A (set 0x10)
+        imem[idx] = 16'hE210; idx = idx + 1; // MOV   #0x10,R2
+        imem[idx] = 16'h4218; idx = idx + 1; // SHLL8 R2      ; R2 = 0x1000 (same-set stride)
+        imem[idx] = 16'h6313; idx = idx + 1; // MOV   R1,R3
+        imem[idx] = 16'h730C; idx = idx + 1; // ADD   #0xC,R3 ; R3 = 0x10C (A word 3)
+        imem[idx] = 16'hE05A; idx = idx + 1; // MOV   #0x5A,R0
+        imem[idx] = 16'h2302; idx = idx + 1; // MOV.L R0,@R3  ; write-allocate: A dirty, MRU
+        imem[idx] = 16'h6413; idx = idx + 1; // MOV   R1,R4
+        imem[idx] = 16'h342C; idx = idx + 1; // ADD   R2,R4   ; R4 = 0x1100
+        imem[idx] = 16'h6542; idx = idx + 1; // MOV.L @R4,R5  ; fill B
+        imem[idx] = 16'h342C; idx = idx + 1; // ADD   R2,R4   ; R4 = 0x2100
+        imem[idx] = 16'h6542; idx = idx + 1; // MOV.L @R4,R5  ; fill C
+        imem[idx] = 16'h342C; idx = idx + 1; // ADD   R2,R4   ; R4 = 0x3100
+        imem[idx] = 16'h6542; idx = idx + 1; // MOV.L @R4,R5  ; fill D -> true-LRU order: A oldest
+        imem[idx] = 16'h342C; idx = idx + 1; // ADD   R2,R4   ; R4 = 0x4100
+        imem[idx] = 16'h6542; idx = idx + 1; // MOV.L @R4,R5  ; fill E: evicts dirty A -> wb buffer
+        imem[idx] = 16'h6632; idx = idx + 1; // MOV.L @R3,R6  ; back-to-back reload A -> 0x5A
+        idx = idx + 24;                      // NOP window (clear_imem fill): let the drain land
+        imem[idx] = 16'h6832; idx = idx + 1; // MOV.L @R3,R8  ; spaced re-read (hit) -> 0x5A
+        sentinel  = idx;
+        imem[idx] = 16'h0009; idx = idx + 1; // NOP           ; sentinel
+        do_reset;
+        run_until_retire(sentinel, 40000);
+        chk("immediate reload of evicted-dirty line -> R6", gpr(6), 32'h0000_005A);
+        chk("spaced re-read of the refilled line -> R8",    gpr(8), 32'h0000_005A);
+        do_reset;
         end_test;
     end
 endtask
@@ -2985,6 +3135,15 @@ initial begin
     test_cached_store_load_spaced;
     test_cached_store_load_fwd;
     test_cached_store_hit_load;
+
+    //Cache coherency + I-side RDW goldens: unified-array self-modify visibility, the
+    //byte-lane bypass compose, and wb-buffer alias ordering. See cache-microbench-gaps.
+    group("9. Cache coherency goldens: self-modify, byte-lane RDW, wb-buffer alias");
+    test_cached_byte_store_fwd;
+    test_cached_selfmod_sweep;
+    test_cached_selfmod_branch(8'h09, "Self-modify via redirect: poked line refetched after BRA (write-back)");
+    test_cached_selfmod_branch(8'h0B, "Self-modify via redirect: poked line refetched after BRA (write-through)");
+    test_cached_wb_alias;
 
     $display("");
     $display("################################");
