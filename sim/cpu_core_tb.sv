@@ -150,6 +150,7 @@ logic   [31:0]  dmem [0:255];
 logic           d_fault_en;
 logic   [7:0]   d_fault_widx;
 integer         d_latency;       //extra response-wait cycles for MA-wait tests
+integer         i_latency;       //extra response-wait cycles on INSTRUCTION reads (fill-stretch knob)
 integer         data_request_count;
 
 //Unified external memory model. The cache now drives ONE bus, so instruction
@@ -169,8 +170,11 @@ logic           mem_is_data;     //captured: serviced transaction is a data acce
 logic           mem_is_fault;
 integer         mem_wait_cnt;
 
-//I/D discriminator for the shared bus (test probe into the DUT's cache FSM).
-wire            req_is_data = u_dut.u_cache.cur_is_data;
+//I/D discriminator for the shared bus (test probe into the DUT's cache FSM). A WRITE
+//is always data-side: a background wb-buffer drain dispatches from an idle edge where
+//cur_is_data holds junk (speculative capture), and a mislabeled drain write would be
+//dropped here, masking DUT coherency bugs. Reads keep the cur_is_data label (fills).
+wire            req_is_data = u_dut.u_cache.cur_is_data || MEM_BUS.req_write;
 
 assign MEM_BUS.req_ready = !mem_pending && !MEM_BUS.rsp_valid;
 
@@ -209,7 +213,7 @@ always_ff @(posedge clk_p or negedge rst_n) begin
             else begin
                 //Instruction fetch: fault tracks the exact requested halfword.
                 mem_is_fault <= if_fault_en && (MEM_BUS.req_addr[11:1] == if_fault_widx);
-                mem_wait_cnt <= 0;
+                mem_wait_cnt <= i_latency;
             end
         end
         if(mem_pending && !MEM_BUS.rsp_valid) begin
@@ -252,6 +256,8 @@ logic           exc_seen;
 logic   [2:0]   exc_cause_l;
 logic   [31:0]  exc_pc_l;
 logic           exc_delay_l;
+logic   [31:0]  exc_aaddr_l;     //latched faulting access address (fill-fault goldens)
+logic           exc_awrite_l;
 logic           trapa_seen;
 logic   [7:0]   trapa_imm_l;
 logic           rte_seen;
@@ -289,6 +295,8 @@ always_ff @(posedge clk or negedge rst_n) begin
         exc_cause_l    <= 3'd0;
         exc_pc_l       <= 32'd0;
         exc_delay_l    <= 1'b0;
+        exc_aaddr_l    <= 32'd0;
+        exc_awrite_l   <= 1'b0;
         trapa_seen     <= 1'b0;
         trapa_imm_l    <= 8'd0;
         rte_seen       <= 1'b0;
@@ -326,10 +334,12 @@ always_ff @(posedge clk or negedge rst_n) begin
                 retire_count[retire_pc[11:1]] <= retire_count[retire_pc[11:1]] + 1;
             end
             if(exc_valid) begin
-                exc_seen    <= 1'b1;
-                exc_cause_l <= exc_cause;
-                exc_pc_l    <= exc_pc;
-                exc_delay_l <= exc_in_delay_slot;
+                exc_seen     <= 1'b1;
+                exc_cause_l  <= exc_cause;
+                exc_pc_l     <= exc_pc;
+                exc_delay_l  <= exc_in_delay_slot;
+                exc_aaddr_l  <= exc_access_addr;
+                exc_awrite_l <= exc_access_write;
             end
             if(trapa_valid) begin trapa_seen <= 1'b1; trapa_imm_l <= trapa_imm; end
             if(rte_valid)   rte_seen   <= 1'b1;
@@ -398,6 +408,250 @@ always_ff @(posedge clk or negedge rst_n) begin
             if(MEM_BUS.req_write) locked_write_count <= locked_write_count + 1;
             else                  locked_read_count  <= locked_read_count + 1;
         end
+    end
+end
+
+
+///////////////////////////////////////////////////////////
+//////  Cache Property Checkers (passive, suite-wide)
+////
+
+/*
+    LRU-divergence mirror: an INDEPENDENT true-LRU model kept as a per-set
+    recency queue (slot 0 = most recent, slot 3 = oldest = the victim),
+    cross-checked against the DUT's 6-pairwise-bit machinery (Table 5.2,
+    p.104) at every LRU RAM write and every miss-dispatch victim choice.
+    A divergence means a stale LRU read, a missed MRU update, or a broken
+    same-edge RDW bypass in the LRU RAM. A software LRU load (non-assoc mm
+    tag write) is not a total order in general: a zero value is the known
+    reset order, anything else UNTRACKS that set until the next flush walk.
+
+    The pair-bit semantic (bit = 1 means the pair's FIRST way is OLDER) and
+    the state encodings mirror cache.sv; the "unknown lru_we site" guard
+    below fails loudly if the state_t declaration order ever drifts.
+*/
+
+//cache.sv state_t encodings (declaration order). CS = "cache state".
+localparam logic [4:0] CS_FLUSH      = 5'd0;
+localparam logic [4:0] CS_IDLE       = 5'd1;
+localparam logic [4:0] CS_IFILL_REQ  = 5'd8;
+localparam logic [4:0] CS_IFILL_WAIT = 5'd9;
+localparam logic [4:0] CS_DFILL_WAIT = 5'd11;
+localparam logic [4:0] CS_MMTAG_WR   = 5'd19;
+
+logic   [1:0]   lru_order [0:255][0:3];     //mirror recency queue per set
+logic           lru_untracked [0:255];      //set holds a software-written non-order
+integer         lru_upd_checks   = 0;       //MRU-update writes cross-checked
+integer         lru_vic_checks   = 0;       //victim choices cross-checked
+integer         lru_mismatches   = 0;
+
+integer         squash_fill_hits = 0;       //cycles with I_SQUASH high during an I-fill run
+
+integer         lbus_dreq_pends  = 0;       //unaccepted-and-held D-request cycles observed
+integer         lbus_dreq_viol   = 0;       //D-request field mutated while pending
+integer         lbus_drsp_pends  = 0;
+integer         lbus_drsp_viol   = 0;       //D-response mutated/lost while unconsumed
+integer         mbus_req_pends   = 0;
+integer         mbus_req_viol    = 0;       //external request mutated/withdrawn while pending
+
+task automatic mirror_reset_set(input integer set);
+    begin
+        lru_order[set][0] = 2'd0;   //all-zero LRU bits decode to the order 0,1,2,3
+        lru_order[set][1] = 2'd1;   //(victim = way 3), matching lru_victim's reset row
+        lru_order[set][2] = 2'd2;
+        lru_order[set][3] = 2'd3;
+        lru_untracked[set] = 1'b0;
+    end
+endtask
+
+task automatic mirror_mru(input integer set, input logic [1:0] way);
+    integer i, j;
+    begin
+        for(i = 1; i < 4; i = i + 1) begin
+            if(lru_order[set][i] == way) begin
+                for(j = i; j > 0; j = j - 1) lru_order[set][j] = lru_order[set][j-1];
+                lru_order[set][0] = way;
+            end
+        end
+    end
+endtask
+
+//Expected pairwise-older bits off the mirror queue. Bit map matches cache_pkg:
+//lru[5]=(0,1) lru[4]=(0,2) lru[3]=(0,3) lru[2]=(1,2) lru[1]=(1,3) lru[0]=(2,3).
+function automatic logic [5:0] mirror_bits(input integer set);
+    integer pos [0:3];
+    integer i;
+    for(i = 0; i < 4; i = i + 1) pos[lru_order[set][i]] = i;
+    mirror_bits[5] = pos[0] > pos[1];
+    mirror_bits[4] = pos[0] > pos[2];
+    mirror_bits[3] = pos[0] > pos[3];
+    mirror_bits[2] = pos[1] > pos[2];
+    mirror_bits[1] = pos[1] > pos[3];
+    mirror_bits[0] = pos[2] > pos[3];
+endfunction
+
+initial begin
+    integer s;
+    for(s = 0; s < 256; s = s + 1) mirror_reset_set(s);  //BRAM powers up all-zero
+end
+
+//The mirror persists across do_reset like the RAMs (p.104: reset keeps V/U/LRU);
+//only the CCR.CF flush walk re-baselines it. Blocking assigns: tb-only state.
+always @(posedge clk) begin
+    logic [4:0]  cst;
+    integer      cset;
+    logic [1:0]  cway;
+    if(rst_n) begin
+        cst = u_dut.u_cache.state;
+
+        //(1) Miss-dispatch victim choice vs the mirror's oldest way.
+        if(cst == CS_IDLE && u_dut.u_cache.vic_ld) begin
+            cset = u_dut.u_cache.bram_addr[11:4];
+            if(!lru_untracked[cset]) begin
+                lru_vic_checks = lru_vic_checks + 1;
+                if(u_dut.u_cache.victim !== lru_order[cset][3]) begin
+                    lru_mismatches = lru_mismatches + 1;
+                    $display("      [LRU] victim mismatch set %02h: dut way %0d, mirror way %0d",
+                             cset, u_dut.u_cache.victim, lru_order[cset][3]);
+                end
+            end
+        end
+
+        //(2) Every LRU RAM write: cross-check the written bits, then track it.
+        if(u_dut.u_cache.lru_we) begin
+            cset = u_dut.u_cache.lru_waddr;
+            if(cst == CS_FLUSH)
+                mirror_reset_set(cset);
+            else if(cst == CS_IDLE || cst == CS_IFILL_WAIT || cst == CS_DFILL_WAIT) begin
+                cway = (cst == CS_IDLE) ? u_dut.u_cache.hit_way : u_dut.u_cache.cur_way;
+                mirror_mru(cset, cway);
+                if(!lru_untracked[cset]) begin
+                    lru_upd_checks = lru_upd_checks + 1;
+                    if(u_dut.u_cache.lru_wdata !== mirror_bits(cset)) begin
+                        lru_mismatches = lru_mismatches + 1;
+                        $display("      [LRU] update mismatch set %02h way %0d: dut %06b, mirror %06b",
+                                 cset, cway, u_dut.u_cache.lru_wdata, mirror_bits(cset));
+                    end
+                end
+            end
+            else if(cst == CS_MMTAG_WR) begin
+                if(u_dut.u_cache.cur_wdata[9:4] == 6'd0) mirror_reset_set(cset);
+                else                                     lru_untracked[cset] = 1'b1;
+            end
+            else begin
+                lru_mismatches = lru_mismatches + 1;    //state encoding drift guard
+                $display("      [LRU] lru_we from unexpected cache state %0d", cst);
+            end
+        end
+
+        //(3) Squash-during-fill coverage: proves the latency sweep really lands
+        //redirects inside I-fill excursions (consume-and-drop path exercised).
+        if(u_dut.pipe_i_squash && (cst == CS_IFILL_REQ || cst == CS_IFILL_WAIT))
+            squash_fill_hits = squash_fill_hits + 1;
+    end
+end
+
+//Debug trace, off by default: a test may pulse these around a window of interest
+//to print retirements and/or accepted external bus requests.
+logic           dbg_trace     = 1'b0;
+logic           dbg_trace_mem = 1'b0;
+always @(posedge clk) begin
+    if(dbg_trace && retire_valid)
+        $display("        [trace %0t] RET pc=%08h inst=%04h", $time, retire_pc, retire_inst);
+    if(dbg_trace_mem && MEM_BUS.req_valid && MEM_BUS.req_ready)
+        $display("        [trace %0t] MEM %s addr=%08h %s", $time,
+                 MEM_BUS.req_write ? "WR" : "RD", MEM_BUS.req_addr, req_is_data ? "(D)" : "(I)");
+end
+
+/*
+    L-bus D-request stability contract: the cache captures a request descriptor
+    at its accept edge and commits stores from that capture, so a data request
+    held while unaccepted MUST re-present identical fields. Withdrawal (valid
+    dropping, or the slot turning into a fetch) is a pipeline kill - allowed.
+    The D-response hold contract is the loss-free retirement rule: an unconsumed
+    D response re-presents identically (D priority keeps rsp_fetch low).
+    The external MEM bus adds the no-withdrawal rule the BSC depends on.
+*/
+logic           lb_dpend_z;
+logic   [31:0]  lb_addr_z, lb_wdata_z;
+logic           lb_write_z, lb_lock_z;
+logic   [1:0]   lb_size_z;
+logic           lb_rpend_z;
+logic   [31:0]  lb_rdata_z;
+logic           lb_dfault_z;
+logic           mb_pend_z;
+logic   [31:0]  mb_addr_z, mb_wdata_z;
+logic   [3:0]   mb_wstrb_z;
+logic   [1:0]   mb_size_z;
+logic           mb_write_z, mb_burst_z, mb_lock_z;
+
+wire            lb_d_now = u_dut.PIPE_L_BUS.req_valid && !u_dut.PIPE_L_BUS.req_fetch;
+wire            lb_r_now = u_dut.PIPE_L_BUS.rsp_valid && !u_dut.PIPE_L_BUS.rsp_fetch;
+
+always @(posedge clk) begin
+    if(!rst_n) begin
+        lb_dpend_z = 1'b0;
+        lb_rpend_z = 1'b0;
+        mb_pend_z  = 1'b0;
+    end
+    else begin
+        //D-request stability while pending (presented last cycle, unaccepted).
+        if(lb_dpend_z && lb_d_now) begin
+            lbus_dreq_pends = lbus_dreq_pends + 1;
+            if(u_dut.PIPE_L_BUS.req_addr  !== lb_addr_z  ||
+               u_dut.PIPE_L_BUS.req_write !== lb_write_z ||
+               u_dut.PIPE_L_BUS.req_size  !== lb_size_z  ||
+               u_dut.PIPE_L_BUS.req_lock  !== lb_lock_z  ||
+               (lb_write_z && u_dut.PIPE_L_BUS.req_wdata !== lb_wdata_z)) begin
+                lbus_dreq_viol = lbus_dreq_viol + 1;
+                $display("      [LBUS] D-request mutated while unaccepted @%0t", $time);
+            end
+        end
+        //D-response hold until consumed (identical data/fault re-presentation).
+        if(lb_rpend_z) begin
+            lbus_drsp_pends = lbus_drsp_pends + 1;
+            if(!lb_r_now ||
+               u_dut.PIPE_L_BUS.rsp_rdata  !== lb_rdata_z ||
+               u_dut.PIPE_L_BUS.rsp_dfault !== lb_dfault_z) begin
+                lbus_drsp_viol = lbus_drsp_viol + 1;
+                $display("      [LBUS] D-response mutated/lost while unconsumed @%0t", $time);
+            end
+        end
+        //External request: no withdrawal, no mutation, until accepted.
+        if(mb_pend_z) begin
+            mbus_req_pends = mbus_req_pends + 1;
+            if(!MEM_BUS.req_valid            ||
+               MEM_BUS.req_addr  !== mb_addr_z  ||
+               MEM_BUS.req_write !== mb_write_z ||
+               MEM_BUS.req_size  !== mb_size_z  ||
+               MEM_BUS.req_burst !== mb_burst_z ||
+               MEM_BUS.req_lock  !== mb_lock_z  ||
+               (mb_write_z && (MEM_BUS.req_wdata !== mb_wdata_z ||
+                               MEM_BUS.req_wstrb !== mb_wstrb_z))) begin
+                mbus_req_viol = mbus_req_viol + 1;
+                $display("      [MBUS] external request mutated/withdrawn while pending @%0t", $time);
+            end
+        end
+
+        lb_dpend_z = lb_d_now && !u_dut.PIPE_L_BUS.req_ready;
+        lb_addr_z  = u_dut.PIPE_L_BUS.req_addr;
+        lb_write_z = u_dut.PIPE_L_BUS.req_write;
+        lb_size_z  = u_dut.PIPE_L_BUS.req_size;
+        lb_lock_z  = u_dut.PIPE_L_BUS.req_lock;
+        lb_wdata_z = u_dut.PIPE_L_BUS.req_wdata;
+
+        lb_rpend_z  = lb_r_now && !u_dut.PIPE_L_BUS.rsp_ready;
+        lb_rdata_z  = u_dut.PIPE_L_BUS.rsp_rdata;
+        lb_dfault_z = u_dut.PIPE_L_BUS.rsp_dfault;
+
+        mb_pend_z  = MEM_BUS.req_valid && !MEM_BUS.req_ready;
+        mb_addr_z  = MEM_BUS.req_addr;
+        mb_write_z = MEM_BUS.req_write;
+        mb_size_z  = MEM_BUS.req_size;
+        mb_burst_z = MEM_BUS.req_burst;
+        mb_lock_z  = MEM_BUS.req_lock;
+        mb_wdata_z = MEM_BUS.req_wdata;
+        mb_wstrb_z = MEM_BUS.req_wstrb;
     end
 end
 
@@ -472,6 +726,7 @@ task automatic init_knobs;
         d_fault_en     = 1'b0;
         d_fault_widx   = 8'd0;
         d_latency      = 0;
+        i_latency      = 0;
     end
 endtask
 
@@ -681,7 +936,7 @@ endtask
 task automatic bench_ipc_store(input integer nstores, input integer iters);
     integer idx, j, loop_idx, bf_idx, sentinel_idx, disp, guard;
     begin
-        cacheable_bootstrap;
+        cacheable_bootstrap(8'h09);   // write-back mode
         idx = 'h20;
         imem[idx] = 16'hE702;                  idx = idx + 1; // MOV   #2,R7
         imem[idx] = 16'h4718;                  idx = idx + 1; // SHLL8 R7      ; R7 = 0x200 (cacheable)
@@ -728,17 +983,18 @@ endtask
 //cacheable P0 longword (dmem index 0x40) distinct from the P0 code at 0x40 (byte addr).
 //
 //Shared bootstrap: run from P2 (bypass) at reset, enable the unified cache, JMP to P0.
-task automatic cacheable_bootstrap;
+//ccr_val picks the write policy: 8'h09 = CE|CF (write-back), 8'h0B = CE|WT|CF (write-through).
+task automatic cacheable_bootstrap(input logic [7:0] ccr_val);
     begin
         clear_imem;
-        imem[0] = 16'hE0EC; // MOV   #0xEC,R0  ; R0 = 0xFFFFFFEC (CCR); 0xEC sign-extends
-        imem[1] = 16'hE109; // MOV   #9,R1     ; CCR.CE=1 | CCR.CF=1 (flush stale lines first)
-        imem[2] = 16'h2012; // MOV.L R1,@R0    ; enable the unified cache + flush
-        imem[3] = 16'h0009; // NOP             ; let the CCR write settle
-        imem[4] = 16'h0009; // NOP
-        imem[5] = 16'hE240; // MOV   #0x40,R2  ; P0 cacheable entry (byte addr 0x40 = idx 0x20)
-        imem[6] = 16'h422B; // JMP   @R2
-        imem[7] = 16'h0009; // NOP             ; JMP delay slot
+        imem[0] = 16'hE0EC;             // MOV   #0xEC,R0  ; R0 = 0xFFFFFFEC (CCR); 0xEC sign-extends
+        imem[1] = 16'hE100 | ccr_val;   // MOV   #ccr,R1   ; CCR.CE=1 | CCR.CF=1 (flush stale lines first)
+        imem[2] = 16'h2012;             // MOV.L R1,@R0    ; enable the unified cache + flush
+        imem[3] = 16'h0009;             // NOP             ; let the CCR write settle
+        imem[4] = 16'h0009;             // NOP
+        imem[5] = 16'hE240;             // MOV   #0x40,R2  ; P0 cacheable entry (byte addr 0x40 = idx 0x20)
+        imem[6] = 16'h422B;             // JMP   @R2
+        imem[7] = 16'h0009;             // NOP             ; JMP delay slot
     end
 endtask
 
@@ -750,7 +1006,7 @@ task automatic test_cached_store_load_spaced;
     integer idx;
     begin
         begin_test("Cacheable D$: store-allocate then spaced load hit (no fwd)");
-        cacheable_bootstrap;
+        cacheable_bootstrap(8'h09);   // write-back mode
         idx = 'h20;
         imem[idx] = 16'hE701; idx = idx + 1; // MOV   #1,R7
         imem[idx] = 16'h4718; idx = idx + 1; // SHLL8 R7       ; R7 = 0x100
@@ -778,7 +1034,7 @@ task automatic test_cached_store_load_fwd;
     integer idx;
     begin
         begin_test("Cacheable D$: back-to-back store->load hit (store-to-load fwd)");
-        cacheable_bootstrap;
+        cacheable_bootstrap(8'h09);   // write-back mode
         idx = 'h20;
         imem[idx] = 16'hE701; idx = idx + 1; // MOV   #1,R7
         imem[idx] = 16'h4718; idx = idx + 1; // SHLL8 R7       ; R7 = 0x100
@@ -804,7 +1060,7 @@ task automatic test_cached_store_hit_load;
     integer idx;
     begin
         begin_test("Cacheable D$: store-hit then back-to-back load (RDW)");
-        cacheable_bootstrap;
+        cacheable_bootstrap(8'h09);   // write-back mode
         idx = 'h20;
         imem[idx] = 16'hE701; idx = idx + 1; // MOV   #1,R7
         imem[idx] = 16'h4718; idx = idx + 1; // SHLL8 R7       ; R7 = 0x100
@@ -819,6 +1075,611 @@ task automatic test_cached_store_hit_load;
         run_until_retire('h28, 40000);
         chk("cacheable store-hit then load -> R2", gpr(2), 32'h0000_003C);
         do_reset;  // clear CCR.CE for the rest of the suite
+        end_test;
+    end
+endtask
+
+//GOLDEN D - byte store then back-to-back longword load (mixed-lane RDW compose). The
+//byte hit commits ONE strobed lane at the resolve edge; the load's read captures at that
+//same edge, so cache_mem o_DO must compose the bypassed lane (0x3C) over three RAM lanes.
+//Goldens B/C are MOV.L-only (all-lane bypass); this gates the partial byp_q compose.
+task automatic test_cached_byte_store_fwd;
+    integer idx;
+    begin
+        begin_test("Cacheable D$: byte store then back-to-back load (mixed-lane RDW)");
+        cacheable_bootstrap(8'h09);   // write-back mode
+        idx = 'h20;
+        imem[idx] = 16'hE701; idx = idx + 1; // MOV   #1,R7
+        imem[idx] = 16'h4718; idx = idx + 1; // SHLL8 R7       ; R7 = 0x100
+        imem[idx] = 16'hE15A; idx = idx + 1; // MOV   #0x5A,R1
+        imem[idx] = 16'h2712; idx = idx + 1; // MOV.L R1,@R7   ; store-allocate @0x100 = 0x0000005A
+        imem[idx] = 16'hE33C; idx = idx + 1; // MOV   #0x3C,R3
+        imem[idx] = 16'h2730; idx = idx + 1; // MOV.B R3,@R7   ; byte hit: BE lane 3 only = 0x3C
+        imem[idx] = 16'h6272; idx = idx + 1; // MOV.L @R7,R2   ; back-to-back load -> 0x3C00005A
+        imem[idx] = 16'h0009; idx = idx + 1; // NOP
+        imem[idx] = 16'h0009; idx = idx + 1; // NOP            ; sentinel (idx 0x28)
+        do_reset;
+        run_until_retire('h28, 40000);
+        chk("byte-store then load composes lanes -> R2", gpr(2), 32'h3C00_005A);
+        do_reset;
+        end_test;
+    end
+endtask
+
+//Self-modify visibility threshold (instructions ahead of the store): targets k < K were
+//already fetched when the store commits and execute STALE (real SH pipelines prefetch the
+//same way); targets k >= K are fetched at/after the commit edge and MUST run the new
+//opcode (unified array + the same-edge RDW bypass on the I side). Locked 2026-07-05:
+//only the instruction directly after the store is prefetched past the commit edge.
+localparam integer SELFMOD_K = 2;
+
+//GOLDEN E - self-modifying code distance sweep (I-side coherency law). MOV.W pokes a new
+//opcode k instructions ahead of the store, INSIDE the store's own line - resident by
+//construction, since the store itself was fetched from it (a store MISS would
+//write-allocate from dmem and shadow the code line: keep the poke in a resident line).
+task automatic test_cached_selfmod_sweep;
+    integer k;
+    logic [31:0] r6;
+    begin
+        begin_test("Self-modify sweep: MOV.W pokes opcode k ahead; new opcode from k>=K");
+        for(k = 1; k <= 7; k = k + 1) begin
+            cacheable_bootstrap(8'h09);   // write-back mode
+            //Setup line at bytes 0x40-0x4F; store line at 0x50-0x5F. Unlisted slots
+            //stay NOP (clear_imem). Guard BRA stops past-sentinel retires.
+            imem['h20]     = 16'hE1E6;                  // MOV   #0xE6,R1 ; sign-extends
+            imem['h21]     = 16'h4118;                  // SHLL8 R1
+            imem['h22]     = 16'h7102;                  // ADD   #2,R1    ; R1 low 16 = 0xE602 = MOV #2,R6
+            imem['h23]     = 16'hE250 | ((2*k) & 8'hFF);// MOV   #(0x50+2k),R2 ; poke target byte addr
+            imem['h24]     = 16'hE600;                  // MOV   #0,R6
+            imem['h28]     = 16'h2211;                  // MOV.W R1,@R2   ; poke k slots ahead (write HIT)
+            imem['h28 + k] = 16'hE601;                  //   target: OLD opcode = MOV #1,R6
+            imem['h31]     = 16'h0009;                  // NOP            ; sentinel (byte 0x62)
+            imem['h32]     = 16'hAFFE;                  // BRA self       ; guard spin
+            do_reset;
+            run_until_retire('h31, 40000);
+            r6 = gpr(6);
+            $display("      k=%0d -> R6=%0d (%s opcode)", k, r6, (r6 == 32'd2) ? "new" : "old");
+            if(k < SELFMOD_K) chk($sformatf("k=%0d executes stale opcode", k), r6, 32'd1);
+            else              chk($sformatf("k=%0d executes new opcode",   k), r6, 32'd2);
+        end
+        do_reset;
+        end_test;
+    end
+endtask
+
+//GOLDEN F - redirect into the just-modified line. Pass 1 executes the target line
+//(making it resident, R6=1), pokes the NEW opcode into that same line, then BRA back:
+//the redirect fetch trails the store commit by only 1-2 cycles and must return the new
+//halfword (same-edge RDW bypass or the freshly written RAM cell). Pass 2's CMP exits.
+//WT mode (ccr 0x0B) additionally parks the refetch across the S_STORE_WR excursion.
+task automatic test_cached_selfmod_branch(input logic [7:0] ccr_val, input string label);
+    begin
+        begin_test(label);
+        cacheable_bootstrap(ccr_val);
+        imem['h20] = 16'hE1E6;  // MOV   #0xE6,R1
+        imem['h21] = 16'h4118;  // SHLL8 R1
+        imem['h22] = 16'h7102;  // ADD   #2,R1    ; R1 low 16 = 0xE602 = MOV #2,R6
+        imem['h23] = 16'hE262;  // MOV   #0x62,R2 ; poke target byte address
+        imem['h24] = 16'hE600;  // MOV   #0,R6
+        //Target line, bytes 0x60-0x6F: target + check + store + loop-back in ONE line.
+        imem['h30] = 16'h0009;  // NOP            ; BRA re-entry (byte 0x60)
+        imem['h31] = 16'hE601;  // MOV   #1,R6    ; the target halfword (byte 0x62)
+        imem['h32] = 16'h0009;  // NOP
+        imem['h33] = 16'h6063;  // MOV   R6,R0
+        imem['h34] = 16'h8802;  // CMP/EQ #2,R0   ; T=1 only after the new opcode ran
+        imem['h35] = 16'h8903;  // BT    byte 0x74 (exit)
+        imem['h36] = 16'h2211;  // MOV.W R1,@R2   ; poke byte 0x62 (this very line - resident)
+        imem['h37] = 16'hAFF7;  // BRA   byte 0x60; redirect into the just-modified line
+        imem['h38] = 16'h0009;  // NOP            ; BRA delay slot
+        imem['h3A] = 16'h0009;  // NOP            ; sentinel/exit (byte 0x74)
+        imem['h3B] = 16'hAFFE;  // BRA self       ; guard spin
+        do_reset;
+        run_until_retire('h3A, 40000);
+        chk("redirect fetch returns the poked opcode -> R6", gpr(6), 32'd2);
+        do_reset;
+        end_test;
+    end
+endtask
+
+//GOLDEN G - write-back buffer alias. A dirty line is evicted into the wb buffer and the
+//SAME line is reloaded before the background drain can complete (back-to-back MA ops;
+//a drain slot needs a request-free edge, and a full drain takes ~12 cycles). The refill
+//must observe the not-yet-drained store data - a fill straight from external memory
+//returns stale zeros. The dirty data sits in word 3, which drains LAST, so even a
+//partially slipped-in drain cannot mask a stale fill. The spaced re-read gates that a
+//stale refill does not PERSIST after the drain finally lands (lost-update detector).
+task automatic test_cached_wb_alias;
+    integer idx, sentinel;
+    begin
+        begin_test("Cacheable D$: dirty evict then immediate reload (wb-buffer alias)");
+        cacheable_bootstrap(8'h09);   // write-back mode
+        idx = 'h20;
+        imem[idx] = 16'hE101; idx = idx + 1; // MOV   #1,R1
+        imem[idx] = 16'h4118; idx = idx + 1; // SHLL8 R1      ; R1 = 0x100 = line A (set 0x10)
+        imem[idx] = 16'hE210; idx = idx + 1; // MOV   #0x10,R2
+        imem[idx] = 16'h4218; idx = idx + 1; // SHLL8 R2      ; R2 = 0x1000 (same-set stride)
+        imem[idx] = 16'h6313; idx = idx + 1; // MOV   R1,R3
+        imem[idx] = 16'h730C; idx = idx + 1; // ADD   #0xC,R3 ; R3 = 0x10C (A word 3)
+        imem[idx] = 16'hE05A; idx = idx + 1; // MOV   #0x5A,R0
+        imem[idx] = 16'h2302; idx = idx + 1; // MOV.L R0,@R3  ; write-allocate: A dirty, MRU
+        imem[idx] = 16'h6413; idx = idx + 1; // MOV   R1,R4
+        imem[idx] = 16'h342C; idx = idx + 1; // ADD   R2,R4   ; R4 = 0x1100
+        imem[idx] = 16'h6542; idx = idx + 1; // MOV.L @R4,R5  ; fill B
+        imem[idx] = 16'h342C; idx = idx + 1; // ADD   R2,R4   ; R4 = 0x2100
+        imem[idx] = 16'h6542; idx = idx + 1; // MOV.L @R4,R5  ; fill C
+        imem[idx] = 16'h342C; idx = idx + 1; // ADD   R2,R4   ; R4 = 0x3100
+        imem[idx] = 16'h6542; idx = idx + 1; // MOV.L @R4,R5  ; fill D -> true-LRU order: A oldest
+        imem[idx] = 16'h342C; idx = idx + 1; // ADD   R2,R4   ; R4 = 0x4100
+        imem[idx] = 16'h6542; idx = idx + 1; // MOV.L @R4,R5  ; fill E: evicts dirty A -> wb buffer
+        imem[idx] = 16'h6632; idx = idx + 1; // MOV.L @R3,R6  ; back-to-back reload A -> 0x5A
+        idx = idx + 24;                      // NOP window (clear_imem fill): let the drain land
+        imem[idx] = 16'h6832; idx = idx + 1; // MOV.L @R3,R8  ; spaced re-read (hit) -> 0x5A
+        sentinel  = idx;
+        imem[idx] = 16'h0009; idx = idx + 1; // NOP           ; sentinel
+        do_reset;
+        run_until_retire(sentinel, 40000);
+        chk("immediate reload of evicted-dirty line -> R6", gpr(6), 32'h0000_005A);
+        chk("spaced re-read of the refilled line -> R8",    gpr(8), 32'h0000_005A);
+        do_reset;
+        end_test;
+    end
+endtask
+
+//GOLDEN H - latency invariance + squash timing sweep. One cacheable branch-torture
+//program (taken branches whose fall-through prefetch crosses into COLD poison lines,
+//a store/load pair, and a backward DT loop) is run over a grid of (i,d) memory-wait
+//settings. Stretching the fill beats sweeps the branch-redirect (i_I_SQUASH) arrival
+//across every I-fill FSM phase: request, each wait beat, completion, and the hit case.
+//LAW: the architectural result is latency-invariant, wrong-path poison never retires,
+//and the sweep really lands squashes inside I-fill runs (coverage counter).
+task automatic test_cached_latency_invariance;
+    integer p, j;
+    integer ilat [0:9];
+    integer dlat [0:9];
+    integer squash_base;
+    begin
+        begin_test("Latency invariance + squash sweep: results identical over (i,d) wait grid");
+        squash_base = squash_fill_hits;
+        ilat[0]=0; dlat[0]=0;    ilat[5]=5; dlat[5]=0;
+        ilat[1]=1; dlat[1]=0;    ilat[6]=7; dlat[6]=0;
+        ilat[2]=2; dlat[2]=0;    ilat[7]=0; dlat[7]=2;
+        ilat[3]=3; dlat[3]=0;    ilat[8]=2; dlat[8]=3;
+        ilat[4]=4; dlat[4]=0;    ilat[9]=5; dlat[9]=1;
+        for(p = 0; p < 10; p = p + 1) begin
+            cacheable_bootstrap(8'h09);   // CF flush: every run starts cold
+            //Line 0 (bytes 0x40-0x4F): setup; BRA sits one slot before the line end so
+            //fetch-ahead crosses into the cold poison line before the redirect resolves.
+            imem['h20] = 16'hE200;  // MOV   #0,R2    ; accumulator
+            imem['h21] = 16'hEA00;  // MOV   #0,R10   ; wrong-path poison detector
+            imem['h22] = 16'hE301;  // MOV   #1,R3
+            imem['h23] = 16'h4318;  // SHLL8 R3       ; R3 = 0x100 (data line)
+            imem['h24] = 16'h0009;  // NOP
+            imem['h25] = 16'h0009;  // NOP
+            imem['h26] = 16'hA008;  // BRA   0x60     ; skip poison line 1
+            imem['h27] = 16'h0009;  //   delay slot (last slot of the line)
+            //Line 2 (0x60): store leg - D-fill traffic racing the wrong-path I-fill.
+            imem['h30] = 16'h7203;  // ADD   #3,R2    ; acc = 3
+            imem['h31] = 16'h2322;  // MOV.L R2,@R3   ; store-allocate 0x100
+            imem['h32] = 16'h0009;
+            imem['h33] = 16'h0009;
+            imem['h34] = 16'h0009;
+            imem['h35] = 16'h0009;
+            imem['h36] = 16'hA008;  // BRA   0x80     ; skip poison line 3
+            imem['h37] = 16'h0009;  //   delay slot
+            //Line 4 (0x80): load leg.
+            imem['h40] = 16'h6432;  // MOV.L @R3,R4   ; load back -> 3
+            imem['h41] = 16'h324C;  // ADD   R4,R2    ; acc = 6
+            imem['h42] = 16'h5631;  // MOV.L @(4,R3),R6 ; preset dmem -> 0x21
+            imem['h43] = 16'h0009;
+            imem['h44] = 16'h0009;
+            imem['h45] = 16'h0009;
+            imem['h46] = 16'hA008;  // BRA   0xA0     ; skip poison line 5
+            imem['h47] = 16'h0009;  //   delay slot
+            //Line 6 (0xA0): backward DT loop - squash lands on a WARM line (hit class).
+            imem['h50] = 16'hE503;  // MOV   #3,R5
+            imem['h51] = 16'h7201;  // ADD   #1,R2    ; 3 iterations -> acc = 9
+            imem['h52] = 16'h4510;  // DT    R5
+            imem['h53] = 16'h8BFC;  // BF    0xA2     ; taken twice, falls through once
+            imem['h54] = 16'h0009;
+            imem['h55] = 16'h0009;
+            imem['h56] = 16'hA008;  // BRA   0xC0     ; skip poison line 7
+            imem['h57] = 16'h0009;  //   delay slot
+            //Line 8 (0xC0): sentinel + guard.
+            imem['h60] = 16'h0009;  // sentinel
+            imem['h61] = 16'hAFFE;  // BRA self       ; guard spin
+            imem['h62] = 16'h0009;
+            //Poison lines 1/3/5/7: retiring any wrong-path slot corrupts R10.
+            for(j = 0; j < 8; j = j + 1) begin
+                imem['h28 + j] = 16'hEA11;  // MOV #0x11,R10
+                imem['h38 + j] = 16'hEA22;
+                imem['h48 + j] = 16'hEA33;
+                imem['h58 + j] = 16'hEA44;
+            end
+            i_latency = ilat[p];
+            d_latency = dlat[p];
+            do_reset;
+            dmem['h41] = 32'h0000_0021;
+            run_until_retire('h60, 60000);
+            chk($sformatf("acc R2 (i=%0d,d=%0d)",     ilat[p], dlat[p]), gpr(2),  32'd9);
+            chk($sformatf("load R4 (i=%0d,d=%0d)",    ilat[p], dlat[p]), gpr(4),  32'd3);
+            chk($sformatf("loop R5 (i=%0d,d=%0d)",    ilat[p], dlat[p]), gpr(5),  32'd0);
+            chk($sformatf("disp R6 (i=%0d,d=%0d)",    ilat[p], dlat[p]), gpr(6),  32'h0000_0021);
+            chk($sformatf("poison R10 (i=%0d,d=%0d)", ilat[p], dlat[p]), gpr(10), 32'd0);
+        end
+        i_latency = 0;
+        d_latency = 0;
+        $display("      squash-during-I-fill cycles across the sweep: %0d", squash_fill_hits - squash_base);
+        chk_true("squash landed inside I-fill runs", squash_fill_hits > squash_base);
+        do_reset;
+        end_test;
+    end
+endtask
+
+//GOLDEN I - D-fill per-beat fault sweep. The line read faults on beat b (0..3):
+//EXC_DATA must be precise (destination unwritten, younger killed, EA reported), and
+//the aborted fill must leave NO usable line - the handler retry reloads from MEMORY
+//(the tb swaps the line's values between phases; a stale partial line would hit).
+task automatic test_cached_fill_fault_d;
+    integer b, j;
+    begin
+        begin_test("D-fill fault sweep: fault on each beat -> precise EXC_DATA, clean refill");
+        for(b = 0; b < 4; b = b + 1) begin
+            cacheable_bootstrap(8'h09);
+            //Reset leaves SR.BL=1 and an exception under BL is a manual RESET (SH-3
+            //rule) - clear BL first so the fault vectors to VBR+0x100 as intended.
+            imem['h20] = 16'hE860;  // MOV    #0x60,R8
+            imem['h21] = 16'h4818;  // SHLL8  R8
+            imem['h22] = 16'h4828;  // SHLL16 R8      ; R8 = 0x6000_0000 (MD=1,RB=1,BL=0)
+            imem['h23] = 16'h480E;  // LDC    R8,SR   ; clear BL (serializes)
+            imem['h24] = 16'hE766;  // MOV   #0x66,R7 ; canary: fault must not overwrite
+            imem['h25] = 16'hE302;  // MOV   #2,R3
+            imem['h26] = 16'h4318;  // SHLL8 R3       ; R3 = 0x200 (set 0x20)
+            imem['h27] = 16'h6732;  // MOV.L @R3,R7   ; fill faults at beat b -> EXC_DATA
+            imem['h28] = 16'hEA55;  // MOV   #0x55,R10 ; younger - must not retire
+            //Handler (VBR+0x100 = imem 0x80): pad covers the tb's disarm window.
+            for(j = 0; j < 24; j = j + 1) imem['h80 + j] = 16'h0009;
+            imem['h98] = 16'h5830;  // MOV.L @(0,R3),R8   ; retry: full-line refill
+            imem['h99] = 16'h5931;  // MOV.L @(4,R3),R9
+            imem['h9A] = 16'h5A32;  // MOV.L @(8,R3),R10
+            imem['h9B] = 16'h5B33;  // MOV.L @(12,R3),R11
+            imem['h9C] = 16'h0009;  // sentinel
+            imem['h9D] = 16'hAFFE;  // BRA self
+            imem['h9E] = 16'h0009;
+            d_fault_en   = 1'b1;
+            d_fault_widx = 8'h80 + b[7:0];
+            do_reset;
+            dmem['h80] = 32'h0000_00A0;   // phase-1 memory truth
+            dmem['h81] = 32'h0000_00A1;
+            dmem['h82] = 32'h0000_00A2;
+            dmem['h83] = 32'h0000_00A3;
+            run_until_exc(20000);
+            chk_true($sformatf("beat %0d: exception fired", b), exc_seen);
+            chk($sformatf("beat %0d: cause", b), {29'd0, exc_cause_l}, {29'd0, EXC_DATA});
+            chk($sformatf("beat %0d: exc pc", b), exc_pc_l, 32'h0000_004E);
+            chk($sformatf("beat %0d: access addr", b), exc_aaddr_l, 32'h0000_0200);
+            chk($sformatf("beat %0d: canary R7", b), gpr(7), 32'h0000_0066);
+            chk_true($sformatf("beat %0d: younger killed", b), !retired_seen['h28]);
+            //Phase 2: NEW memory truth. A stale partial line would hit and expose it.
+            d_fault_en = 1'b0;
+            dmem['h80] = 32'h0000_00B0;
+            dmem['h81] = 32'h0000_00B1;
+            dmem['h82] = 32'h0000_00B2;
+            dmem['h83] = 32'h0000_00B3;
+            run_until_retire('h9C, 20000);
+            chk($sformatf("beat %0d: refill word 0", b), gpr(8),  32'h0000_00B0);
+            chk($sformatf("beat %0d: refill word 1", b), gpr(9),  32'h0000_00B1);
+            chk($sformatf("beat %0d: refill word 2", b), gpr(10), 32'h0000_00B2);
+            chk($sformatf("beat %0d: refill word 3", b), gpr(11), 32'h0000_00B3);
+        end
+        do_reset;
+        end_test;
+    end
+endtask
+
+//GOLDEN J - I-fill per-beat fault sweep. The jump target's line fill faults on beat b:
+//EXC_IFETCH must report the REQUESTED PC whichever beat faulted, none of the target's
+//stale opcodes may retire, and the post-fault refetch must read fresh MEMORY (the tb
+//pokes a new opcode over the target between phases).
+task automatic test_cached_fill_fault_i;
+    integer b, j;
+    begin
+        begin_test("I-fill fault sweep: fault on each beat -> precise EXC_IFETCH, clean refetch");
+        for(b = 0; b < 4; b = b + 1) begin
+            cacheable_bootstrap(8'h09);
+            imem['h20] = 16'hE860;  // MOV    #0x60,R8 ; BL-clear prologue (see the D sweep)
+            imem['h21] = 16'h4818;  // SHLL8  R8
+            imem['h22] = 16'h4828;  // SHLL16 R8
+            imem['h23] = 16'h480E;  // LDC    R8,SR
+            imem['h24] = 16'hEC00;  // MOV   #0,R12   ; stale/new opcode detector
+            imem['h25] = 16'hE160;  // MOV   #0x60,R1
+            imem['h26] = 16'h412B;  // JMP   @R1      ; -> byte 0x60 (cold line, set 6)
+            imem['h27] = 16'h0009;  //   delay slot
+            //Target line phase-1 content: stale markers, contained by a guard.
+            for(j = 0; j < 6; j = j + 1) imem['h30 + j] = 16'hEC11;  // MOV #0x11,R12
+            imem['h36] = 16'hAFFE;  // BRA self       ; guard if the fault never fires
+            imem['h37] = 16'h0009;
+            //Handler: pad, then refetch the (by then re-poked) target line.
+            for(j = 0; j < 24; j = j + 1) imem['h80 + j] = 16'h0009;
+            imem['h98] = 16'hE260;  // MOV   #0x60,R2
+            imem['h99] = 16'h422B;  // JMP   @R2      ; refetch the target
+            imem['h9A] = 16'h0009;  //   delay slot
+            if_fault_en   = 1'b1;
+            if_fault_widx = 11'h30 + 11'(2 * b);  // halfword index of fill beat b
+            do_reset;
+            run_until_exc(20000);
+            chk_true($sformatf("beat %0d: exception fired", b), exc_seen);
+            chk($sformatf("beat %0d: cause", b), {29'd0, exc_cause_l}, {29'd0, EXC_IFETCH});
+            chk($sformatf("beat %0d: exc pc = requested PC", b), exc_pc_l, 32'h0000_0060);
+            chk($sformatf("beat %0d: stale opcodes never ran", b), gpr(12), 32'd0);
+            //Phase 2: poke the NEW opcode; the refetch must refill from imem.
+            if_fault_en = 1'b0;
+            imem['h30] = 16'hEC22;  // MOV #0x22,R12  ; the new opcode
+            imem['h31] = 16'h0009;
+            imem['h32] = 16'h0009;
+            imem['h33] = 16'h0009;
+            imem['h34] = 16'h0009;
+            imem['h35] = 16'h0009;  // sentinel
+            run_until_retire('h35, 20000);
+            chk($sformatf("beat %0d: refetch runs the new opcode", b), gpr(12), 32'h0000_0022);
+        end
+        do_reset;
+        end_test;
+    end
+endtask
+
+//GOLDEN K - fill-fault victim integrity. A mid-line fill fault aborts AFTER earlier
+//beats already overwrote the victim way's data - but the victim's OLD tag is not
+//rewritten until the final beat. If the abort leaves that old tag valid, the old line
+//is a HIT over corrupt (half-new) data. Setup: X resident clean, LRU-oldest; the tb
+//swaps memory truth, then a same-set fill faults on beat 2 with X as its victim.
+//LAW: X must be gone (invalidated); rereads of X refill fresh memory on every word.
+task automatic test_cached_fill_fault_victim;
+    integer j;
+    begin
+        begin_test("Fill-fault victim integrity: aborted fill must not leave a corrupt valid line");
+        cacheable_bootstrap(8'h09);
+        imem['h20] = 16'hE860;  // MOV    #0x60,R8 ; BL-clear prologue (see the D sweep)
+        imem['h21] = 16'h4818;  // SHLL8  R8
+        imem['h22] = 16'h4828;  // SHLL16 R8
+        imem['h23] = 16'h480E;  // LDC    R8,SR
+        imem['h24] = 16'hE102;  // MOV   #2,R1
+        imem['h25] = 16'h4118;  // SHLL8 R1       ; R1 = 0x200 = line X (set 0x20)
+        imem['h26] = 16'hE210;  // MOV   #0x10,R2
+        imem['h27] = 16'h4218;  // SHLL8 R2       ; R2 = 0x1000 same-set stride
+        imem['h28] = 16'h6612;  // MOV.L @R1,R6   ; fill X -> way 3 (post-flush LRU)
+        imem['h29] = 16'h6313;  // MOV   R1,R3
+        imem['h2A] = 16'h332C;  // ADD   R2,R3    ; 0x1200
+        imem['h2B] = 16'h6532;  // MOV.L @R3,R5   ; fill -> way 2
+        imem['h2C] = 16'h332C;  //                ; 0x2200
+        imem['h2D] = 16'h6532;  //                ; fill -> way 1
+        imem['h2E] = 16'h332C;  //                ; 0x3200
+        imem['h2F] = 16'h6532;  //                ; fill -> way 0: X is LRU-oldest again
+        imem['h30] = 16'h0009;  // marker: tb swaps memory truth + arms the beat fault
+        for(j = 0; j < 16; j = j + 1) imem['h31 + j] = 16'h0009;   // re-arm window
+        imem['h41] = 16'h332C;  //                ; 0x4200
+        imem['h42] = 16'h6732;  // MOV.L @R3,R7   ; fill Z: victim = clean X; beat 2 faults
+        imem['h43] = 16'hED55;  // MOV   #0x55,R13 ; younger - must not retire
+        //Handler: pad, then reread every word of X.
+        for(j = 0; j < 24; j = j + 1) imem['h80 + j] = 16'h0009;
+        imem['h98] = 16'h6812;  // MOV.L @R1,R8       ; X word 0
+        imem['h99] = 16'h5911;  // MOV.L @(4,R1),R9
+        imem['h9A] = 16'h5A12;  // MOV.L @(8,R1),R10
+        imem['h9B] = 16'h5B13;  // MOV.L @(12,R1),R11
+        imem['h9C] = 16'h0009;  // sentinel
+        imem['h9D] = 16'hAFFE;  // BRA self
+        imem['h9E] = 16'h0009;
+        do_reset;
+        dmem['h80] = 32'h0000_00A0;   // phase-1 truth (X's resident content)
+        dmem['h81] = 32'h0000_00A1;
+        dmem['h82] = 32'h0000_00A2;
+        dmem['h83] = 32'h0000_00A3;
+        run_until_retire('h30, 20000);
+        dmem['h80] = 32'h0000_00B0;   // phase-2 truth: Z's beats deliver B-values
+        dmem['h81] = 32'h0000_00B1;
+        dmem['h82] = 32'h0000_00B2;
+        dmem['h83] = 32'h0000_00B3;
+        d_fault_en   = 1'b1;
+        d_fault_widx = 8'h82;         // Z fill beat 2
+        run_until_exc(20000);
+        chk_true("exception fired", exc_seen);
+        chk("cause", {29'd0, exc_cause_l}, {29'd0, EXC_DATA});
+        chk("access addr", exc_aaddr_l, 32'h0000_4200);
+        chk_true("younger killed", !retired_seen['h43]);
+        d_fault_en = 1'b0;
+        run_until_retire('h9C, 20000);
+        //A stale-valid X returns {B0,B1,A2,A3} (corrupt); a clean refill returns all B.
+        chk("X word 0 after aborted fill", gpr(8),  32'h0000_00B0);
+        chk("X word 1 after aborted fill", gpr(9),  32'h0000_00B1);
+        chk("X word 2 after aborted fill", gpr(10), 32'h0000_00B2);
+        chk("X word 3 after aborted fill", gpr(11), 32'h0000_00B3);
+        do_reset;
+        end_test;
+    end
+endtask
+
+//GOLDEN L - PREF fill-fault abandon (p.111: a prefetch raises no exception). The
+//faulting PREF fill must be dropped silently AND leave the line unallocated: the
+//later demand load refills from (by then updated) memory.
+task automatic test_cached_pref_fill_fault;
+    integer j;
+    begin
+        begin_test("PREF fill fault: silent abandon, no allocation, later load refills");
+        cacheable_bootstrap(8'h09);
+        imem['h20] = 16'hE303;  // MOV   #3,R3
+        imem['h21] = 16'h4318;  // SHLL8 R3       ; R3 = 0x300 (set 0x30)
+        imem['h22] = 16'h0383;  // PREF  @R3      ; fill faults at beat 1 -> abandoned
+        imem['h23] = 16'h0009;  // marker: tb disarms + swaps memory truth
+        for(j = 0; j < 16; j = j + 1) imem['h24 + j] = 16'h0009;   // disarm window
+        imem['h34] = 16'h6732;  // MOV.L @R3,R7   ; must REFILL (nothing was allocated)
+        imem['h35] = 16'h0009;  // sentinel
+        imem['h36] = 16'hAFFE;  // BRA self
+        imem['h37] = 16'h0009;
+        d_fault_en   = 1'b1;
+        d_fault_widx = 8'hC1;   // PREF fill beat 1
+        do_reset;
+        dmem['hC0] = 32'h0000_00A0;
+        dmem['hC1] = 32'h0000_00A1;
+        run_until_retire('h23, 20000);
+        chk_true("PREF fill fault raises no exception", !exc_seen);
+        d_fault_en = 1'b0;
+        dmem['hC0] = 32'h0000_00B0;   // phase-2 truth
+        run_until_retire('h35, 20000);
+        chk_true("still no exception", !exc_seen);
+        chk("post-abandon load refills from memory", gpr(7), 32'h0000_00B0);
+        do_reset;
+        end_test;
+    end
+endtask
+
+//GOLDEN M - write-back drain fault law (LOCKED 2026-07-05): a fault on a drain beat
+//is SILENTLY IGNORED - no exception, the drain completes, the faulted word is simply
+//lost (memory keeps its old value), all other words commit. The drain is forced
+//deterministically with a NON-ASSOCIATIVE mm tag write (0xF0 window, p.112) that
+//invalidates the dirty line - no same-set fills needed, so the tb's aliased dmem
+//never sees the armed fault index on a READ.
+task automatic test_cached_drain_fault_law;
+    integer w, i;
+    begin
+        begin_test("Drain-beat fault law: ignored fault, word lost, no exception (sweep all beats)");
+        for(w = 0; w < 4; w = w + 1) begin
+            cacheable_bootstrap(8'h09);
+            imem['h20] = 16'hE118;  // MOV   #0x18,R1
+            imem['h21] = 16'h4108;  // SHLL2 R1
+            imem['h22] = 16'h4108;  // SHLL2 R1       ; R1 = 0x180 = line A (set 0x18)
+            imem['h23] = 16'h6712;  // MOV.L @R1,R7   ; fill A (fault not armed yet)
+            imem['h24] = 16'hE251;  // MOV   #0x51,R2
+            imem['h25] = 16'h2122;  // MOV.L R2,@R1       ; word 0 = 0x51 (line dirty)
+            imem['h26] = 16'h7201;  // ADD   #1,R2
+            imem['h27] = 16'h1121;  // MOV.L R2,@(4,R1)   ; word 1 = 0x52
+            imem['h28] = 16'h7201;
+            imem['h29] = 16'h1122;  // MOV.L R2,@(8,R1)   ; word 2 = 0x53
+            imem['h2A] = 16'h7201;
+            imem['h2B] = 16'h1123;  // MOV.L R2,@(12,R1)  ; word 3 = 0x54
+            imem['h2C] = 16'h0009;  // marker: tb arms the drain-beat fault here
+            for(i = 0; i < 12; i = i + 1) imem['h2D + i] = 16'h0009;  // arm window
+            imem['h39] = 16'hE0F0;  // MOV   #0xF0,R0
+            imem['h3A] = 16'h4028;  // SHLL16 R0
+            imem['h3B] = 16'h4018;  // SHLL8 R0       ; R0 = 0xF000_0000 (mm tag window)
+            imem['h3C] = 16'hE431;  // MOV   #0x31,R4
+            imem['h3D] = 16'h4418;  // SHLL8 R4       ; 0x3100 = way-3 field
+            imem['h3E] = 16'h7440;  // ADD   #0x40,R4 ; (0x80 immediate would sign-extend)
+            imem['h3F] = 16'h7440;  // ADD   #0x40,R4 ; +0x80 = set 0x18 field
+            imem['h40] = 16'h304C;  // ADD   R4,R0    ; R0 = 0xF000_3180
+            imem['h41] = 16'hE500;  // MOV   #0,R5
+            imem['h42] = 16'h2052;  // MOV.L R5,@R0   ; mm tag write V=0: forced write-back
+            //Drain pump: a pure hit/fetch stream never yields a request-free edge (the
+            //background drain starves by design - IPC first); DSP result waits stall the
+            //front end and open the idle edges the drain needs, one word per stall.
+            for(i = 0; i < 8; i = i + 1) begin
+                imem['h43 + 2*i] = 16'h222F;    // MULS.W R2,R2 ; occupy the DSP
+                imem['h44 + 2*i] = 16'h061A;    // STS   MACL,R6 ; wait on it: fetch idles
+            end
+            imem['h53] = 16'h0009;  // sentinel
+            imem['h54] = 16'hAFFE;  // BRA self
+            imem['h55] = 16'h0009;
+            do_reset;
+            for(i = 0; i < 4; i = i + 1) dmem['h60 + i] = 32'h0000_0041 + i;  // A-values
+            run_until_retire('h2C, 20000);
+            d_fault_en   = 1'b1;
+            d_fault_widx = 8'h60 + w[7:0];
+            run_until_retire('h53, 20000);
+            chk_true($sformatf("word %0d: no exception on the drain fault", w), !exc_seen);
+            chk_true($sformatf("word %0d: buffer fully drained", w), !u_dut.u_cache.wb_valid);
+            for(i = 0; i < 4; i = i + 1) begin
+                if(i == w) chk($sformatf("word %0d kept its OLD value (write lost)", i),
+                               dmem['h60 + i], 32'h0000_0041 + i);
+                else       chk($sformatf("word %0d drained", i),
+                               dmem['h60 + i], 32'h0000_0051 + i);
+            end
+            d_fault_en = 1'b0;
+        end
+        do_reset;
+        end_test;
+    end
+endtask
+
+//GOLDEN N - LRU thrash: 6 lines share one set (> 4 ways) and are walked in a shuffled
+//order with two dirtying stores, forcing repeated evictions, refills, and write-back
+//drains. The correctness burden is carried by the suite-wide LRU mirror (victim and
+//update cross-checks); this program exists to feed it a dense, irregular history.
+task automatic test_cached_lru_thrash;
+    integer vic_base;
+    begin
+        begin_test("LRU thrash: 6 same-set lines, shuffled walk, mirror-checked victims");
+        vic_base = lru_vic_checks;
+        cacheable_bootstrap(8'h09);
+        imem['h20] = 16'hE128;  // MOV   #0x28,R1
+        imem['h21] = 16'h4108;  // SHLL2 R1
+        imem['h22] = 16'h4108;  // SHLL2 R1       ; R1 = 0x280 (set 0x28)
+        imem['h23] = 16'hE210;  // MOV   #0x10,R2
+        imem['h24] = 16'h4218;  // SHLL8 R2       ; R2 = 0x1000 same-set stride
+        imem['h25] = 16'h6313;  // MOV   R1,R3    ; k=0
+        imem['h26] = 16'h6032;  // MOV.L @R3,R0   ; k=0 fill
+        imem['h27] = 16'h2302;  // MOV.L R0,@R3   ; k=0 dirty
+        imem['h28] = 16'h332C;  // ADD   R2,R3    ; k=1
+        imem['h29] = 16'h6032;
+        imem['h2A] = 16'h332C;  //                ; k=2
+        imem['h2B] = 16'h6032;
+        imem['h2C] = 16'h332C;  //                ; k=3
+        imem['h2D] = 16'h6032;
+        imem['h2E] = 16'h332C;  //                ; k=4
+        imem['h2F] = 16'h6032;  //                ; 5th line: first eviction
+        imem['h30] = 16'h3328;  // SUB   R2,R3
+        imem['h31] = 16'h3328;
+        imem['h32] = 16'h3328;
+        imem['h33] = 16'h3328;  //                ; k=0
+        imem['h34] = 16'h6032;  //                ; k=0 again (evicted-dirty reload)
+        imem['h35] = 16'h332C;
+        imem['h36] = 16'h332C;  //                ; k=2
+        imem['h37] = 16'h6032;
+        imem['h38] = 16'h2302;  //                ; k=2 dirty
+        imem['h39] = 16'h332C;
+        imem['h3A] = 16'h332C;
+        imem['h3B] = 16'h332C;  //                ; k=5
+        imem['h3C] = 16'h6032;
+        imem['h3D] = 16'h3328;
+        imem['h3E] = 16'h3328;
+        imem['h3F] = 16'h3328;
+        imem['h40] = 16'h3328;  //                ; k=1
+        imem['h41] = 16'h6032;
+        imem['h42] = 16'h332C;
+        imem['h43] = 16'h332C;  //                ; k=3
+        imem['h44] = 16'h6032;
+        imem['h45] = 16'h3328;
+        imem['h46] = 16'h3328;
+        imem['h47] = 16'h3328;  //                ; k=0
+        imem['h48] = 16'h6032;
+        imem['h49] = 16'h332C;
+        imem['h4A] = 16'h332C;
+        imem['h4B] = 16'h332C;
+        imem['h4C] = 16'h332C;  //                ; k=4
+        imem['h4D] = 16'h6032;
+        imem['h4E] = 16'h0009;  // sentinel
+        imem['h4F] = 16'hAFFE;  // BRA self
+        imem['h50] = 16'h0009;
+        do_reset;
+        dmem['hA0] = 32'h0000_0077;   // aliased word 0: every k reads/rewrites it
+        run_until_retire('h4E, 60000);
+        chk("aliased word-0 value follows every reload", gpr(0), 32'h0000_0077);
+        $display("      victim choices mirror-checked in this walk: %0d", lru_vic_checks - vic_base);
+        chk_true("victim choices exercised", lru_vic_checks >= vic_base + 6);
+        do_reset;
+        end_test;
+    end
+endtask
+
+//Suite-wide property verdicts, evaluated LAST so every test fed the checkers.
+task automatic test_property_summary;
+    begin
+        begin_test("Suite-wide properties: LRU divergence, L-bus/MEM-bus contracts");
+        $display("      LRU: %0d update checks, %0d victim checks; L-bus: %0d req-pend, %0d rsp-pend cycles; MEM-bus: %0d pend cycles",
+                 lru_upd_checks, lru_vic_checks, lbus_dreq_pends, lbus_drsp_pends, mbus_req_pends);
+        chk_true("LRU checker exercised", (lru_upd_checks > 100) && (lru_vic_checks > 20));
+        chk("LRU divergences",                    lru_mismatches[31:0], 32'd0);
+        chk_true("D-request stability exercised", lbus_dreq_pends > 0);
+        chk("L-bus D-request stability violations", lbus_dreq_viol[31:0], 32'd0);
+        chk("L-bus D-response hold violations",     lbus_drsp_viol[31:0], 32'd0);
+        chk("MEM-bus request stability violations", mbus_req_viol[31:0],  32'd0);
         end_test;
     end
 endtask
@@ -2891,6 +3752,7 @@ initial begin
     d_fault_en     = 1'b0;
     d_fault_widx   = 8'd0;
     d_latency      = 1;
+    i_latency      = 0;    //IPC baselines were locked with instant instruction reads
 
     $display("######## cpu_core_tb ########");
 
@@ -2985,6 +3847,30 @@ initial begin
     test_cached_store_load_spaced;
     test_cached_store_load_fwd;
     test_cached_store_hit_load;
+
+    //Cache coherency + I-side RDW goldens: unified-array self-modify visibility, the
+    //byte-lane bypass compose, and wb-buffer alias ordering. See cache-microbench-gaps.
+    group("9. Cache coherency goldens: self-modify, byte-lane RDW, wb-buffer alias");
+    test_cached_byte_store_fwd;
+    test_cached_selfmod_sweep;
+    test_cached_selfmod_branch(8'h09, "Self-modify via redirect: poked line refetched after BRA (write-back)");
+    test_cached_selfmod_branch(8'h0B, "Self-modify via redirect: poked line refetched after BRA (write-through)");
+    test_cached_wb_alias;
+
+    //Miss-flow stress: fill-stretch latency sweeps (squash timing), per-beat fill
+    //faults, the drain-fault law, and dense LRU traffic. See cache-microbench-gaps.
+    group("10. Cache stress: latency/squash sweep, fill faults, drain law, LRU thrash");
+    test_cached_latency_invariance;
+    test_cached_fill_fault_d;
+    test_cached_fill_fault_i;
+    test_cached_fill_fault_victim;
+    test_cached_pref_fill_fault;
+    test_cached_drain_fault_law;
+    test_cached_lru_thrash;
+
+    //Verdicts of the always-on passive checkers, judged over the WHOLE suite.
+    group("11. Suite-wide property checkers");
+    test_property_summary;
 
     $display("");
     $display("################################");

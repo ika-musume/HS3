@@ -698,163 +698,86 @@ function automatic logic source_matches_load(
     source_matches_load = source_used && load_valid && load_write && source_id == load_dst;
 endfunction
 
-function automatic logic [31:0] forwarded_id_value(
-    input logic [31:0] base_value,     //GPR-file read for this source (the ID/BRAM value)
+//EX-head forward lane: which REGISTERED word patches this operand at the head of EX.
+//Replaces the ID-mux LIVE legs (the ex_result ALU tail and the ld_word aligner):
+//the EX producer's result is read from EX/MA one cycle later (G0/G1), and the WB
+//view (FWD_WB, or a drained G0/G1 producer) reads the registered MA/WB packet on
+//its one live cycle, then a shadow register DEPOSITED from it (reg->reg; the r_t
+//running-deposit model on operands - no live cache/completion term anywhere).
+typedef enum logic [1:0] {
+    FWD_NONE    = 2'd0,     //no patch: idex.src_* / agu_base_q as captured in ID
+    FWD_EXMA_G0 = 2'd1,     //producer in EX at my ID -> exma.gpr0_data at my EX
+    FWD_EXMA_G1 = 2'd2,     //producer address-update lane -> exma.gpr1_data
+    FWD_WB      = 2'd3      //WB view: mawb word (live cycle) / deposited shadow
+} fwd_lane_t;
+
+//Lane pick, ID time, REGISTERED-field compares ONLY (no live cache/ALU term).
+//Priority matches the old select chain: EX result (youngest) shadows the MA load;
+//gpr1/gpr0 of one producer never both match (double writes suppressed in ID).
+//The EX gpr0 leg excludes loads (word not ready until MA; the load-use interlock
+//holds the consumer in ID instead, and the FWD_WB view catches the release: the
+//consumer issues at the load's completion edge, so its first EX cycle IS the
+//producer's one live mawb cycle).
+//Fault/flush qualifiers omitted on the discard argument (see load_forward_active
+//history): a faulting/killed producer flushes this consumer's packet with it.
+function automatic fwd_lane_t fwd_lane_pick(
     input logic        source_used,
     input logic [4:0]  source_id,
-    input logic        ex_fwd_en,       //EX result is a valid, non-flushed forward candidate
-    input exma_t       ex_result,       //combinational EX result of the younger instruction
-    input exma_t       exma,            //registered EX/MA packet (older instruction in MA)
-    input logic        wb_data_ready,   //MA load response returned this cycle (= data_response)
-    input mawb_t       ma_result        //MA/WB packet; gpr0_data carries the returned load word
+    input idex_t       idex,           //producer candidate in EX
+    input exma_t       exma            //older load candidate in MA
 );
-    //Two independent producers may target source_id at once: a younger instruction
-    //in EX and an older one in MA. The reader must take the youngest, so a priority
-    //EX > MA > GPR-file is mandatory; the final select is an ordinary priority mux.
-    //
-    //Lateness is confined to the MA LOAD term: its data (load word) and qualifier
-    //(wb_data_ready, response fault) arrive late from the cache. Every match address
-    //compares a REGISTERED field, so the EX and MA-early hits resolve before the load,
-    //which keeps the live cache hit off the deep forwarding cone.
-    //
-    //ex_fwd_en qualifies the EX term with idex.valid && !wb_fault_pending ONLY - the
-    //pipeline-advance handshake (ex_complete = req_ready accept, exma_allow = ma_complete)
-    //is intentionally NOT here. The register that captures this value (ID/EX, idex_allow)
-    //enables only when ex_complete && exma_allow already hold, so re-testing the handshake
-    //in the value select is redundant and merely welds the deep req_ready/ma_complete cone
-    //onto the forwarding mux. ex_result.gpr0_we is not valid-gated, hence the idex.valid term.
-    logic        ex_g1, ma_g1;             //gpr1 (post-increment address) port matched
-    logic        ex_take, ma_take, ld_take; //EX hit, MA early hit, MA late load hit
-    logic [31:0] ex_val, ma_val, ld_val;
+    logic ex_g1, ex_g0, ld_ma;
     begin
-        //EX producer: gpr0 excludes loads (value not ready until MA); gpr1 is an addr update.
-        ex_g1   = source_used && ex_fwd_en && !ex_result.fault &&
-                  ex_result.gpr1_we && ex_result.gpr1_dst == source_id;
-        ex_take = ex_g1 || (source_used && ex_fwd_en && !ex_result.fault &&
-                            ex_result.mem_op != MEM_LOAD &&
-                            ex_result.gpr0_we && ex_result.gpr0_dst == source_id);
-        ex_val  = ex_g1 ? ex_result.gpr1_data : ex_result.gpr0_data;
+        ex_g1 = source_used && idex.valid &&
+                idex.gpr1_we && idex.gpr1_dst == source_id;
+        ex_g0 = source_used && idex.valid && idex.mem_op != MEM_LOAD &&
+                idex.gpr0_we && idex.gpr0_dst == source_id;
+        ld_ma = source_used && exma.valid && exma.mem_op == MEM_LOAD &&
+                exma.gpr0_we && exma.gpr0_dst == source_id;
+        fwd_lane_pick = ex_g1 ? FWD_EXMA_G1 :
+                        ex_g0 ? FWD_EXMA_G0 :
+                        ld_ma ? FWD_WB      : FWD_NONE;
+    end
+endfunction
 
-        //MA producer, EARLY: non-load gpr0 result and gpr1 address update. Registered
-        //exma fields and exma.fault only, so this term carries no cache delay.
+//MA-only ID residue forward: the EX live leg and the MA load word moved to the
+//EX-head lanes (fwd_lane_pick above), so ID folds ONLY the registered MA (exma)
+//producer over the WB-lane / R0-mirror base residue. Registered fields throughout;
+//exma.fault is a registered bit (no live AGU cone rides this select).
+function automatic logic [31:0] ma_forward(
+    input logic [31:0] base_value,     //WB-lane / R0-mirror residue for this source
+    input logic        source_used,
+    input logic [4:0]  source_id,
+    input exma_t       exma
+);
+    logic        ma_g1, ma_take;
+    logic [31:0] ma_val;
+    begin
+        //gpr1 is the address-update lane (ready in EX, loads included); gpr0
+        //excludes loads (their word rides the EX-head SHADOW deposit instead).
         ma_g1   = source_used && exma.valid && !exma.fault &&
                   exma.gpr1_we && exma.gpr1_dst == source_id;
         ma_take = ma_g1 || (source_used && exma.valid && !exma.fault &&
                             exma.mem_op != MEM_LOAD &&
                             exma.gpr0_we && exma.gpr0_dst == source_id);
         ma_val  = ma_g1 ? exma.gpr1_data : exma.gpr0_data;
-
-        //MA producer, LATE: gpr0 load value. Address match is registered (early); only
-        //wb_data_ready and !ma_result.fault are late, and ma_result.gpr0_data is the word.
-        ld_take = source_used && exma.valid && wb_data_ready && !ma_result.fault &&
-                  exma.mem_op == MEM_LOAD &&
-                  exma.gpr0_we && exma.gpr0_dst == source_id;
-        ld_val  = ma_result.gpr0_data;
-
-        //Priority mux: EX newest, then MA non-load, then MA load, then the GPR file.
-        //Only ld_take carries the late cache term, and it sits at the tail of the chain.
-        forwarded_id_value = ex_take ? ex_val :
-                             ma_take ? ma_val :
-                             ld_take ? ld_val : base_value;
+        ma_forward = ma_take ? ma_val : base_value;
     end
 endfunction
 
-//forwarded_id_value split into two PARALLEL pieces so the late cen_n cache load word never
-//sits upstream of the deep forwarding cone (Route B, int_pipe.md). nonload_forward resolves the
-//EX/MA-early priority from REGISTERED fields only (early, in parallel with the cache read);
-//load_forward_active is just the select bit for the MA load word (late only via wb_data_ready).
-//The consumer combines them as `load_forward_active ? ld_word : nonload_forward`, identical to
-//forwarded_id_value, but with the late word crossing a single flat mux level.
-function automatic logic [31:0] nonload_forward(
-    input logic [31:0] base_value,     //GPR-file read for this source
+//Select-only twin of ma_forward: does the MA producer shadow this source (steers
+//the GPR BRAM words off the last-level operand mux onto the early residue).
+function automatic logic ma_take_only(
     input logic        source_used,
     input logic [4:0]  source_id,
-    input logic        ex_fwd_en,
-    input exma_t       ex_result,
     input exma_t       exma
 );
-    logic        ex_g1, ma_g1, ex_take, ma_take;
-    logic [31:0] ex_val, ma_val;
     begin
-        //The EX-forward SELECT deliberately omits !ex_result.fault: ex_result.fault
-        //folds address_error, which is the AGU-output misalignment check, so gating the
-        //select on it welds the 32-bit AGU adder onto the forwarding mux. A faulting EX
-        //instruction takes an exception and flushes the younger ID consumer, so whatever
-        //value is forwarded on that cycle is discarded - the fault gate was pure
-        //redundancy on the value path. The registered exma.fault below is kept (no AGU).
-        ex_g1   = source_used && ex_fwd_en &&
-                  ex_result.gpr1_we && ex_result.gpr1_dst == source_id;
-        ex_take = ex_g1 || (source_used && ex_fwd_en &&
-                            ex_result.mem_op != MEM_LOAD &&
-                            ex_result.gpr0_we && ex_result.gpr0_dst == source_id);
-        ex_val  = ex_g1 ? ex_result.gpr1_data : ex_result.gpr0_data;
-        ma_g1   = source_used && exma.valid && !exma.fault &&
-                  exma.gpr1_we && exma.gpr1_dst == source_id;
-        ma_take = ma_g1 || (source_used && exma.valid && !exma.fault &&
-                            exma.mem_op != MEM_LOAD &&
-                            exma.gpr0_we && exma.gpr0_dst == source_id);
-        ma_val  = ma_g1 ? exma.gpr1_data : exma.gpr0_data;
-        nonload_forward = ex_take ? ex_val : ma_take ? ma_val : base_value;
-    end
-endfunction
-
-//Select-only twin of nonload_forward: does an EX or MA (non-load) forward shadow this
-//source? Routes the GPR BRAM words through the LAST-level operand mux only when no
-//forward wins. Term-for-term identical to the take products inside nonload_forward.
-function automatic logic nonload_take(
-    input logic        source_used,
-    input logic [4:0]  source_id,
-    input logic        ex_fwd_en,
-    input exma_t       ex_result,
-    input exma_t       exma
-);
-    logic ex_take, ma_take;
-    begin
-        ex_take = (source_used && ex_fwd_en &&
-                   ex_result.gpr1_we && ex_result.gpr1_dst == source_id) ||
-                  (source_used && ex_fwd_en &&
-                   ex_result.mem_op != MEM_LOAD &&
-                   ex_result.gpr0_we && ex_result.gpr0_dst == source_id);
-        ma_take = (source_used && exma.valid && !exma.fault &&
-                   exma.gpr1_we && exma.gpr1_dst == source_id) ||
-                  (source_used && exma.valid && !exma.fault &&
-                   exma.mem_op != MEM_LOAD &&
-                   exma.gpr0_we && exma.gpr0_dst == source_id);
-        nonload_take = ex_take || ma_take;
-    end
-endfunction
-
-function automatic logic load_forward_active(
-    input logic        source_used,
-    input logic [4:0]  source_id,
-    input logic        ex_fwd_en,
-    input exma_t       ex_result,
-    input exma_t       exma
-);
-    logic ex_g1, ma_g1, ex_take, ma_take, ld_take;
-    begin
-        //Recompute the EX/MA-early hits so the MA load only wins when unshadowed (EX>MA>LD).
-        //ALL registered-field compares - the select is fully EARLY. Completion (wb ready)
-        //and fault are deliberately NOT tested - neither the load's own exma.fault nor
-        //ex_result.fault on the EX shadow terms: ex_result.fault folds address_error = the
-        //LIVE AGU adder output, so gating here welds that adder onto the operand-select
-        //cone (fit4 worst path). Discard argument as in nonload_forward above: a faulting
-        //EX flushes the younger ID consumer, and an incomplete load keeps id_issue blocked
-        //via the exma-load interlock, so a mis-picked value lands only in a squashed packet.
-        ex_g1   = source_used && ex_fwd_en &&
-                  ex_result.gpr1_we && ex_result.gpr1_dst == source_id;
-        ex_take = ex_g1 || (source_used && ex_fwd_en &&
-                            ex_result.mem_op != MEM_LOAD &&
-                            ex_result.gpr0_we && ex_result.gpr0_dst == source_id);
-        ma_g1   = source_used && exma.valid && !exma.fault &&
-                  exma.gpr1_we && exma.gpr1_dst == source_id;
-        ma_take = ma_g1 || (source_used && exma.valid && !exma.fault &&
-                            exma.mem_op != MEM_LOAD &&
-                            exma.gpr0_we && exma.gpr0_dst == source_id);
-        ld_take = source_used && exma.valid &&
-                  exma.mem_op == MEM_LOAD &&
-                  exma.gpr0_we && exma.gpr0_dst == source_id;
-        load_forward_active = ld_take && !ex_take && !ma_take;
+        ma_take_only = (source_used && exma.valid && !exma.fault &&
+                        exma.gpr1_we && exma.gpr1_dst == source_id) ||
+                       (source_used && exma.valid && !exma.fault &&
+                        exma.mem_op != MEM_LOAD &&
+                        exma.gpr0_we && exma.gpr0_dst == source_id);
     end
 endfunction
 

@@ -172,6 +172,8 @@ logic   [31:0]  wb_data [0:3];
 logic   [1:0]   wb_load_word;   //victim copy-in progress
 logic   [1:0]   wb_drain_word;  //drain-out progress
 logic           drain_for_vic;  //draining to free the buffer for a new victim
+logic           drain_to_wbuf;  //post-drain route: 1 = buffer the dirty victim (S_WBUF_RD),
+                                //0 = alias-only drain - go straight to the fill (after_wb)
 
 logic           mem_pending;
 
@@ -468,15 +470,29 @@ always_comb begin
             tag_we[2] = store_wb_qual && hit_w[2] && !tag_rdata[2][19];
             tag_we[3] = store_wb_qual && hit_w[3] && !tag_rdata[3][19];
         end
-        if(state == S_IFILL_WAIT && I_BUS.rsp_valid && I_BUS.rsp_ready &&
-           !I_BUS.rsp_fault && fill_word == 2'd3) begin
-            tag_wdata       = {1'b1, 1'b0, tag_of(cur_addr)};
-            tag_we[cur_way] = 1'b1;
+        //Fill tag update: completion validates the line. A mid-line FAULT instead
+        //INVALIDATES the victim way: earlier beats already overwrote its data words,
+        //and the old tag would otherwise stay valid over the half-filled line - a
+        //later access to the old address would hit CORRUPT data (victim-integrity golden).
+        if(state == S_IFILL_WAIT && I_BUS.rsp_valid && I_BUS.rsp_ready) begin
+            if(I_BUS.rsp_fault) begin
+                tag_wdata       = 21'd0;                    //kill V (and U) of the victim way
+                tag_we[cur_way] = 1'b1;
+            end
+            else if(fill_word == 2'd3) begin
+                tag_wdata       = {1'b1, 1'b0, tag_of(cur_addr)};
+                tag_we[cur_way] = 1'b1;
+            end
         end
-        if(state == S_DFILL_WAIT && I_BUS.rsp_valid && I_BUS.rsp_ready &&
-           !I_BUS.rsp_fault && fill_word == 2'd3) begin
-            tag_wdata       = {1'b1, cur_write, tag_of(cur_addr)};  //U=1 for write-allocate
-            tag_we[cur_way] = 1'b1;
+        if(state == S_DFILL_WAIT && I_BUS.rsp_valid && I_BUS.rsp_ready) begin
+            if(I_BUS.rsp_fault) begin
+                tag_wdata       = 21'd0;
+                tag_we[cur_way] = 1'b1;
+            end
+            else if(fill_word == 2'd3) begin
+                tag_wdata       = {1'b1, cur_write, tag_of(cur_addr)};  //U=1 for write-allocate
+                tag_we[cur_way] = 1'b1;
+            end
         end
         if(state == S_MMTAG_WR) begin
             //Memory-mapped tag write. Associative keeps tag+LRU, sets V/U only;
@@ -709,11 +725,19 @@ wire            vic_ctl_i = bram_cacheable_i && !i_I_SQUASH;
 wire            vic_pre = (acc_d_q && vic_ctl_d) || (acc_i_q && vic_ctl_i);
 wire            vic_ld  = vic_pre && !hit;
 
+//WB-BUFFER ALIAS GUARD: the missed line's own dirty copy still sits undrained in the
+//write-back buffer (fill-first ordering, pp.111-112). Filling from memory now would read
+//stale data AND the later drain would strand the stale line in the array (lost update).
+//Force a full drain first, then fill. PA line compare: region bits [31:29] ignored
+//(P0/P1 alias to one PA); wb_pa[31:29] is 000 by construction. Fills only - non-cacheable
+//bypass vs a buffered line stays software-coherency territory, like bypass vs the array.
+wire    wb_alias = wb_valid && (bram_addr[28:4] == wb_pa[28:4]);
+
 //Miss-dispatch next state, one shared select tree for all three fill sites (drain a
-//dirty victim first; else straight to the fill; D flag alone picks the fill flavor).
+//dirty victim or an aliased buffer first; else straight to the fill).
 state_t         vic_state_nx;
-assign  vic_state_nx = victim_dirty ? (wb_valid ? S_DRAIN_REQ : S_WBUF_RD)
-                                    : (bram_is_data ? S_DFILL_REQ : S_IFILL_REQ);
+assign  vic_state_nx = (victim_dirty || wb_alias) ? (wb_valid ? S_DRAIN_REQ : S_WBUF_RD)
+                                                  : (bram_is_data ? S_DFILL_REQ : S_IFILL_REQ);
 
 //cur_way next value, FLAT: (hit ? priority-encode(hit_w) : victim) folded to one
 //5-input LUT per bit (the encode truth table absorbs the fallback select).
@@ -765,6 +789,7 @@ always_ff @(posedge i_CLK or negedge i_RST_n) begin
         wb_load_word  <= 2'd0;
         wb_drain_word <= 2'd0;
         drain_for_vic <= 1'b0;
+        drain_to_wbuf <= 1'b0;
         mem_pending   <= 1'b0;
         rsp_valid_i   <= 1'b0;
         rsp_inst      <= 16'd0;
@@ -852,9 +877,12 @@ always_ff @(posedge i_CLK or negedge i_RST_n) begin
                         //PREF: allocate if cacheable & miss (vic_ld below); a hit is
                         //acked live; the non-cacheable no-op ack fired at the accept edge.
                         if(bram_cacheable_d && !hit) begin
-                            if(victim_dirty) begin
-                                if(wb_valid) drain_for_vic <= 1'b1;
-                                else         wb_load_word  <= 2'd0;
+                            if(victim_dirty || wb_alias) begin
+                                if(wb_valid) begin  //alias implies wb_valid: drain first
+                                    drain_for_vic <= 1'b1;
+                                    drain_to_wbuf <= victim_dirty;
+                                end
+                                else wb_load_word <= 2'd0;
                             end
                         end
                     end
@@ -875,9 +903,12 @@ always_ff @(posedge i_CLK or negedge i_RST_n) begin
                             state <= S_DBYP_REQ;            //write-through store miss: no allocate
                         else begin
                             //Read / write-allocate miss: fill (write back a dirty victim first).
-                            if(victim_dirty) begin
-                                if(wb_valid) drain_for_vic <= 1'b1;
-                                else         wb_load_word  <= 2'd0;
+                            if(victim_dirty || wb_alias) begin
+                                if(wb_valid) begin  //alias implies wb_valid: drain first
+                                    drain_for_vic <= 1'b1;
+                                    drain_to_wbuf <= victim_dirty;
+                                end
+                                else wb_load_word <= 2'd0;
                             end
                         end
                     end
@@ -894,9 +925,12 @@ always_ff @(posedge i_CLK or negedge i_RST_n) begin
                             rsp_valid_i <= 1'b1;
                         end
                         else begin
-                            if(victim_dirty) begin
-                                if(wb_valid) drain_for_vic <= 1'b1;
-                                else         wb_load_word  <= 2'd0;
+                            if(victim_dirty || wb_alias) begin
+                                if(wb_valid) begin  //alias implies wb_valid: drain first
+                                    drain_for_vic <= 1'b1;
+                                    drain_to_wbuf <= victim_dirty;
+                                end
+                                else wb_load_word <= 2'd0;
                             end
                         end
                     end
@@ -1003,8 +1037,12 @@ always_ff @(posedge i_CLK or negedge i_RST_n) begin
                         wb_drain_word <= 2'd0;
                         if(drain_for_vic) begin
                             drain_for_vic <= 1'b0;
-                            wb_load_word  <= 2'd0;
-                            state         <= S_WBUF_RD;    //buffer free: load the new victim
+                            if(drain_to_wbuf) begin
+                                wb_load_word <= 2'd0;
+                                state        <= S_WBUF_RD; //buffer free: load the new victim
+                            end
+                            else    //alias-only drain: memory is fresh, go fill the miss
+                                state <= (after_wb == AW_IFILL) ? S_IFILL_REQ : S_DFILL_REQ;
                         end
                         else
                             state <= S_IDLE;
@@ -1065,8 +1103,8 @@ always_ff @(posedge i_CLK or negedge i_RST_n) begin
                 if(I_BUS.rsp_valid && I_BUS.rsp_ready) begin
                     mem_pending <= 1'b0;
                     if(I_BUS.rsp_fault) begin
-                        //A prefetch silently abandons a faulting fill (no exception);
-                        //the line is left invalid (tag not yet written).
+                        //A prefetch silently abandons a faulting fill (no exception).
+                        //The victim way is invalidated at this edge (tag control block).
                         rsp_rdata   <= 32'd0;
                         rsp_fault_d <= cur_pref ? 1'b0 : 1'b1;
                         rsp_valid_d <= 1'b1;
@@ -1174,6 +1212,7 @@ always_ff @(posedge i_CLK or negedge i_RST_n) begin
                         victim_tag <= tag_rdata[mm_sel_way][18:0];
                         if(wb_valid) begin
                             drain_for_vic <= 1'b1;
+                            drain_to_wbuf <= 1'b1;      //displaced entry is dirty: buffer it
                             state         <= S_DRAIN_REQ;
                         end
                         else begin

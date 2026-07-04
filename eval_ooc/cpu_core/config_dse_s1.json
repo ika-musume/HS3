@@ -1,7 +1,7 @@
 {
-  "project_name": "HS3",
-  "top_module": "HS3_ooc_top",
-  "top_source": "HS3_ooc_top.sv",
+  "project_name": "cpu_core",
+  "top_module": "cpu_core_ooc_top",
+  "top_source": "cpu_core_ooc_top.sv",
   "sources": [
     "../../src/cpu_core/int_pipe_pkg.sv",
     "../../src/cpu_core/cache_pkg.sv",
@@ -14,26 +14,12 @@
     "../../src/cpu_core/ctrl_reg.sv",
     "../../src/cpu_core/exc_handler.sv",
     "../../src/cpu_core/cpu_core.sv",
-    "../../src/peri/peri_bus_if.sv",
-    "../../src/peri/ibus_splitter.sv",
-    "../../src/peri/ibus_bridge.sv",
-    "../../src/peri/cpg_wdt.sv",
-    "../../src/peri/intc.sv",
-    "../../src/peri/bsc.sv",
-    "../../src/peri/tmu.sv",
-    "../../src/peri/rtc.sv",
-    "../../src/peri/ioport.sv",
-    "../../src/HS3.sv",
-    "HS3_ooc_top.sv"
+    "cpu_core_ooc_top.sv"
   ],
   "clock_port": "i_CLK",
   "clock_ports": [
-    "i_CLK",
-    "i_EXTAL2"
+    "i_CLK"
   ],
-  "async_clocks": {
-    "i_EXTAL2": 0.032768
-  },
   "reset_ports": [
     "i_POR_n",
     "i_RST_n"
@@ -48,9 +34,9 @@
     "family": "Cyclone V",
     "device": "5CSEBA6U23I7",
     "docker_image": "raetro/quartus:17.0",
-    "revision": "HS3_quartus_ooc",
-    "run_name": "quartus_cyclonev_100_dse",
-    "seed": 3
+    "revision": "cpu_core_quartus_ooc",
+    "run_name": "quartus_cyclonev_100_dse_s1",
+    "seed": 1
   },
   "false_paths": [
     {

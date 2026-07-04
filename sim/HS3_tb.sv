@@ -1022,7 +1022,9 @@ task automatic bench_ipc_cached(input integer body, input integer iters);
 
         chk("cached loop R3 = body (fetch integrity)", gpr(3), body);
         chk("cached loop R5 = 0 (DT;BF count)",        gpr(5), 32'd0);
-        chk("cached retires (parity)",     bench_retires,     32'd1147);
+        //Relocked 2026-07-05: the wrong-path fetch-leak fix (int_pipe drop_d) removed
+        //~1 bogus retire per taken branch; cycle count unchanged (same real work).
+        chk("cached retires (parity)",     bench_retires,     32'd1137);
         chk("cached arch-cycles (parity)", bench_arch_cycles, 32'd1167);
         do_reset;
     end
@@ -1066,8 +1068,10 @@ task automatic bench_ipc_store(input integer nstores, input integer iters);
                      ((bench_retires * 1000) / bench_arch_cycles) % 1000);
         chk("store loop verify load -> R2", gpr(2), 32'h0000_005A);
         chk("store loop R5 = 0 (DT;BF count)", gpr(5), 32'd0);
-        chk("store retires (parity)",     bench_retires,     32'd418);
-        chk("store arch-cycles (parity)", bench_arch_cycles, 32'd827);
+        //Relocked 2026-07-05 (fetch-leak fix): the old 827-cycle figure was TRUNCATED -
+        //a leaked wrong-path sentinel retire ended the measurement window early.
+        chk("store retires (parity)",     bench_retires,     32'd414);
+        chk("store arch-cycles (parity)", bench_arch_cycles, 32'd848);
         do_reset;
     end
 endtask
@@ -2346,7 +2350,7 @@ task automatic bench_ipc_sdram;
                      ((bench_retires * 1000) / bench_arch_cycles) / 1000,
                      ((bench_retires * 1000) / bench_arch_cycles) % 1000);
         chk("SDRAM cached loop R3", gpr(3), 32'd100);
-        chk("SDRAM cached retires (incl. boot)",     bench_retires,     32'd1319);
+        chk("SDRAM cached retires (incl. boot)",     bench_retires,     32'd1311); //relocked 2026-07-05 (fetch-leak fix)
         chk("SDRAM cached arch-cycles (incl. boot)", bench_arch_cycles, 32'd2114);
         end_test;
     end
@@ -2764,7 +2768,9 @@ task automatic test_pbus_tmu_regs;
         chk("PCCR reset 0xAAAA (P window)",     dmem[16'h12], 32'hFFFF_AAAA);
         chk("port-window fringe stays dummy",   dmem[16'h13], 32'h0000_0000);
         chk("TCPR2 never initialized (sim 0)",  dmem[16'h14], 32'h0000_0000);
-        chk_true("PTH7 drives as TCLK (TCOE & PH7 mode 00)", pth_oe[7] && !pth_o[7]);
+        //Drive grant only: the pad VALUE is the toggling RTC output clock (phase depends
+        //on the sample instant; the pad==RTCCLK value law is locked by the RTC-clock test).
+        chk_true("PTH7 drives as TCLK (TCOE & PH7 mode 00)", pth_oe[7]);
         chk_true("PTH6-0 stay inputs",          pth_oe[6:0] == 7'd0);
         end_test;
     end
