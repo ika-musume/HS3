@@ -68,6 +68,7 @@ module int_pipe #(
     //the redirect will discard (mawb..fetch_pc priority; retire+2 on a plain stream,
     //the branch-target stream head after a taken branch).
     output  logic           o_RETIRE_INT_DEFER,
+    output  logic           o_MA_INFLIGHT,      //accepted D access / RMW-MAC mid-sequence: defer acceptance
     output  logic   [31:0]  o_INT_NEXT_PC,
     output  logic           o_RETIRE_GPR_WE,
     output  logic   [4:0]   o_RETIRE_GPR,
@@ -349,7 +350,8 @@ always_comb begin
               (ifid.inst[15:12] == 4'h4 && ifid.inst[3:0] == 4'h3)  ||
               (ifid.inst[15:12] == 4'h0 && ifid.inst[7:0] == 8'h2A) ||
               (ifid.inst[15:12] == 4'h4 && ifid.inst[7:0] == 8'h22) ||
-              (ifid.inst == 16'h00_0B);
+              (ifid.inst == 16'h00_0B) ||
+              (ifid.inst == 16'h00_2B);   //RTE reads SPC (EX target) and SSR
     if(ifid.valid && ifid.pd.reads_sr !== ref_sr)
         $fatal(1, "pd.reads_sr mismatch: inst=%04x pd=%b ref=%b", ifid.inst, ifid.pd.reads_sr, ref_sr);
     if(ifid.valid && ifid.pd.uses_mac !== ref_mac)
@@ -1146,6 +1148,12 @@ logic           ctrl_misc_write_pending;//older GBR/VBR/SSR/SPC/PR write still u
 assign data_response = data_req_sent && d_rsp_valid;
 assign wb_valid      = mawb.valid;
 assign wb_fault_pending = wb_valid && mawb.fault;
+//Interrupt-acceptance defer (exc_handler): killing an ACCEPTED D access orphans its
+//response - the held rsp_valid_d wedges the shared L-bus response channel and starves
+//every later fetch - and killing between the legs of a locked RMW / MAC pair splits an
+//indivisible sequence (dangling bus lock). Acceptance waits until the op leaves MA; a
+//not-yet-granted request stays killable (L-bus withdrawal is legal). Registered terms.
+assign o_MA_INFLIGHT = data_req_sent || (exma.valid && !exma.fault && ma_second_access);
 //!i_REDIRECT_VALID: the packet in WB at an interrupt-redirect edge is KILLED (its
 //retirement and every other commit lane are suppressed) - without this gate its GPR
 //write leaked and the resumed instruction ran twice (interrupt-sweep golden).
@@ -1949,9 +1957,16 @@ always_comb begin
                      (idex.privileged && !i_SR[30]) || address_error;
     //Request-valid base: everything except the exma_allow qualifier, which carries the
     //cache late bits and is ANDed in per rail (see the 4-rail block below u_ma_seq).
+    //!i_REDIRECT_VALID: a D request granted AT a kill edge runs wrong-path and its
+    //response is orphaned (the fetch drop_d leak's D-side twin). !(data_response &&
+    //d_rsp_fault): the elder MA op's SAME-EDGE fault response must block this fire -
+    //wb_kill_ex sees the fault one cycle too late; the unfired op stalls in MA until
+    //the fault redirect kills it. Both found by the exception/interrupt sweeps.
     early_d_req_base = idex.valid &&
                         !fault_hold && !wb_kill_ex &&
-                        !early_ex_fault && idex.mem_op != MEM_NONE;
+                        !early_ex_fault && idex.mem_op != MEM_NONE &&
+                        !i_REDIRECT_VALID &&
+                        !(data_response && d_rsp_fault);
     ex_req       = '0;
     ex_req.valid = early_d_req_valid;
     ex_req.write = idex.mem_op == MEM_STORE;
@@ -2352,12 +2367,14 @@ assign  o_I_SQUASH = fetch_drop;
 //retiree already committed). Plain stream -> mawb = retire+2; post-taken-branch ->
 //every live stage holds the TARGET stream, so the mux lands on its head. The old
 //retire_pc+2 rule lost taken branches when the accept hit a branch/slot retire.
+//!fetch_drop: a DROPPED wrong-path fetch (unwithdrawable at a branch redirect) still
+//holds its stale fall-through PC - the live resume point is fetch_pc (miss sweep).
 assign  o_INT_NEXT_PC = mawb.valid    ? mawb.pc :
                         exma.valid    ? exma.pc :
                         idex.valid    ? idex.pc :
                         ifid.valid    ? ifid.pc :
                         pair_ready    ? pair_pc :
-                        fetch_pending ? fetch_pending_pc : fetch_pc;
+                        (fetch_pending && !fetch_drop) ? fetch_pending_pc : fetch_pc;
 
 //The former o_D_REQ_RAW sideband is now L_BUS.req_fetch (= !l_is_data), driven above; the
 //former o_I_REQ_RAW cold-accept sideband died with the cache's reqn machinery (the single

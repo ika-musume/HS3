@@ -275,6 +275,7 @@ logic   [31:0]  exception_entry_pc_l;
 integer         entry_count;         //exception/interrupt entries since reset
 logic           entry_z;             //one-cycle-delayed entry pulse (SPC settle)
 logic   [31:0]  entry_spc_l;         //SPC captured the cycle after each entry
+integer         int_ack_count;       //o_INT_ACK pulses since reset (INTC drop key)
 logic           gpr_phase_write_seen;
 logic           gpr_phase_read_seen;
 logic           gpr_phase_capture_seen;
@@ -317,6 +318,7 @@ always_ff @(posedge clk or negedge rst_n) begin
         entry_count          <= 0;
         entry_z              <= 1'b0;
         entry_spc_l          <= 32'd0;
+        int_ack_count        <= 0;
         gpr_phase_write_seen   <= 1'b0;
         gpr_phase_read_seen    <= 1'b0;
         gpr_phase_capture_seen <= 1'b0;
@@ -365,6 +367,9 @@ always_ff @(posedge clk or negedge rst_n) begin
             end
             entry_z <= exception_entry_valid;
             if(entry_z) entry_spc_l <= spc_o;   //SPC is committed by the cycle after entry
+            //Clocked ack sampling: the SoC INTC drops its request on this pulse, so an
+            //ack WITHOUT a matching interrupt entry is a lost interrupt (collision law).
+            if(int_ack_w) int_ack_count <= int_ack_count + 1;
         end
 
         //IPC benchmark window. One architectural cycle per posedge; counting starts
@@ -462,6 +467,7 @@ integer         lru_vic_checks   = 0;       //victim choices cross-checked
 integer         lru_mismatches   = 0;
 
 integer         squash_fill_hits = 0;       //cycles with I_SQUASH high during an I-fill run
+integer         entry_cache_busy = 0;       //interrupt/exception entries with the cache FSM mid-excursion
 
 integer         lbus_dreq_pends  = 0;       //unaccepted-and-held D-request cycles observed
 integer         lbus_dreq_viol   = 0;       //D-request field mutated while pending
@@ -566,6 +572,11 @@ always @(posedge clk) begin
         //redirects inside I-fill excursions (consume-and-drop path exercised).
         if(u_dut.pipe_i_squash && (cst == CS_IFILL_REQ || cst == CS_IFILL_WAIT))
             squash_fill_hits = squash_fill_hits + 1;
+
+        //(4) Entry-vs-machinery coverage: proves the interrupt sweeps really land
+        //acceptance edges while the cache FSM is mid-fill/drain/bypass (not IDLE).
+        if(exception_entry_valid && cst != CS_IDLE)
+            entry_cache_busy = entry_cache_busy + 1;
     end
 end
 
@@ -576,9 +587,35 @@ logic           dbg_trace_mem = 1'b0;
 always @(posedge clk) begin
     if(dbg_trace && retire_valid)
         $display("        [trace %0t] RET pc=%08h inst=%04h", $time, retire_pc, retire_inst);
+    if(dbg_trace && retire_gpr_we)
+        $display("        [trace %0t] RETW R%0d <= %08h", $time, retire_gpr, retire_gpr_data);
     if(dbg_trace_mem && MEM_BUS.req_valid && MEM_BUS.req_ready)
         $display("        [trace %0t] MEM %s addr=%08h %s", $time,
                  MEM_BUS.req_write ? "WR" : "RD", MEM_BUS.req_addr, req_is_data ? "(D)" : "(I)");
+    if(dbg_trace && exc_valid)
+        $display("        [trace %0t] EXC cause=%0d pc=%08h aaddr=%08h wr=%b slot=%b inst_at_pc=%04h",
+                 $time, exc_cause, exc_pc, exc_access_addr, exc_access_write,
+                 exc_in_delay_slot, imem[exc_pc[11:1]]);
+    if(dbg_trace && u_dut.u_int_pipe.ex_advance)
+        $display("        [trace %0t] EX  pc=%08h inst=%04h ea=%08h a=%08h b=%08h", $time,
+                 u_dut.u_int_pipe.idex.pc, u_dut.u_int_pipe.idex.inst,
+                 u_dut.u_int_pipe.effective_addr,
+                 u_dut.u_int_pipe.idex.src_a_value, u_dut.u_int_pipe.idex.src_b_value);
+    if(dbg_trace && u_dut.u_int_pipe.wb_valid && !u_dut.u_int_pipe.mawb.fault)
+        $display("        [trace %0t] WB  pc=%08h inst=%04h g0=%b/%0d/%08h g1=%b/%0d/%08h", $time,
+                 u_dut.u_int_pipe.mawb.pc, u_dut.u_int_pipe.mawb.inst,
+                 u_dut.u_int_pipe.mawb.gpr0_we, u_dut.u_int_pipe.mawb.gpr0_dst, u_dut.u_int_pipe.mawb.gpr0_data,
+                 u_dut.u_int_pipe.mawb.gpr1_we, u_dut.u_int_pipe.mawb.gpr1_dst, u_dut.u_int_pipe.mawb.gpr1_data);
+    if(dbg_trace && exception_entry_valid)
+        $display("        [trace %0t] ENTRY nextpc=%08h stages mawb=%b/%08h exma=%b/%08h idex=%b/%08h ifid=%b/%08h pair=%b/%08h fpend=%b/%08h fpc=%08h",
+                 $time, u_dut.u_int_pipe.o_INT_NEXT_PC,
+                 u_dut.u_int_pipe.mawb.valid, u_dut.u_int_pipe.mawb.pc,
+                 u_dut.u_int_pipe.exma.valid, u_dut.u_int_pipe.exma.pc,
+                 u_dut.u_int_pipe.idex.valid, u_dut.u_int_pipe.idex.pc,
+                 u_dut.u_int_pipe.ifid.valid, u_dut.u_int_pipe.ifid.pc,
+                 u_dut.u_int_pipe.pair_ready, u_dut.u_int_pipe.pair_pc,
+                 u_dut.u_int_pipe.fetch_pending, u_dut.u_int_pipe.fetch_pending_pc,
+                 u_dut.u_int_pipe.fetch_pc);
 end
 
 /*
@@ -1929,6 +1966,308 @@ task automatic test_int_timing_sweep;
             chk_true($sformatf("off=%0d: SPC is never the delay slot (spc=%08h)", off, entry_spc_l),
                      entry_spc_l[11:0] != 12'h05A);   //slot PC = byte 0x5A ('h2D)
             chk("INTEVT carries the driven code", intevt_o, 32'h0000_0600);
+        end
+        do_reset;
+        end_test;
+    end
+endtask
+
+//GOLDEN V - interrupt vs miss/fill/drain machinery. The old timing sweep runs at zero
+//latency where cached hits respond combinationally, so an acceptance edge almost never
+//overlaps an in-flight cache excursion. Here the loop walks EIGHT same-set (set 6)
+//lines with dirtying stores - every store misses, iterations 5+ evict a DIRTY victim
+//(drain), and the loop-tail code line shares set 6 so I-misses interleave too - over a
+//(i,d) latency grid. LAWS at every offset: one entry, transparent result, no deadlock.
+//The entry_cache_busy counter proves entries really landed mid-excursion.
+task automatic test_int_miss_sweep;
+    integer g, off, w, busy0, e0;
+    integer il_g [0:3];
+    integer dl_g [0:3];
+    begin
+        begin_test("Interrupt vs miss/fill/drain: acceptance mid-excursion is transparent (grid sweep)");
+        il_g = '{0, 0, 3, 2};
+        dl_g = '{0, 3, 0, 5};
+        busy0 = entry_cache_busy;
+        for(g = 0; g < 4; g = g + 1) begin
+        for(off = 0; off < 120; off = off + 3) begin
+            cacheable_bootstrap(8'h09);
+            i_latency = il_g[g];
+            d_latency = dl_g[g];
+            imem['h20] = 16'hE860;  // MOV    #0x60,R8 ; BL-clear prologue (IMASK=0)
+            imem['h21] = 16'h4818;  // SHLL8  R8
+            imem['h22] = 16'h4828;  // SHLL16 R8
+            imem['h23] = 16'h480E;  // LDC    R8,SR
+            imem['h24] = 16'hED00;  // MOV   #0,R13   ; handler entry counter
+            imem['h25] = 16'hE110;  // MOV   #0x10,R1
+            imem['h26] = 16'h4118;  // SHLL8 R1
+            imem['h27] = 16'h7160;  // ADD   #0x60,R1 ; R1 = 0x1060 (set 6)
+            imem['h28] = 16'h6713;  // MOV   R1,R7    ; 6nm3: n=dst=7, m=src=1
+            imem['h29] = 16'h7710;  // ADD   #0x10,R7 ; R7 = 0x1070 (set 7, never stored)
+            imem['h2A] = 16'hE310;  // MOV   #0x10,R3
+            imem['h2B] = 16'h4318;  // SHLL8 R3       ; R3 = 0x1000 same-set stride
+            imem['h2C] = 16'hE508;  // MOV   #8,R5    ; 8 lines > 4 ways: iters 5+ drain
+            imem['h2D] = 16'hE200;  // MOV   #0,R2
+            imem['h2E] = 16'hE600;  // MOV   #0,R6
+            //loop: miss store + hit load-back + COLD-MISS load (a pending-response
+            //window every iteration - stores are notify-at-accept) + DELAYED BF/S;
+            //the tail code lines share sets 6/7, so the walks evict them - I-misses too.
+            imem['h2F] = 16'h7201;  // ADD   #1,R2
+            imem['h30] = 16'h2122;  // MOV.L R2,@R1   ; write-allocate miss (dirty)
+            imem['h31] = 16'h6412;  // MOV.L @R1,R4   ; load-back on the fresh line
+            imem['h32] = 16'h313C;  // ADD   R3,R1    ; next same-set line
+            imem['h33] = 16'h6972;  // MOV.L @R7,R9   ; COLD-MISS load (set 7)
+            imem['h34] = 16'h373C;  // ADD   R3,R7
+            imem['h35] = 16'h4510;  // DT    R5
+            imem['h36] = 16'h8FF7;  // BF/S  loop     ; delayed
+            imem['h37] = 16'h7601;  // ADD   #1,R6    ;   delay slot
+            imem['h38] = 16'h0009;  // sentinel
+            imem['h39] = 16'hAFFE;  // guard
+            imem['h3A] = 16'h0009;
+            //handler at VBR+0x600: count the entry and return.
+            imem['h300] = 16'h7D01; // ADD   #1,R13
+            imem['h301] = 16'h002B; // RTE
+            imem['h302] = 16'h0009; //   delay slot
+            do_reset;
+            e0 = test_errors;
+            dbg_trace = $test$plusargs("trace87") && (g == 0) && (off == 0);
+            run_until_retire('h2E, 30000);        //loop is starting
+            if(dbg_trace) $display("        [dbg] pre-loop bram: R1=%08h R3=%08h R7=%08h R13=%08h",
+                                   gpr(1), gpr(3), gpr(7), gpr(13));
+            repeat(off) @(posedge clk);
+            int_level_q = 4'd8;
+            int_code_q  = 12'h600;
+            int_valid_q = 1'b1;
+            //Drop at the first entry, keyed on the sticky counter (see the zero-lat sweep).
+            w = 0;
+            while(entry_count == 0 && w < 20000) begin @(posedge clk); w = w + 1; end
+            @(posedge clk);
+            int_valid_q = 1'b0;
+            run_until_retire('h301, 60000);       //handler RTE retired
+            run_until_retire('h38, 60000);        //main line completed
+            chk($sformatf("g=%0d off=%0d: exactly one entry", g, off), entry_count, 32'd1);
+            chk($sformatf("g=%0d off=%0d: handler ran once", g, off), gpr(13), 32'd1);
+            chk($sformatf("g=%0d off=%0d: accumulator transparent", g, off), gpr(2), 32'd8);
+            chk($sformatf("g=%0d off=%0d: load-back transparent", g, off), gpr(4), 32'd8);
+            chk($sformatf("g=%0d off=%0d: cold-miss load transparent", g, off), gpr(9), 32'd0);
+            chk($sformatf("g=%0d off=%0d: slot count transparent", g, off), gpr(6), 32'd8);
+            chk($sformatf("g=%0d off=%0d: loop count consumed", g, off), gpr(5), 32'd0);
+            chk_true($sformatf("g=%0d off=%0d: no spurious exception", g, off), !exc_seen);
+            chk("INTEVT carries the driven code", intevt_o, 32'h0000_0600);
+            chk_true($sformatf("g=%0d off=%0d: SPC is never the delay slot (spc=%08h)", g, off, entry_spc_l),
+                     entry_spc_l[11:0] != 12'h06E);   //slot PC = byte 0x6E ('h37)
+            if(test_errors != e0)
+                $display("      [dbg] EXPEVT=%08h INTEVT=%08h SR=%08h SPC=%08h spc_l=%08h entries=%0d ack=%0d R13=%0d R2=%0d R5=%0d R6=%0d cstate=%0d",
+                         expevt_o, intevt_o, sr, spc_o, entry_spc_l, entry_count, int_ack_count,
+                         gpr(13), gpr(2), gpr(5), gpr(6), u_dut.u_cache.state);
+            dbg_trace = 1'b0;
+        end
+        end
+        //Coverage verdict: the sweep must have landed entries INSIDE cache excursions.
+        $display("      entry-vs-machinery coverage: %0d entries with the cache FSM busy",
+                 entry_cache_busy - busy0);
+        chk_true("entries landed mid-excursion (coverage)", (entry_cache_busy - busy0) > 20);
+        do_reset;
+        end_test;
+    end
+endtask
+
+//GOLDEN W - interrupt vs locked TAS.B RMW (atomicity law). The locked read-modify-write
+//is indivisible: acceptance must never split it, and a killed-then-reexecuted TAS whose
+//write already committed would read back its own 0x80 (T flips 1->0). Two back-to-back
+//TAS windows are swept with the RMW stretched by d_latency; the lock pairing counter
+//(every locked read paired with exactly one locked write) closes the bus-protocol law.
+task automatic test_int_tas_atomic;
+    integer dl, off, w, e0;
+    begin
+        begin_test("Interrupt vs TAS.B: locked RMW is indivisible and exactly-once (offset sweep)");
+        for(dl = 0; dl <= 6; dl = dl + 6) begin
+        for(off = 0; off < 35; off = off + 1) begin
+            cacheable_bootstrap(8'h09);
+            d_latency = dl;
+            imem['h20] = 16'hE860;  // MOV    #0x60,R8 ; BL-clear prologue
+            imem['h21] = 16'h4818;  // SHLL8  R8
+            imem['h22] = 16'h4828;  // SHLL16 R8
+            imem['h23] = 16'h480E;  // LDC    R8,SR
+            imem['h24] = 16'hED00;  // MOV   #0,R13   ; handler entry counter
+            imem['h25] = 16'hE118;  // MOV   #0x18,R1
+            imem['h26] = 16'h4108;  // SHLL2 R1
+            imem['h27] = 16'h4108;  // SHLL2 R1       ; R1 = 0x180 (memory byte, MSB lane)
+            imem['h28] = 16'hE400;  // MOV   #0,R4
+            imem['h29] = 16'hE600;  // MOV   #0,R6    ; anchor
+            imem['h2A] = 16'h0009;  // NOP            ; retire pulses land in TAS's MA
+            imem['h2B] = 16'h0009;  // NOP
+            imem['h2C] = 16'h0009;  // NOP
+            imem['h2D] = 16'h411B;  // TAS.B @R1      ; locked RMW #1: byte 0 -> T=1, set 0x80
+            imem['h2E] = 16'h0429;  // MOVT  R4
+            imem['h2F] = 16'h411B;  // TAS.B @R1      ; locked RMW #2: byte 0x80 -> T=0
+            imem['h30] = 16'h0629;  // MOVT  R6
+            imem['h31] = 16'h0009;  // sentinel
+            imem['h32] = 16'hAFFE;  // guard
+            imem['h33] = 16'h0009;
+            imem['h300] = 16'h7D01; // ADD   #1,R13   ; VBR+0x600 handler
+            imem['h301] = 16'h002B; // RTE
+            imem['h302] = 16'h0009; //   delay slot
+            do_reset;
+            e0 = test_errors;
+            dmem['h60] = 32'h0000_0041;   //byte 0x180 = 0x00 (big-endian MSB lane)
+            run_until_retire('h29, 30000);
+            repeat(off) @(posedge clk);
+            int_level_q = 4'd8;
+            int_code_q  = 12'h600;
+            int_valid_q = 1'b1;
+            w = 0;
+            while(entry_count == 0 && w < 20000) begin @(posedge clk); w = w + 1; end
+            @(posedge clk);
+            int_valid_q = 1'b0;
+            run_until_retire('h301, 20000);       //handler RTE retired
+            run_until_retire('h31, 20000);        //sentinel
+            chk($sformatf("dl=%0d off=%0d: TAS#1 saw the pre-RMW byte once (T=1)", dl, off), gpr(4), 32'd1);
+            chk($sformatf("dl=%0d off=%0d: TAS#2 saw bit7 already set (T=0)", dl, off), gpr(6), 32'd0);
+            chk($sformatf("dl=%0d off=%0d: memory byte mutated exactly once", dl, off), dmem['h60], 32'h8000_0041);
+            chk($sformatf("dl=%0d off=%0d: locked reads paired", dl, off), locked_read_count, 32'd2);
+            chk($sformatf("dl=%0d off=%0d: locked writes paired", dl, off), locked_write_count, 32'd2);
+            chk($sformatf("dl=%0d off=%0d: exactly one entry", dl, off), entry_count, 32'd1);
+            chk($sformatf("dl=%0d off=%0d: handler ran once", dl, off), gpr(13), 32'd1);
+            chk_true($sformatf("dl=%0d off=%0d: no spurious exception", dl, off), !exc_seen);
+            if(test_errors != e0)
+                $display("      [dbg] EXPEVT=%08h INTEVT=%08h SR=%08h SPC=%08h spc_l=%08h entries=%0d ack=%0d lockR=%0d lockW=%0d cstate=%0d epc_l=%08h",
+                         expevt_o, intevt_o, sr, spc_o, entry_spc_l, entry_count, int_ack_count,
+                         locked_read_count, locked_write_count, u_dut.u_cache.state, exception_entry_pc_l);
+        end
+        end
+        do_reset;
+        end_test;
+    end
+endtask
+
+//GOLDEN X2 - synchronous exception vs pending interrupt, collided at every offset.
+//Four flavors fault/trap at F: ILLEGAL (ID), ADDRESS error (EX/AGU), TRAPA (a trap
+//that IS a retirement - interrupt_boundary is genuinely open on its retire edge),
+//and a BUS-FAULT load with a younger memory op in EX (in-flight kill arm). LAWS,
+//whatever the offset: each event enters EXACTLY once (one ack, one exception),
+//EXPEVT/INTEVT never mix, the mainline result is transparent, and the pre-decrement
+//store executes exactly once (a wrong-path or re-executed tail would double it).
+task automatic test_exc_int_collision;
+    integer f, lat, off, w, e0;
+    logic [15:0] f_op, g_op;
+    logic [31:0] exp_ev, exp_r2;
+    logic        skip;
+    string       fname;
+    begin
+        begin_test("Exception x interrupt collision: both once, never mixed (4 flavors x offsets)");
+        for(f = 0; f < 4; f = f + 1) begin
+            case(f)
+                0: begin fname="illegal"; f_op=16'hF000; g_op=16'h7201; exp_ev=32'h0000_0180; skip=1'b1; end
+                1: begin fname="address"; f_op=16'h6402; g_op=16'h7201; exp_ev=32'h0000_00E0; skip=1'b1; end
+                2: begin fname="trapa";   f_op=16'hC342; g_op=16'h7201; exp_ev=32'h0000_0160; skip=1'b0; end
+                default: begin fname="busfault"; f_op=16'h6432; g_op=16'h6532; exp_ev=32'h0000_00E0; skip=1'b1; end
+            endcase
+            exp_r2 = (f == 3) ? 32'd2 : 32'd3;    //flavor 3's G is a load, not an ADD
+        for(lat = 0; lat <= 2; lat = lat + 2) begin
+        for(off = 0; off < 25; off = off + 1) begin
+            cacheable_bootstrap(8'h09);
+            i_latency = lat;
+            d_latency = lat;
+            imem['h20] = 16'hE860;  // MOV    #0x60,R8 ; BL-clear prologue
+            imem['h21] = 16'h4818;  // SHLL8  R8
+            imem['h22] = 16'h4828;  // SHLL16 R8
+            imem['h23] = 16'h480E;  // LDC    R8,SR
+            imem['h24] = 16'hED00;  // MOV   #0,R13   ; interrupt handler counter
+            imem['h25] = 16'hEB00;  // MOV   #0,R11   ; exception handler counter
+            imem['h26] = 16'hE200;  // MOV   #0,R2
+            imem['h27] = 16'hE001;  // MOV   #1,R0    ; odd base (ADDRESS flavor)
+            imem['h28] = 16'hE304;  // MOV   #4,R3
+            imem['h29] = 16'h4318;  // SHLL8 R3       ; R3 = 0x400 (BUSFAULT target, widx 0)
+            imem['h2A] = 16'h7201;  // ADD   #1,R2
+            imem['h2B] = 16'h7201;  // ADD   #1,R2
+            imem['h2C] = f_op;      // F: the flavor's faulting/trapping instruction
+            imem['h2D] = g_op;      // G: ADD #1,R2 - or the in-flight younger load
+            imem['h2E] = 16'h2326;  // MOV.L R2,@-R3  ; pre-dec: double-execution detector
+            imem['h2F] = 16'h6432;  // MOV.L @R3,R4   ; load-back of the stored word
+            imem['h30] = 16'h0009;  // sentinel
+            imem['h31] = 16'hAFFE;  // guard
+            imem['h32] = 16'h0009;
+            //General-exception handler (VBR+0x100): count, skip F when it faults.
+            if(skip) begin
+                imem['h80] = 16'h0942;  // STC SPC,R9
+                imem['h81] = 16'h7902;  // ADD #2,R9
+                imem['h82] = 16'h494E;  // LDC R9,SPC   ; resume past F
+                imem['h83] = 16'h7B01;  // ADD #1,R11
+                imem['h84] = 16'h002B;  // RTE
+                imem['h85] = 16'h0009;  //   delay slot
+            end
+            else begin
+                imem['h80] = 16'h7B01;  // ADD #1,R11   ; TRAPA: SPC is already F+2
+                imem['h81] = 16'h002B;  // RTE
+                imem['h82] = 16'h0009;  //   delay slot
+            end
+            imem['h300] = 16'h7D01; // ADD   #1,R13   ; VBR+0x600 interrupt handler
+            imem['h301] = 16'h002B; // RTE
+            imem['h302] = 16'h0009; //   delay slot
+            if(f == 3) begin
+                d_fault_en   = 1'b1;
+                d_fault_widx = 8'd0;      //F's fill beat 0 (addr 0x400) faults
+            end
+            do_reset;
+            e0 = test_errors;
+            if(f == 3) dmem[0] = 32'h0000_00A5;   //G's clean reload value
+            run_until_retire('h29, 30000);
+            repeat(off) @(posedge clk);
+            int_level_q = 4'd8;
+            int_code_q  = 12'h600;
+            int_valid_q = 1'b1;
+            //Drop on the ACK - the SoC INTC protocol. An ack without a matching entry
+            //(the collision hazard) LOSES the interrupt and fails the checks below.
+            w = 0;
+            while(int_ack_count == 0 && w < 20000) begin @(posedge clk); w = w + 1; end
+            @(posedge clk);
+            int_valid_q = 1'b0;
+            //The synchronous event must fire exactly once; disarm the bus fault so the
+            //skip-return path (and G's re-run) refills cleanly.
+            w = 0;
+            while(!exc_seen && !trapa_seen && w < 20000) begin @(posedge clk); w = w + 1; end
+            if(f == 3) begin @(posedge clk); d_fault_en = 1'b0; end
+            run_until_retire('h30, 30000);        //main line completed
+            //A late interrupt lands in the guard spin: wait for its handler.
+            w = 0;
+            while(gpr(13) == 32'd0 && w < 20000) begin @(posedge clk); w = w + 1; end
+            run_cycles(30);
+            chk($sformatf("%s lat=%0d off=%0d: interrupt ack'd exactly once", fname, lat, off), int_ack_count, 32'd1);
+            chk($sformatf("%s lat=%0d off=%0d: interrupt handler ran exactly once", fname, lat, off), gpr(13), 32'd1);
+            chk($sformatf("%s lat=%0d off=%0d: exception handler ran exactly once", fname, lat, off), gpr(11), 32'd1);
+            chk($sformatf("%s lat=%0d off=%0d: exactly two entries", fname, lat, off), entry_count, 32'd2);
+            chk($sformatf("%s lat=%0d off=%0d: INTEVT", fname, lat, off), intevt_o, 32'h0000_0600);
+            chk($sformatf("%s lat=%0d off=%0d: EXPEVT", fname, lat, off), expevt_o, exp_ev);
+            chk($sformatf("%s lat=%0d off=%0d: mainline result transparent", fname, lat, off), gpr(2), exp_r2);
+            chk($sformatf("%s lat=%0d off=%0d: pre-dec store executed once", fname, lat, off), gpr(3), 32'h0000_03FC);
+            chk($sformatf("%s lat=%0d off=%0d: stored word load-back", fname, lat, off), gpr(4), exp_r2);
+            case(f)
+                1: begin
+                    chk($sformatf("%s lat=%0d off=%0d: TEA = misaligned EA", fname, lat, off), tea_o, 32'd1);
+                    chk($sformatf("%s lat=%0d off=%0d: cause", fname, lat, off), {29'd0, exc_cause_l}, {29'd0, EXC_ADDRESS});
+                    chk($sformatf("%s lat=%0d off=%0d: exc pc = F", fname, lat, off), exc_pc_l, 32'h0000_0058);
+                end
+                2: begin
+                    chk_true($sformatf("%s lat=%0d off=%0d: TRAPA pulsed", fname, lat, off), trapa_seen);
+                    chk($sformatf("%s lat=%0d off=%0d: TRA = imm<<2", fname, lat, off), tra_o, 32'h0000_0108);
+                end
+                3: begin
+                    chk($sformatf("%s lat=%0d off=%0d: TEA = faulting fill addr", fname, lat, off), tea_o, 32'h0000_0400);
+                    chk($sformatf("%s lat=%0d off=%0d: cause", fname, lat, off), {29'd0, exc_cause_l}, {29'd0, EXC_DATA});
+                    chk($sformatf("%s lat=%0d off=%0d: exc pc = F", fname, lat, off), exc_pc_l, 32'h0000_0058);
+                    chk($sformatf("%s lat=%0d off=%0d: G reloaded cleanly", fname, lat, off), gpr(5), 32'h0000_00A5);
+                end
+                default: begin
+                    chk($sformatf("%s lat=%0d off=%0d: cause", fname, lat, off), {29'd0, exc_cause_l}, {29'd0, EXC_ILLEGAL});
+                    chk($sformatf("%s lat=%0d off=%0d: exc pc = F", fname, lat, off), exc_pc_l, 32'h0000_0058);
+                end
+            endcase
+            if(test_errors != e0)
+                $display("      [dbg] EXPEVT=%08h INTEVT=%08h TEA=%08h SR=%08h SPC=%08h spc_l=%08h entries=%0d ack=%0d R2=%0d R11=%0d R13=%0d cstate=%0d epc_l=%08h",
+                         expevt_o, intevt_o, tea_o, sr, spc_o, entry_spc_l, entry_count, int_ack_count,
+                         gpr(2), gpr(11), gpr(13), u_dut.u_cache.state, exception_entry_pc_l);
+        end
+        end
         end
         do_reset;
         end_test;
@@ -4250,6 +4589,19 @@ initial begin
 
     $display("######## cpu_core_tb ########");
 
+    //+focus: run only the interrupt/exception collision sweeps (debug subset).
+    if($test$plusargs("focus")) begin
+        group("focus: interrupt/exception machinery subset");
+        test_int_timing_sweep;
+        test_int_miss_sweep;
+        test_int_tas_atomic;
+        test_exc_int_collision;
+        $display("");
+        if(errors == 0) $display("cpu_core_tb: PASS (focus subset, %0d tests)", test_count);
+        else            $display("cpu_core_tb: FAIL (focus subset, %0d errors over %0d tests)", errors, test_count);
+        $finish;
+    end
+
     bench_ipc_straightline(200);
     //Cached straight-line steady state runs 1 hit/cycle (look_ov accepts a fetch every
     //cycle); the measured loop IPC is that minus the 2 taken-branch bubbles per iteration
@@ -4374,9 +4726,12 @@ initial begin
     test_cached_drain_pairidle;
 
     //Pipeline-state and interrupt corners + the random invariance oracle.
-    group("12. Pipeline state: LDC-SR spacing, interrupt timing, random oracle");
+    group("12. Pipeline state: LDC-SR spacing, interrupt timing/machinery, exc collision, random oracle");
     test_cached_ldcsr_tight;
     test_int_timing_sweep;
+    test_int_miss_sweep;
+    test_int_tas_atomic;
+    test_exc_int_collision;
     test_random_latency_oracle;
 
     //Verdicts of the always-on passive checkers, judged over the WHOLE suite.

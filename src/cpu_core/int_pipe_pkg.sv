@@ -599,7 +599,9 @@ function automatic pd_route_t pd_route(input logic [15:0] inst);
                             (hi == 4'h4 && (lo == 4'hA || lo == 4'h6 || lo == 4'h2) &&
                              inst[7:4] <= 4'h1);
         //reads_cmisc: GBR-relative addressing (C.{0,1,2,4,5,6} disp / C.{C,D,E,F} index),
-        //the STC (0..2) / STC.L (4..3) supersets, STS PR (0n2A), STS.L PR (4n22), RTS.
+        //the STC (0..2) / STC.L (4..3) supersets, STS PR (0n2A), STS.L PR (4n22), RTS,
+        //and RTE (002B): its EX branch target is i_SPC and its restore reads SSR, so it
+        //must stall behind an uncommitted LDC Rm,SPC/SSR (the handler-epilogue idiom).
         pd_route.reads_cmisc = (hi == 4'hC && (nn == 4'h0 || nn == 4'h1 || nn == 4'h2 ||
                                                nn == 4'h4 || nn == 4'h5 || nn == 4'h6 ||
                                                nn == 4'hC || nn == 4'hD || nn == 4'hE ||
@@ -608,7 +610,8 @@ function automatic pd_route_t pd_route(input logic [15:0] inst);
                                (hi == 4'h4 && lo == 4'h3) ||
                                (hi == 4'h0 && inst[7:0] == 8'h2A) ||
                                (hi == 4'h4 && inst[7:0] == 8'h22) ||
-                               (inst == 16'h00_0B);
+                               (inst == 16'h00_0B) ||
+                               (inst == 16'h00_2B);
 
         //Addressing-mode class (see the struct note; asserted vs id_decode.addr_op).
         //Mirrors the decode case's addr_op assignments only - manual table 2.12, pp.50-52.
