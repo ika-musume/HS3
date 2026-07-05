@@ -53,6 +53,12 @@ logic           rsp_ifault;     //fetch fault (registered response only)
    vice versa - physically real but architecturally false paths. */
 logic   [31:0]  rsp_rdata;      //load word (data response only)
 logic   [15:0]  rsp_inst;       //fetched opcode, addr[1]-picked half (fetch response only)
+/* FETCH PAIR: every fetch reads a full longword (like the real chip's 32-bit IF); on an
+   EVEN fetch the sibling opcode at PC+2 rides along so the master's pair slot can issue
+   it without a second request - that port slot is freed for MA or left idle (drain).
+   rsp_pair qualifies the sibling: even fetch AND fault-free. Fetch responses only. */
+logic   [15:0]  rsp_inst_sib;   //sibling opcode (the fetched longword's other half)
+logic           rsp_pair;       //rsp_inst_sib is usable this response
 /* DUAL-ALIGNER feed: rsp_rdata above is the 2:1-muxed word (raw-word consumers keep it);
    the pipe's load aligner instead takes BOTH sources and re-applies the hit select AFTER
    alignment, so the late cache word (and the late hit select) cross the aligner-depth
@@ -65,14 +71,14 @@ modport master (
     output req_valid, req_addr, req_fetch, req_write, req_size, req_lock,
            req_wdata, req_wstrb, rsp_ready,
     input  req_ready, rsp_valid, rsp_fetch, rsp_dfault, rsp_ifault, rsp_rdata, rsp_inst,
-           rsp_rdata_hit, rsp_rdata_miss, rsp_hit_d
+           rsp_inst_sib, rsp_pair, rsp_rdata_hit, rsp_rdata_miss, rsp_hit_d
 );
 
 modport slave (
     input  req_valid, req_addr, req_fetch, req_write, req_size, req_lock,
            req_wdata, req_wstrb, rsp_ready,
     output req_ready, rsp_valid, rsp_fetch, rsp_dfault, rsp_ifault, rsp_rdata, rsp_inst,
-           rsp_rdata_hit, rsp_rdata_miss, rsp_hit_d
+           rsp_inst_sib, rsp_pair, rsp_rdata_hit, rsp_rdata_miss, rsp_hit_d
 );
 
 /* Input-only snoop for register owners on the L bus (exc_handler group): the

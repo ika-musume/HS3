@@ -34,6 +34,9 @@ module exc_handler #(
     input   wire            i_PIPE_RTE_VALID,
     input   wire            i_PIPE_RETIRE_VALID,
     input   wire    [31:0]  i_PIPE_RETIRE_PC,
+    input   wire            i_PIPE_RETIRE_INT_DEFER, //retiree is a delayed branch: slot owed
+    input   wire            i_PIPE_MA_INFLIGHT,      //accepted D access / RMW mid-sequence: defer
+    input   wire    [31:0]  i_PIPE_INT_NEXT_PC,      //oldest instruction the redirect discards
 
     /* ALREADY-PRIORITIZED EXTERNAL INTERRUPTS - the INTC owns INTEVT2 (I bus, Appendix B
        p.741), so only the INTEVT code arrives; the acks below let it latch/clear. */
@@ -168,12 +171,24 @@ logic   [31:0]  interrupt_spc;
 
 assign  sr_bl              = i_SR[28];
 assign  sr_imask           = i_SR[7:4];
-assign  interrupt_boundary = i_PIPE_RETIRE_VALID;
+//Deferred while a delayed-branch pair is open (branch retired, slot owed): no
+//interrupt is accepted between them (section 4.5.3, pp.98-100). Also deferred while
+//an ACCEPTED data access or a locked-RMW/MAC pair is in flight in MA: the redirect
+//would orphan the bus response (wedging the L-bus response channel) or split an
+//indivisible sequence - found by the interrupt-vs-TAS and busfault collision sweeps.
+assign  interrupt_boundary = i_PIPE_RETIRE_VALID && !i_PIPE_RETIRE_INT_DEFER &&
+                             !i_PIPE_MA_INFLIGHT;
 assign  general_accept     = i_PIPE_EXC_VALID || i_PIPE_TRAPA_VALID;
 assign  general_reset_like = general_accept && sr_bl;
 assign  rte_accept         = i_PIPE_RTE_VALID;
-assign  nmi_accept         = interrupt_boundary && i_NMI_VALID && (!sr_bl || i_NMI_BLMSK);
-assign  int_accept         = interrupt_boundary && i_INT_VALID && !sr_bl && (i_INT_LEVEL > sr_imask);
+//A same-edge synchronous event wins (the redirect chain below): the accepts - and
+//with them the ACKs - must yield, or the INTC drops a request that never entered
+//(TRAPA retires, so its edge is a genuinely open interrupt boundary). The loser
+//stays pending at the INTC and is accepted after the handler. NMI beats INT.
+assign  nmi_accept         = interrupt_boundary && i_NMI_VALID && (!sr_bl || i_NMI_BLMSK) &&
+                             !general_accept;
+assign  int_accept         = interrupt_boundary && i_INT_VALID && !sr_bl && (i_INT_LEVEL > sr_imask) &&
+                             !general_accept && !nmi_accept;
 //Accept strobes back to the INTC: it latches INTEVT2 from the code it presented this same
 //cycle (its own registered output - coherent by construction) and clears NMI edge-pending.
 assign  o_INT_ACK          = int_accept;
@@ -207,8 +222,10 @@ always_comb begin
 end
 
 always_comb begin
-    // Interrupts complete the current instruction; see section 4.5.3, pp.98-100.
-    interrupt_spc = i_PIPE_RETIRE_VALID ? i_PIPE_RETIRE_PC + 32'd2 : i_FETCH_PC;
+    //Interrupts complete the current instruction; SPC = the oldest instruction the
+    //redirect discards (the pipe's mux). The old retire_pc+2 lost a taken branch
+    //when the accept landed on the branch's / its slot's retire cycle.
+    interrupt_spc = i_PIPE_INT_NEXT_PC;
 end
 
 /*
@@ -270,23 +287,29 @@ end
 //hardware event is naturally superseded by the event write (higher priority in the commit chain
 //below), and the event also flushes the software access in the pipe.
 
-always_ff @(posedge i_CLK or negedge i_POR_n or negedge i_RST_n) begin
+always_ff @(posedge i_CLK or negedge i_POR_n) begin
     if(!i_POR_n) begin
         o_TRA          <= 32'd0;
         o_EXPEVT       <= {20'd0, EV_POWER_RESET};
         o_INTEVT       <= 32'd0;
         o_TEA          <= 32'd0;
     end
-    else if(!i_RST_n) begin
-        o_TRA          <= 32'd0;
-        o_EXPEVT       <= {20'd0, EV_MANUAL_RESET};
-        o_INTEVT       <= 32'd0;
-        o_TEA          <= 32'd0;
-    end
     else begin if(i_CEN) begin
-        if(general_reset_like) begin
+        if(!i_RST_n) begin
+            //Manual reset is synchronous, not async (section 4.6 pp.100-101). EXPEVT bit[5]
+            //is the only bit that differs from power reset (0x020 vs 0x000); an async preset
+            //there cannot share one Cyclone V register with the POR async clear, so Quartus
+            //emulates it with a register+latch - a combinational loop. The clock always runs
+            //during a manual reset, so a synchronous load is equivalent and closes the loop.
+            o_TRA          <= 32'd0;
+            o_EXPEVT       <= {20'd0, EV_MANUAL_RESET};
+            o_INTEVT       <= 32'd0;
+            o_TEA          <= 32'd0;
+        end
+        else if(general_reset_like) begin
+            //BL=1 reset-like recovery is a MANUAL reset (section 4.6 pp.100-101).
             o_TRA    <= 32'd0;
-            o_EXPEVT <= {20'd0, EV_POWER_RESET};
+            o_EXPEVT <= {20'd0, EV_MANUAL_RESET};
             o_INTEVT <= 32'd0;
             o_TEA    <= 32'd0;
         end
