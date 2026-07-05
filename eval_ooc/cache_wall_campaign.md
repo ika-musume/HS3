@@ -23,10 +23,11 @@ attack. **A round that isn't logged didn't happen.**
 ## Class table (update every fit)
 | Class | Launch → capture | Best ever | Prev | Current | Status / next lever |
 |---|---|---|---|---|---|
-| Wall B / byp_q (SoC) | `ma_seq\|second_access_agu` → `cache_data_bank_wt\|byp_q[3]` | −1.956 (R2, reverted) | −2.220 | −2.220 (current, seed3) | SHELVED: trades against FSM, can't move plateau (R1+R2) |
-| Wall B / FSM (SoC) | `int_pipe\|{second_access_agu,fwd_*_agu}` → `cache\|state.*` decode | −1.905 | −1.905 | −1.905 (fit#0, SoC seed3) | placement-coupled to byp_q; needs floorplan / front cut |
-| Wall B / FSM (core) | `int_pipe\|{mawb.gpr0_data,fwd_*_agu}` → `cache\|state.S_FLUSH_OTERM25` | −2.472 | −2.472 | −2.472 (fit#0, core seed3) | same wall, core placement (attack with R2) |
-| Wall A (core) | `cache\|bram_addr[23]` → `int_pipe\|gpr_2r2w\|…portb_address_reg` | −2.461 | −2.461 | −2.461 (fit#0, core seed3) | I-response→predecode→GPR read-ahead (later round) |
+| Advance loop (SoC, NEW) | `{exma.gpr1_data,fwd_*_agu,second_access_agu}` → AGU adder → `early_d_req_valid` → `idex_allow`(fo 346) → `nx_read0` → GPR `portb_address_reg` | −2.920 | (below top-20 @ f9aae05) | **−2.920** (re-baseline, seed3) | only unspent lever: tail late-select (see re-baseline note) |
+| Wall A (SoC) | `cache\|bram_addr` → `hit_w/hit_rsp_i` → `rsp_inst` → predecode → `nx_read0` → GPR `portb_address_reg` | −2.728 | −2.461 (core) | −2.813 (SoC seed3) | same capture as advance loop; shares any nx_read0 tail fix |
+| o_TEA (SoC, NEW) | same AGU front → `idex_allow` → `i_req_fire` → `exc_handler\|o_TEA` | −2.737 | (below top-20) | −2.737 | enable-side of the same loop; not headline |
+| Wall B / FSM (SoC) | `int_pipe\|{second_access_agu,fwd_*_agu}` → `cache\|state.*` decode | −1.905 | −1.905 | −2.595 (re-triage, worst now elsewhere) | placement-coupled to byp_q; needs floorplan / front cut |
+| Wall B / byp_q (SoC) | `ma_seq\|second_access_agu` → `cache_data_bank_wt\|byp_q[3]` | −1.920 (re-baseline) | −2.220 | −1.920 | SHELVED: trades against FSM, can't move plateau (R1+R2) |
 
 **Wall B has two capture flavors off one shared AGU-request front.** The expensive
 common cone is `{second_access_agu, mawb.gpr0_data, fwd_*_agu} → always20 (2nd-pending
@@ -66,6 +67,34 @@ it into ONE compare (nodes named in `g_way[3]`/`g_way[0]`) and routes the result
 `g_way[2]`'s `byp_q` FF across a **1.470 ns inter-bank hop** (Y21→Y17). Three ~1.5 ns
 interconnect hops dominate: Mux362 (AGU-side), tag_raddr (AGU→cache handoff), byp_q~2
 (inter-bank scatter). 66 % of the data delay is routing, not cells.
+
+## Re-baseline — 2026-07-05, current tree (86da99e + exc_handler manual-reset sync fix)
+Fit of `HS3/runs/quartus_cyclonev_100_dse` (seed 3, AGGRESSIVE PERFORMANCE) on the tree
+with fetch-pair + interrupt-precision + int×cache-collision fixes landed since `f9aae05`.
+**Worst −2.920 multicorner (77.4 MHz)** vs −2.252 at the f9aae05 baseline. The top-20 is
+now two classes, BOTH capturing at the GPR read-ahead address regs (`nx_read0` →
+`portb_address_reg`): the NEW advance loop (14/20) and Wall A (6/20). byp_q/FSM left the
+panel (probes: byp_q −1.920, FSM −2.595 — re-triage around the new headline class).
+- Worst-path anatomy (probe + summary.json): 8 levels, 60 % IC, 12.18 ns data delay.
+  Head = the SAME measured-full AGU front (GPR data → `Mux374` base mux 1.54 IC → adder).
+  New middle/tail = `o_ADDR[1:0]` → `early_d_req_valid` (now also gated on
+  `!i_REDIRECT_VALID` and same-edge `d_rsp_fault` — interrupt-correctness terms, spec
+  per [[no-bubbles-ipc-first]]) → `idex_allow` (fanout 346) → `ifid_ld_dat` (fo 72,
+  already a placement duplicate) → `nx_pd.rib` → `nx_read0` → 1.04 IC → M10K addr reg.
+- The −0.67 delta vs f9aae05 bought IPC 0.284→0.401 bypass / 0.488→0.554 store plus 8
+  interrupt bugs — a correct trade under the IPC-first law. SoC noise ±~0.3-0.4 means the
+  exact size is fuzzy; the class swap is real.
+- **LogicLock is NOT licensed** in `raetro/quartus:17.0` (warning 292013) — plateau
+  lever 1 (floorplan) is unavailable in this flow.
+- Only unspent RTL lever: a TAIL round on `nx_read0` — precompute the 3 arm candidates
+  (pair_serve / ifid_ld / hold) from registered state and late-select at the M10K address
+  pin with per-cluster `idex_allow`/serve duplicates near the GPR M10Ks (last-level-mux
+  pattern from the halfcycle campaign). Ceiling if fully successful: back to the measured
+  −2.2..−2.4 plateau (~80 MHz) — it does NOT beat the plateau; the AGU front (measured
+  full), FSM (−2.6) and o_TEA (−2.74) queue directly underneath. 85 MHz gate (−1.765)
+  not reachable on current evidence.
+- **Verdict: no definite headroom. RTL FROZEN at the current tree** unless the tail
+  round is explicitly commissioned to recover the ~80 MHz number.
 
 ## Standing walls (measured-full — do NOT re-attack without new information)
 - (none yet)

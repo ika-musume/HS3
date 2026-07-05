@@ -287,21 +287,26 @@ end
 //hardware event is naturally superseded by the event write (higher priority in the commit chain
 //below), and the event also flushes the software access in the pipe.
 
-always_ff @(posedge i_CLK or negedge i_POR_n or negedge i_RST_n) begin
+always_ff @(posedge i_CLK or negedge i_POR_n) begin
     if(!i_POR_n) begin
         o_TRA          <= 32'd0;
         o_EXPEVT       <= {20'd0, EV_POWER_RESET};
         o_INTEVT       <= 32'd0;
         o_TEA          <= 32'd0;
     end
-    else if(!i_RST_n) begin
-        o_TRA          <= 32'd0;
-        o_EXPEVT       <= {20'd0, EV_MANUAL_RESET};
-        o_INTEVT       <= 32'd0;
-        o_TEA          <= 32'd0;
-    end
     else begin if(i_CEN) begin
-        if(general_reset_like) begin
+        if(!i_RST_n) begin
+            //Manual reset is synchronous, not async (section 4.6 pp.100-101). EXPEVT bit[5]
+            //is the only bit that differs from power reset (0x020 vs 0x000); an async preset
+            //there cannot share one Cyclone V register with the POR async clear, so Quartus
+            //emulates it with a register+latch - a combinational loop. The clock always runs
+            //during a manual reset, so a synchronous load is equivalent and closes the loop.
+            o_TRA          <= 32'd0;
+            o_EXPEVT       <= {20'd0, EV_MANUAL_RESET};
+            o_INTEVT       <= 32'd0;
+            o_TEA          <= 32'd0;
+        end
+        else if(general_reset_like) begin
             //BL=1 reset-like recovery is a MANUAL reset (section 4.6 pp.100-101).
             o_TRA    <= 32'd0;
             o_EXPEVT <= {20'd0, EV_MANUAL_RESET};
