@@ -183,6 +183,8 @@ logic           mem_pending;
 logic           rsp_valid_i;
 logic   [15:0]  rsp_inst;
 logic           rsp_fault_i;
+logic   [15:0]  rsp_sib;        //fetch-pair sibling opcode held with rsp_inst (see LBus)
+logic           rsp_pair_q;     //pair qualifier captured with it (even fetch, fault-free)
 logic           rsp_valid_d;
 logic   [31:0]  rsp_rdata;
 logic           rsp_fault_d;
@@ -409,6 +411,8 @@ wire    [31:0]  res_d_rdata = run_d_lmmio_read ? lmmio_rdata :
                               run_d_hit_load   ? hit_word    : 32'd0;   //pref returns no data
 wire            res_i_valid = run_i_hit;
 wire    [15:0]  res_i_inst  = pick_inst(hit_word, bram_addr[1], BIG_ENDIAN);
+//Fetch-pair sibling: the hit longword's OTHER halfword (LBus rsp_inst_sib).
+wire    [15:0]  res_i_sib   = pick_inst(hit_word, !bram_addr[1], BIG_ENDIAN);
 
 //LIVE (accept-edge) classification of the request being accepted THIS edge. Dispatches
 //whose target does not depend on the resolve - non-cacheable bypass, the memory-mapped
@@ -651,6 +655,10 @@ assign  PIPE_L_BUS.rsp_rdata_hit  = res_d_rdata;    //dual-aligner raw feeds (se
 assign  PIPE_L_BUS.rsp_rdata_miss = rsp_rdata;
 assign  PIPE_L_BUS.rsp_hit_d      = hit_rsp_d;      //post-alignment select
 assign  PIPE_L_BUS.rsp_inst  = hit_rsp_i ? res_i_inst : rsp_inst;           //I-only 2:1
+//Fetch pair: a live hit pairs on an even fetch (a hit never faults); registered
+//responses carry the qualifier captured alongside them (LBus rsp_pair contract).
+assign  PIPE_L_BUS.rsp_inst_sib = hit_rsp_i ? res_i_sib : rsp_sib;
+assign  PIPE_L_BUS.rsp_pair     = hit_rsp_i ? !bram_addr[1] : (rsp_valid_i && rsp_pair_q);
 //A hit never faults, and a registered response excludes a same-side live hit, so each
 //fault line is a pure registered-flag product - no live select.
 assign  PIPE_L_BUS.rsp_dfault = rsp_valid_d && rsp_fault_d;
@@ -746,6 +754,12 @@ assign  cur_way_nx[1] = hit ? (!hit_w[0] && !hit_w[1])                : victim[1
 assign  cur_way_nx[0] = hit ? (!hit_w[0] && (hit_w[1] || !hit_w[2])) : victim[0];
 
 
+//Completed-I-fill response longword: the addressed word is either the just-arrived
+//final beat or one already held in fill_words (consumed at fill_word == 3 only).
+wire    [31:0]  ifill_word = (cur_addr[3:2] == fill_word) ? I_BUS.rsp_rdata
+                                                          : fill_words[cur_addr[3:2]];
+
+
 ///////////////////////////////////////////////////////////
 //////  Controller Sequencer
 ////
@@ -794,6 +808,8 @@ always_ff @(posedge i_CLK or negedge i_RST_n) begin
         rsp_valid_i   <= 1'b0;
         rsp_inst      <= 16'd0;
         rsp_fault_i   <= 1'b0;
+        rsp_sib       <= 16'd0;
+        rsp_pair_q    <= 1'b0;
         rsp_valid_d   <= 1'b0;
         rsp_rdata     <= 32'd0;
         rsp_fault_d   <= 1'b0;
@@ -830,6 +846,8 @@ always_ff @(posedge i_CLK or negedge i_RST_n) begin
         //impossible here (it blocks the accept), so no overwrite can occur.
         if(hit_rsp_i && !cons_i) begin
             rsp_inst    <= res_i_inst;
+            rsp_sib     <= res_i_sib;
+            rsp_pair_q  <= !bram_addr[1];
             rsp_fault_i <= 1'b0;
             rsp_valid_i <= 1'b1;
         end
@@ -921,6 +939,7 @@ always_ff @(posedge i_CLK or negedge i_RST_n) begin
                             //Wrong-path instruction miss: the pipeline is discarding this fetch,
                             //so do NOT allocate; ack with a dummy response and free at once.
                             rsp_inst    <= 16'd0;
+                            rsp_pair_q  <= 1'b0;    //dummy squash ack carries no pair
                             rsp_fault_i <= 1'b0;
                             rsp_valid_i <= 1'b1;
                         end
@@ -981,6 +1000,8 @@ always_ff @(posedge i_CLK or negedge i_RST_n) begin
                             //Sibling halfword of the last bypass read: serve from the
                             //buffer as a registered response, no FSM run, no bus run.
                             rsp_inst    <= pick_inst(ibyp_buf_data, PIPE_L_BUS.req_addr[1], BIG_ENDIAN);
+                            rsp_sib     <= pick_inst(ibyp_buf_data, !PIPE_L_BUS.req_addr[1], BIG_ENDIAN);
+                            rsp_pair_q  <= !PIPE_L_BUS.req_addr[1];
                             rsp_fault_i <= 1'b0;
                             rsp_valid_i <= 1'b1;
                         end
@@ -1049,9 +1070,13 @@ always_ff @(posedge i_CLK or negedge i_RST_n) begin
                     end
                     else begin
                         wb_drain_word <= wb_drain_word + 2'd1;
-                        //Forced drain runs to completion; a background drain yields
-                        //to any waiting access between longwords.
-                        state <= drain_for_vic ? S_DRAIN_REQ : S_IDLE;
+                        //A drain runs to COMPLETION once its head beat is on the bus:
+                        //the BSC burst engine owns the line until beat 3 (fe_b_cont),
+                        //so a foreign request interleaved mid-line deadlocks the pair
+                        //(cache waits for the accept, engine waits for the beats -
+                        //found by the fetch-pair bring-up). Background-ness only
+                        //chooses WHEN the burst starts: a request-free S_IDLE edge.
+                        state <= S_DRAIN_REQ;
                     end
                 end
             end
@@ -1070,6 +1095,7 @@ always_ff @(posedge i_CLK or negedge i_RST_n) begin
                     mem_pending <= 1'b0;
                     if(I_BUS.rsp_fault) begin
                         rsp_inst    <= 16'd0;
+                        rsp_pair_q  <= 1'b0;        //a faulted response never pairs
                         rsp_fault_i <= 1'b1;
                         rsp_valid_i <= 1'b1;
                         state       <= S_IDLE;
@@ -1077,9 +1103,9 @@ always_ff @(posedge i_CLK or negedge i_RST_n) begin
                     else begin
                         fill_words[fill_word] <= I_BUS.rsp_rdata;
                         if(fill_word == 2'd3) begin
-                            rsp_inst    <= pick_inst((cur_addr[3:2] == fill_word) ?
-                                           I_BUS.rsp_rdata : fill_words[cur_addr[3:2]],
-                                           cur_addr[1], BIG_ENDIAN);
+                            rsp_inst    <= pick_inst(ifill_word, cur_addr[1], BIG_ENDIAN);
+                            rsp_sib     <= pick_inst(ifill_word, !cur_addr[1], BIG_ENDIAN);
+                            rsp_pair_q  <= !cur_addr[1];
                             rsp_fault_i <= 1'b0;
                             rsp_valid_i <= 1'b1;
                             state       <= S_IDLE;
@@ -1161,6 +1187,8 @@ always_ff @(posedge i_CLK or negedge i_RST_n) begin
                 if(I_BUS.rsp_valid && I_BUS.rsp_ready) begin
                     mem_pending <= 1'b0;
                     rsp_inst    <= pick_inst(I_BUS.rsp_rdata, cur_addr[1], BIG_ENDIAN);
+                    rsp_sib     <= pick_inst(I_BUS.rsp_rdata, !cur_addr[1], BIG_ENDIAN);
+                    rsp_pair_q  <= !I_BUS.rsp_fault && !cur_addr[1];
                     rsp_fault_i <= I_BUS.rsp_fault;
                     rsp_valid_i <= 1'b1;
                     state       <= S_IDLE;

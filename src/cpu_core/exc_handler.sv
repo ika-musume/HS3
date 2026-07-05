@@ -34,6 +34,8 @@ module exc_handler #(
     input   wire            i_PIPE_RTE_VALID,
     input   wire            i_PIPE_RETIRE_VALID,
     input   wire    [31:0]  i_PIPE_RETIRE_PC,
+    input   wire            i_PIPE_RETIRE_INT_DEFER, //retiree is a delayed branch: slot owed
+    input   wire    [31:0]  i_PIPE_INT_NEXT_PC,      //oldest instruction the redirect discards
 
     /* ALREADY-PRIORITIZED EXTERNAL INTERRUPTS - the INTC owns INTEVT2 (I bus, Appendix B
        p.741), so only the INTEVT code arrives; the acks below let it latch/clear. */
@@ -168,7 +170,9 @@ logic   [31:0]  interrupt_spc;
 
 assign  sr_bl              = i_SR[28];
 assign  sr_imask           = i_SR[7:4];
-assign  interrupt_boundary = i_PIPE_RETIRE_VALID;
+//Deferred while a delayed-branch pair is open (branch retired, slot owed): no
+//interrupt is accepted between them (section 4.5.3, pp.98-100).
+assign  interrupt_boundary = i_PIPE_RETIRE_VALID && !i_PIPE_RETIRE_INT_DEFER;
 assign  general_accept     = i_PIPE_EXC_VALID || i_PIPE_TRAPA_VALID;
 assign  general_reset_like = general_accept && sr_bl;
 assign  rte_accept         = i_PIPE_RTE_VALID;
@@ -207,8 +211,10 @@ always_comb begin
 end
 
 always_comb begin
-    // Interrupts complete the current instruction; see section 4.5.3, pp.98-100.
-    interrupt_spc = i_PIPE_RETIRE_VALID ? i_PIPE_RETIRE_PC + 32'd2 : i_FETCH_PC;
+    //Interrupts complete the current instruction; SPC = the oldest instruction the
+    //redirect discards (the pipe's mux). The old retire_pc+2 lost a taken branch
+    //when the accept landed on the branch's / its slot's retire cycle.
+    interrupt_spc = i_PIPE_INT_NEXT_PC;
 end
 
 /*
@@ -285,8 +291,9 @@ always_ff @(posedge i_CLK or negedge i_POR_n or negedge i_RST_n) begin
     end
     else begin if(i_CEN) begin
         if(general_reset_like) begin
+            //BL=1 reset-like recovery is a MANUAL reset (section 4.6 pp.100-101).
             o_TRA    <= 32'd0;
-            o_EXPEVT <= {20'd0, EV_POWER_RESET};
+            o_EXPEVT <= {20'd0, EV_MANUAL_RESET};
             o_INTEVT <= 32'd0;
             o_TEA    <= 32'd0;
         end

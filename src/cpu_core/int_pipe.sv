@@ -63,6 +63,12 @@ module int_pipe #(
     output  logic           o_RETIRE_VALID,
     output  logic   [31:0]  o_RETIRE_PC,
     output  logic   [15:0]  o_RETIRE_INST,
+    //Interrupt sidebands (exc_handler): the retiree is a DELAYED BRANCH whose slot has
+    //not retired (defer acceptance, 4.5.3), and the restart PC = the OLDEST instruction
+    //the redirect will discard (mawb..fetch_pc priority; retire+2 on a plain stream,
+    //the branch-target stream head after a taken branch).
+    output  logic           o_RETIRE_INT_DEFER,
+    output  logic   [31:0]  o_INT_NEXT_PC,
     output  logic           o_RETIRE_GPR_WE,
     output  logic   [4:0]   o_RETIRE_GPR,
     output  logic   [31:0]  o_RETIRE_GPR_DATA,
@@ -221,6 +227,16 @@ logic           fetch_drop;       //discard stale response after redirect
 logic           fault_hold;       //wait for external exception redirect
 logic   [31:0]  fetch_pc;          //address used by the next fetch request
 logic   [31:0]  fetch_pending_pc;  //PC paired with the outstanding response
+
+//FETCH-PAIR slot: every fetch response carries the full longword (LBus rsp_inst_sib);
+//an even fetch's sibling (PC+2) is held here as ONE extra in-order fetch-queue entry
+//and inserted into IF/ID without a bus request - the freed port slot goes to MA or
+//idles (drain). Next-sequential ONLY, killed on every redirect: architecturally the
+//same class as IF/ID itself, so it needs no store/eviction coherency (SH prefetch law).
+logic           pair_ready;       //slot holds the next-in-order opcode
+logic   [31:0]  pair_pc;
+logic   [15:0]  pair_inst;
+pd_route_t      pair_pd;          //sibling predecode, computed once at capture
 logic           data_req_sent;    //MA request accepted; response still pending
 logic           data_req_sent_agu;    //AGU-only preserved duplicate (u_ma_seq o_req_sent_agu)
 logic           ma_second_access; //MEM_MAC second read or MEM_RMW write phase
@@ -427,6 +443,13 @@ assign  redirect_active = i_REDIRECT_VALID || branch_redirect;
 //decode on the hazard/issue cone. See int_pipe.md.
 pd_route_t      pd_fetch;
 assign  pd_fetch = pd_route(i_rsp_inst);
+
+//Sibling opcode + its predecode (second pd_route instance): both are captured into the
+//pair slot registers, so a pair-served IF/ID load is a pure register read - the serve
+//path adds NO depth to the rsp_inst -> predecode cone.
+wire    [15:0]  i_rsp_sib = L_BUS.rsp_inst_sib;
+pd_route_t      pd_fetch_sib;
+assign  pd_fetch_sib = pd_route(i_rsp_sib);
 
 
 ///////////////////////////////////////////////////////////
@@ -1123,8 +1146,11 @@ logic           ctrl_misc_write_pending;//older GBR/VBR/SSR/SPC/PR write still u
 assign data_response = data_req_sent && d_rsp_valid;
 assign wb_valid      = mawb.valid;
 assign wb_fault_pending = wb_valid && mawb.fault;
-assign gpr_wb0_we    = wb_valid && !mawb.fault && mawb.gpr0_we;
-assign gpr_wb1_we    = wb_valid && !mawb.fault && mawb.gpr1_we;
+//!i_REDIRECT_VALID: the packet in WB at an interrupt-redirect edge is KILLED (its
+//retirement and every other commit lane are suppressed) - without this gate its GPR
+//write leaked and the resumed instruction ran twice (interrupt-sweep golden).
+assign gpr_wb0_we    = wb_valid && !i_REDIRECT_VALID && !mawb.fault && mawb.gpr0_we;
+assign gpr_wb1_we    = wb_valid && !i_REDIRECT_VALID && !mawb.fault && mawb.gpr1_we;
 assign gpr_wb0_dst   = mawb.gpr0_dst;
 assign gpr_wb1_dst   = mawb.gpr1_dst;
 assign gpr_wb0_data  = mawb.gpr0_data;
@@ -1976,6 +2002,7 @@ always_comb begin
     ex_result.gpr1_dst      = idex.gpr1_dst;
     ex_result.gpr1_data     = idex.mem_op == MEM_MAC ? address_update_second : address_update;
     ex_result.mem_op        = idex.mem_op;
+    ex_result.dbr           = idex.branch_delayed;  //interrupt-defer marker (pair atomicity)
     ex_result.mem_size      = idex.mem_size;
     ex_result.load_signed   = idex.load_signed;
     ex_result.byte_op       = idex.byte_op;
@@ -2182,13 +2209,23 @@ wire            agu_hold_mac  = exma.mem_op == MEM_MAC;   //2nd-addr source sele
 //drop/pending flags - priorities preserved exactly from the pre-rail procedural code:
 //redirect > WB fault kill > branch clear > response insert > issue clear (ifid);
 //fault > accept > branch redirect (fetch_drop, last-write-wins order).
+//Insert leg gated on !pair_ready: the held sibling is OLDER than any waiting response,
+//so it must reach IF/ID first (the response holds loss-free in the cache meanwhile).
+//The drop/redirect consume legs stay pair-blind.
 assign  i_rsp_ready = fetch_pending &&
-                      (fetch_drop || (!ifid.valid || id_issue) ||
+                      (fetch_drop || ((!ifid.valid || id_issue) && !pair_ready) ||
                        i_REDIRECT_VALID || branch_redirect);
 assign  if_accept   = i_rsp_valid && i_rsp_ready;
+//A usable pair rides the live fetch response: the same-edge request fire MUST be
+//suppressed - fetch_pc is the sibling's own PC, which the pair slot satisfies.
+//Kill-gated only (NOT insert-gated: an unconsumed paired response keeps suppressing);
+//under a redirect the fire is the TARGET fetch and proceeds (drop_d marks wrong-path).
+wire    rsp_pair_ok = i_rsp_valid && L_BUS.rsp_pair && !i_rsp_fault &&
+                      fetch_pending && !fetch_drop &&
+                      !i_REDIRECT_VALID && !branch_redirect && !wb_fault_kill;
 //Pipelined fetch "want to issue". A wrong-path fetch is marked via fetch_drop and its
 //line fill aborted (o_I_SQUASH).
-assign  early_i_req_raw_valid = (!fetch_pending || if_accept) &&
+assign  early_i_req_raw_valid = (!fetch_pending || if_accept) && !rsp_pair_ok &&
                                 !i_REDIRECT_VALID && !fault_hold && !wb_fault_kill;
 assign  i_req_fire  = early_i_req_raw_valid && !l_is_data && L_BUS.req_ready;
 
@@ -2198,9 +2235,18 @@ wire    ifid_ld   = !i_REDIRECT_VALID && !wb_fault_kill && !ifid_clr &&
                     if_accept && !fetch_drop;               //response insert into IF/ID
 (* keep *) wire ifid_ld_dat = !i_REDIRECT_VALID && !wb_fault_kill && !ifid_clr &&
                     if_accept && !fetch_drop;   //data-cluster CE duplicate (placement-local)
+//Pair slot events. Capture = the response inserts into IF/ID this edge AND pairs
+//(ifid_ld already folds every kill term); at that edge fetch_pc == the sibling's PC
+//(it only advances on fire/capture, and any redirect in between killed the capture).
+//Serve = IF/ID can take the held sibling (kill terms mirror ifid_ld; exclusive with
+//ifid_ld by the i_rsp_ready gate above).
+wire    pair_capture = ifid_ld && L_BUS.rsp_pair;
+wire    pair_serve   = pair_ready && !i_REDIRECT_VALID && !wb_fault_kill && !ifid_clr &&
+                       (!ifid.valid || id_issue);
 wire    ifid_zero = i_REDIRECT_VALID || wb_fault_kill || ifid_clr ||
-                    (id_issue && !ifid_ld);                 //every '0 load of the IF/ID packet
-wire    fpc_ce    = i_REDIRECT_VALID || branch_redirect || i_req_fire;  //fetch_pc capture
+                    (id_issue && !ifid_ld && !pair_serve);  //every '0 load of the IF/ID packet
+wire    fpc_ce    = i_REDIRECT_VALID || branch_redirect || i_req_fire ||
+                    pair_capture;             //capture advances fetch_pc PAST the sibling
 wire    fpc_selbr = branch_redirect;      //fetch_pc source: branch target (over pc+2)
 wire    fp_ce     = i_req_fire || if_accept;                //fetch_pending capture
 wire    drop_ce   = i_REDIRECT_VALID || wb_fault_kill || branch_redirect || if_accept;
@@ -2232,9 +2278,13 @@ always_ff @(posedge i_CLK or negedge i_RST_n) begin
     end end
 end
 //NEXT-ifid instruction/predecode: what IF/ID will hold during the read-data cycle.
-wire    [15:0]  nx_inst = ifid_ld ? i_rsp_inst : ifid.inst;
+//Pair-serve leads: pair_inst/pair_pd are REGISTERS, so that arm is shallower than
+//the live response arm (exclusive with ifid_ld by construction).
+wire    [15:0]  nx_inst = pair_serve ? pair_inst :
+                          ifid_ld    ? i_rsp_inst : ifid.inst;
 pd_route_t      nx_pd;
-assign  nx_pd   = ifid_ld ? pd_fetch : ifid.pd;
+assign  nx_pd   = pair_serve ? pair_pd :
+                  ifid_ld    ? pd_fetch : ifid.pd;
 wire    [4:0]   nx_n_id    = active_gpr_id(nx_inst[11:8], bank1_nx);
 wire    [4:0]   nx_m_id    = active_gpr_id(nx_inst[7:4],  bank1_nx);
 wire    [4:0]   nx_bank_id = inactive_bank_id(nx_inst[6:4], bank1_nx);
@@ -2298,6 +2348,17 @@ assign  o_D_PREF = early_bus_d_req.pref;
 //cache may abort its line fill instead of allocating wrong-path instructions.
 assign  o_I_SQUASH = fetch_drop;
 
+//Interrupt restart PC: the oldest packet the external redirect will DISCARD (the
+//retiree already committed). Plain stream -> mawb = retire+2; post-taken-branch ->
+//every live stage holds the TARGET stream, so the mux lands on its head. The old
+//retire_pc+2 rule lost taken branches when the accept hit a branch/slot retire.
+assign  o_INT_NEXT_PC = mawb.valid    ? mawb.pc :
+                        exma.valid    ? exma.pc :
+                        idex.valid    ? idex.pc :
+                        ifid.valid    ? ifid.pc :
+                        pair_ready    ? pair_pc :
+                        fetch_pending ? fetch_pending_pc : fetch_pc;
+
 //The former o_D_REQ_RAW sideband is now L_BUS.req_fetch (= !l_is_data), driven above; the
 //former o_I_REQ_RAW cold-accept sideband died with the cache's reqn machinery (the single
 //clock accepts live - accept and fire are the same edge decision, no phase race remains).
@@ -2309,6 +2370,7 @@ always_comb begin
     ma_result.pc            = exma.pc;
     ma_result.inst          = exma.inst;
     ma_result.delay_slot    = exma.delay_slot;
+    ma_result.dbr           = exma.dbr;
     ma_result.gpr0_we       = exma.gpr0_we;
     ma_result.gpr0_dst      = exma.gpr0_dst;
     ma_result.gpr0_data     = exma.mem_op == MEM_LOAD ? load_value : exma.gpr0_data;
@@ -2576,6 +2638,10 @@ always_ff @(posedge i_CLK or negedge i_RST_n) begin
         fault_hold      <= 1'b0;
         fetch_pc        <= RESET_PC;
         fetch_pending_pc<= 32'd0;
+        pair_ready      <= 1'b0;
+        pair_pc         <= 32'd0;
+        pair_inst       <= 16'd0;
+        pair_pd         <= '0;
         mac_started       <= 1'b0;
         mac_armed         <= 1'b0;
         agu_base_q        <= 32'd0;
@@ -2599,6 +2665,7 @@ always_ff @(posedge i_CLK or negedge i_RST_n) begin
         o_RETIRE_VALID       <= 1'b0;
         o_RETIRE_PC          <= 32'd0;
         o_RETIRE_INST        <= 16'd0;
+        o_RETIRE_INT_DEFER   <= 1'b0;
         o_RETIRE_GPR_WE      <= 1'b0;
         o_RETIRE_GPR         <= 5'd0;
         o_RETIRE_GPR_DATA    <= 32'd0;
@@ -2612,6 +2679,7 @@ always_ff @(posedge i_CLK or negedge i_RST_n) begin
         o_SLEEP_VALID       <= 1'b0;
         o_LDTLB_VALID       <= 1'b0;
         o_RETIRE_VALID      <= 1'b0;
+        o_RETIRE_INT_DEFER  <= 1'b0;
         o_RETIRE_GPR_WE     <= 1'b0;
 
         //External reset/exception control has priority over all internal advancement.
@@ -2689,6 +2757,7 @@ always_ff @(posedge i_CLK or negedge i_RST_n) begin
                     o_RETIRE_VALID <= 1'b1;
                     o_RETIRE_PC    <= mawb.pc;
                     o_RETIRE_INST  <= mawb.inst;
+                    o_RETIRE_INT_DEFER <= mawb.dbr;  //slot still owed: defer acceptance
                 end
             end
 
@@ -2882,13 +2951,31 @@ always_ff @(posedge i_CLK or negedge i_RST_n) begin
         //id_issue). The 89-bit data cluster rides the load-only enable (a placement-
         //local keep duplicate), halving the deep CE net's fanout.
         if(ifid_zero)    ifid.valid <= 1'b0;
-        else if(ifid_ld) ifid.valid <= 1'b1;
-        if(ifid_ld_dat) begin
+        else if(ifid_ld || pair_serve) ifid.valid <= 1'b1;
+        if(pair_serve) begin
+            //Held sibling insert: register-sourced, exclusive with the response insert.
+            ifid.pc          <= pair_pc;
+            ifid.inst        <= pair_inst;
+            ifid.fetch_fault <= 1'b0;     //a pair is never captured from a faulted response
+            ifid.delay_slot  <= 1'b0;
+            ifid.pd          <= pair_pd;
+        end
+        else if(ifid_ld_dat) begin
             ifid.pc          <= fetch_pending_pc;
             ifid.inst        <= i_rsp_inst;
             ifid.fetch_fault <= i_rsp_fault;
             ifid.delay_slot  <= 1'b0;
             ifid.pd          <= pd_fetch; //predecoded source routing rides the instruction
+        end
+
+        //Fetch-pair slot: kill > capture > serve-consume.
+        if(i_REDIRECT_VALID || wb_fault_kill || ifid_clr) pair_ready <= 1'b0;
+        else if(pair_capture)                             pair_ready <= 1'b1;
+        else if(pair_serve)                               pair_ready <= 1'b0;
+        if(pair_capture) begin
+            pair_pc   <= fetch_pc;        //= the sibling's PC (see the rails invariant)
+            pair_inst <= i_rsp_sib;
+            pair_pd   <= pd_fetch_sib;
         end
 
         if(fpc_ce)  fetch_pc <= i_REDIRECT_VALID ? i_REDIRECT_PC :

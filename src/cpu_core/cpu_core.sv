@@ -98,6 +98,8 @@ logic           pipe_sleep_valid;
 logic           pipe_ldtlb_valid;
 logic           pipe_retire_valid;
 logic   [31:0]  pipe_retire_pc;
+logic           pipe_retire_int_defer;  //retiree = delayed branch, slot owed (interrupt defer)
+logic   [31:0]  pipe_int_next_pc;       //interrupt SPC: oldest instruction the redirect discards
 logic   [15:0]  pipe_retire_inst;
 logic           pipe_retire_gpr_we;
 logic   [4:0]   pipe_retire_gpr;
@@ -230,6 +232,8 @@ int_pipe #(
     .o_RETIRE_VALID         (pipe_retire_valid                      ),
     .o_RETIRE_PC            (pipe_retire_pc                         ),
     .o_RETIRE_INST          (pipe_retire_inst                       ),
+    .o_RETIRE_INT_DEFER     (pipe_retire_int_defer                  ),
+    .o_INT_NEXT_PC          (pipe_int_next_pc                       ),
     .o_RETIRE_GPR_WE        (pipe_retire_gpr_we                     ),
     .o_RETIRE_GPR           (pipe_retire_gpr                        ),
     .o_RETIRE_GPR_DATA      (pipe_retire_gpr_data                   ),
@@ -352,6 +356,8 @@ exc_handler #(
     .i_PIPE_RTE_VALID       (pipe_rte_valid                         ),
     .i_PIPE_RETIRE_VALID    (pipe_retire_valid                      ),
     .i_PIPE_RETIRE_PC       (pipe_retire_pc                         ),
+    .i_PIPE_RETIRE_INT_DEFER(pipe_retire_int_defer                  ),
+    .i_PIPE_INT_NEXT_PC     (pipe_int_next_pc                       ),
 
     .i_NMI_VALID            (i_NMI_VALID                            ),
     .i_NMI_BLMSK            (i_NMI_BLMSK                            ),
