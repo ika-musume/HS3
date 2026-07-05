@@ -478,6 +478,14 @@ integer         mbus_req_viol    = 0;       //external request mutated/withdrawn
 
 integer         lbus_ifetch_acc  = 0;       //accepted L-bus FETCH requests (pair-law probe)
 
+integer         lock_pairs_checked = 0;     //completed locked read->write RMW pairs
+integer         lock_pair_viol     = 0;     //broken/dangling bus-lock sequences
+logic           lock_open_q        = 1'b0;  //a locked read is awaiting its locked write
+integer         ack_checks         = 0;     //o_INT_ACK pulses cross-checked
+integer         ack_viol           = 0;     //acks without entry / INTEVT mismatches
+logic           ack_z              = 1'b0;  //previous-cycle ack (INTEVT settles then)
+logic   [11:0]  ack_code_z         = 12'd0; //code presented at that ack
+
 task automatic mirror_reset_set(input integer set);
     begin
         lru_order[set][0] = 2'd0;   //all-zero LRU bits decode to the order 0,1,2,3
@@ -577,6 +585,57 @@ always @(posedge clk) begin
         //acceptance edges while the cache FSM is mid-fill/drain/bypass (not IDLE).
         if(exception_entry_valid && cst != CS_IDLE)
             entry_cache_busy = entry_cache_busy + 1;
+    end
+end
+
+/*
+    Locked-pair alternation: a locked READ opens an RMW pair that the NEXT locked
+    access must close as its WRITE (non-locked traffic may interleave; other masters
+    are held off by the BSC, see test_tas_atomic_breq). Two locked reads in a row or
+    an unpaired locked write = a split RMW / dangling bus lock (the TAS-vs-interrupt
+    bug class). Ack-implies-entry: the INTC drops its request on o_INT_ACK, so an ack
+    without a same-cycle entry is a LOST interrupt, and INTEVT must carry the acked
+    code the next cycle (an exception winning the same edge would leave it unwritten).
+*/
+always @(posedge clk) begin
+    if(!rst_n) begin
+        lock_open_q = 1'b0;
+        ack_z       = 1'b0;
+    end
+    else begin
+        //(5) Locked read->write pairing on the external bus.
+        if(MEM_BUS.req_valid && MEM_BUS.req_ready && MEM_BUS.req_lock) begin
+            if(MEM_BUS.req_write) begin
+                if(!lock_open_q) begin
+                    lock_pair_viol = lock_pair_viol + 1;
+                    $display("      [LOCK] locked WRITE with no locked read open @%0t", $time);
+                end
+                else lock_pairs_checked = lock_pairs_checked + 1;
+                lock_open_q = 1'b0;
+            end
+            else begin
+                if(lock_open_q) begin
+                    lock_pair_viol = lock_pair_viol + 1;
+                    $display("      [LOCK] second locked READ while a pair is open @%0t", $time);
+                end
+                lock_open_q = 1'b1;
+            end
+        end
+
+        //(6) Every interrupt ack enters, and INTEVT reflects the acked code.
+        if(int_ack_w) begin
+            ack_checks = ack_checks + 1;
+            if(!exception_entry_valid) begin
+                ack_viol = ack_viol + 1;
+                $display("      [ACK] o_INT_ACK without an interrupt entry @%0t", $time);
+            end
+        end
+        if(ack_z && intevt_o[11:0] !== ack_code_z) begin
+            ack_viol = ack_viol + 1;
+            $display("      [ACK] INTEVT %03h != acked code %03h @%0t", intevt_o[11:0], ack_code_z, $time);
+        end
+        ack_z      = int_ack_w;
+        ack_code_z = int_code_q;
     end
 end
 
@@ -2504,15 +2563,21 @@ endtask
 //Suite-wide property verdicts, evaluated LAST so every test fed the checkers.
 task automatic test_property_summary;
     begin
-        begin_test("Suite-wide properties: LRU divergence, L-bus/MEM-bus contracts");
+        begin_test("Suite-wide properties: LRU divergence, L-bus/MEM-bus contracts, lock pairs, int acks");
         $display("      LRU: %0d update checks, %0d victim checks; L-bus: %0d req-pend, %0d rsp-pend cycles; MEM-bus: %0d pend cycles",
                  lru_upd_checks, lru_vic_checks, lbus_dreq_pends, lbus_drsp_pends, mbus_req_pends);
+        $display("      locked RMW pairs completed: %0d; interrupt acks cross-checked: %0d",
+                 lock_pairs_checked, ack_checks);
         chk_true("LRU checker exercised", (lru_upd_checks > 100) && (lru_vic_checks > 20));
         chk("LRU divergences",                    lru_mismatches[31:0], 32'd0);
         chk_true("D-request stability exercised", lbus_dreq_pends > 0);
         chk("L-bus D-request stability violations", lbus_dreq_viol[31:0], 32'd0);
         chk("L-bus D-response hold violations",     lbus_drsp_viol[31:0], 32'd0);
         chk("MEM-bus request stability violations", mbus_req_viol[31:0],  32'd0);
+        chk_true("locked-pair law exercised",       lock_pairs_checked > 50);
+        chk("locked-pair violations",               lock_pair_viol[31:0], 32'd0);
+        chk_true("interrupt-ack law exercised",     ack_checks > 100);
+        chk("ack-without-entry / INTEVT violations", ack_viol[31:0], 32'd0);
         end_test;
     end
 endtask

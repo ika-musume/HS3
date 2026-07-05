@@ -27,6 +27,12 @@
     chip, not a hierarchy peek) and the RTC on its own EXTAL2 clock domain -
     the tb crystal is a scaled 32.768 kHz surrogate (80 ns period), see the
     generator comment for the exact-law reasoning.
+
+    Group 13 twins the cpu_core_tb interrupt-collision sweeps (tests 87-89)
+    onto the real INTC/BSC: IRL requests on the pins vs SDRAM fill/drain/
+    refresh machinery, TAS.B locked pairs, and synchronous-exception
+    collisions - plus suite-wide passive checkers for lock pairing on
+    CORE_I_BUS and the ack/INTEVT/INTEVT2 handshake law.
 */
 
 module HS3_tb;
@@ -277,6 +283,9 @@ wire    [31:0]  intevt_o     = u_dut.u_cpu.dbg_o_INTEVT;
 wire            exc_valid    = u_dut.u_cpu.dbg_o_EXC_VALID;
 wire            entry_valid  = u_dut.u_cpu.o_EXCEPTION_ENTRY_VALID;
 wire    [31:0]  entry_pc     = u_dut.u_cpu.o_EXCEPTION_ENTRY_PC;
+wire    [31:0]  tea_o        = u_dut.u_cpu.dbg_o_TEA;
+wire    [31:0]  tra_o        = u_dut.u_cpu.dbg_o_TRA;
+wire            trapa_valid  = u_dut.u_cpu.dbg_o_TRAPA_VALID;
 wire    [31:0]  intevt2_reg  = u_dut.u_intc.intevt2;
 wire            wdt_rst_hit  = !u_dut.wdt_rst_por_n || !u_dut.wdt_rst_man_n;
 
@@ -504,6 +513,7 @@ end
 logic           retired_seen [0:2047];
 integer         retire_count [0:2047];
 logic           exc_seen;
+logic           trapa_seen;
 integer         entry_count;
 logic   [31:0]  entry_pc_l;
 
@@ -516,6 +526,7 @@ always_ff @(posedge clk or negedge sys_rst_n) begin
         retired_seen      <= '{default:1'b0};
         retire_count      <= '{default:0};
         exc_seen          <= 1'b0;
+        trapa_seen        <= 1'b0;
         entry_count       <= 0;
         entry_pc_l        <= 32'd0;
         bench_active      <= 1'b0;
@@ -529,6 +540,7 @@ always_ff @(posedge clk or negedge sys_rst_n) begin
             retire_count[retire_pc[11:1]] <= retire_count[retire_pc[11:1]] + 1;
         end
         if(exc_valid) exc_seen <= 1'b1;
+        if(trapa_valid) trapa_seen <= 1'b1;
         if(entry_valid) begin
             entry_count <= entry_count + 1;
             entry_pc_l  <= entry_pc;
@@ -551,6 +563,99 @@ always_ff @(posedge clk or negedge sys_rst_n) begin
                 if(retire_valid) bench_retires <= bench_retires + 1;
             end
         end
+    end
+end
+
+
+///////////////////////////////////////////////////////////
+//////  SoC Boundary Contracts (suite-wide passive checkers)
+////
+
+/*
+    SoC twins of the cpu_core_tb suite-wide contracts. The lock-pairing law
+    watches the CPU's own bus (CORE_I_BUS, the splitter input): every locked
+    READ opens an RMW pair that exactly one locked WRITE closes - no nested
+    reads, no widowed writes (TAS.B indivisibility, p.320). The ack law is
+    the INTC handshake: o_INT_ACK must land ON an exception-entry edge (an
+    ack without an entry LOSES the interrupt - the INTC drops the request),
+    and one cycle later the core's INTEVT must hold the code presented at
+    the ack edge while the INTC's INTEVT2 holds its per-source code2 (the
+    two differ for kind=0 sources, where INTEVT gets the level code).
+    Coverage counters prove the sweeps land entries mid-machinery.
+*/
+integer         int_ack_cnt;                    //clocked ack counter (sweep drop key)
+integer         locked_rd_cnt, locked_wr_cnt;   //accepted locked beats on CORE_I_BUS
+integer         lock_pairs_checked = 0;
+integer         lock_pair_viol     = 0;
+logic           lock_open_q;
+integer         ack_checks = 0, ack_viol = 0;
+logic           ack_z;
+logic   [11:0]  ack_code_z;                     //o_INT_CODE at the ack edge (-> INTEVT)
+logic   [11:0]  ack_code2_z;                    //INTC b_code2_q at the ack edge (-> INTEVT2)
+integer         entry_cache_busy = 0;           //entries with the cache FSM mid-excursion
+integer         entry_sdram_busy = 0;           //entries with the SDRAM engine mid-cycle
+logic   [4:0]   cache_st, bsc_est;
+localparam logic [4:0] TB_CS_IDLE = 5'd1;       //cache state_t encoding (drift guard: cpu_core_tb)
+
+wire            core_lock_beat = u_dut.CORE_I_BUS.req_valid && u_dut.CORE_I_BUS.req_ready &&
+                                 u_dut.CORE_I_BUS.req_lock;
+
+always @(posedge clk) begin
+    cache_st = u_dut.u_cpu.u_cache.state;
+    bsc_est  = u_dut.u_bsc.est;
+    if(!sys_rst_n) begin
+        int_ack_cnt   = 0;
+        locked_rd_cnt = 0;
+        locked_wr_cnt = 0;
+        lock_open_q   = 1'b0;
+        ack_z         = 1'b0;
+    end
+    else begin
+        if(u_dut.int_ack) int_ack_cnt = int_ack_cnt + 1;
+        //(1) locked read->write pairing, observed as CORE_I_BUS accept beats
+        if(core_lock_beat) begin
+            if(u_dut.CORE_I_BUS.req_write) begin
+                locked_wr_cnt = locked_wr_cnt + 1;
+                if(!lock_open_q) begin
+                    lock_pair_viol = lock_pair_viol + 1;
+                    $display("      [LOCK] locked WRITE with no locked read open");
+                end
+                else lock_pairs_checked = lock_pairs_checked + 1;
+                lock_open_q = 1'b0;
+            end
+            else begin
+                locked_rd_cnt = locked_rd_cnt + 1;
+                if(lock_open_q) begin
+                    lock_pair_viol = lock_pair_viol + 1;
+                    $display("      [LOCK] second locked READ while a pair is open");
+                end
+                lock_open_q = 1'b1;
+            end
+        end
+        //(2) every ack enters, and both event registers reflect the acked codes
+        if(u_dut.int_ack) begin
+            ack_checks = ack_checks + 1;
+            if(!entry_valid) begin
+                ack_viol = ack_viol + 1;
+                $display("      [ACK] o_INT_ACK without an interrupt entry");
+            end
+        end
+        if(ack_z) begin
+            if(intevt_o[11:0] !== ack_code_z) begin
+                ack_viol = ack_viol + 1;
+                $display("      [ACK] INTEVT %03h != presented code %03h", intevt_o[11:0], ack_code_z);
+            end
+            if(intevt2_reg[11:0] !== ack_code2_z) begin
+                ack_viol = ack_viol + 1;
+                $display("      [ACK] INTEVT2 %03h != presented code2 %03h", intevt2_reg[11:0], ack_code2_z);
+            end
+        end
+        ack_z       = u_dut.int_ack;
+        ack_code_z  = u_dut.int_code;
+        ack_code2_z = u_dut.u_intc.b_code2_q;
+        //(3) entry-vs-machinery coverage (verdicts in the sweep tests)
+        if(entry_valid && cache_st != TB_CS_IDLE) entry_cache_busy = entry_cache_busy + 1;
+        if(entry_valid && bsc_est  != 5'd0)       entry_sdram_busy = entry_sdram_busy + 1;
     end
 end
 
@@ -3371,6 +3476,329 @@ endtask
 
 
 ///////////////////////////////////////////////////////////
+//////  Interrupt x Machinery Collision (SoC twins of cpu_core_tb 87-89)
+////
+
+/*
+    The core-level sweeps drove i_INT_VALID directly; here the interrupt is a
+    real IRL request: pins -> 2FF sync -> P-phi noise cancel (two consecutive
+    equal samples, p.122-123) -> resolver -> INTC/core handshake. The tests
+    program FRQCR for P-phi = /1 so the pin-offset sweep keeps a ~2-cycle
+    acceptance grain. Pin protocol per the manual: the IRL level must be HELD
+    until the interrupt is accepted and handling starts (p.123) - the tb keys
+    the release on the clocked ack counter, and the handler carries grace NOPs
+    so the released level has drained out of the resolver before RTE re-opens
+    the acceptance boundary (a held level across RTE legally RE-ENTERS).
+*/
+
+//interrupt handler at VBR+0x600: count the entry in R13 and return. The 10
+//grace NOPs cover the pin-release path: 2FF + 2 P-phi cancel + winner reg.
+task automatic emit_count_handler;
+    integer k;
+    begin
+        imem['h300] = 16'h7D01;                           // ADD   #1,R13
+        for(k = 0; k < 10; k = k + 1) begin
+            imem['h301 + k] = 16'h0009;                   // grace NOPs
+        end
+        imem['h30B] = 16'h002B;                           // RTE
+        imem['h30C] = 16'h0009;                           //   delay slot
+    end
+endtask
+
+/*
+    Twin of cpu_core_tb test 87 on the real BSC: a P0 write-back loop walks
+    8 same-set SDRAM lines (write-allocate fill + dirty-victim drain bursts)
+    plus a cold-miss load walk, with the LOOP CODE lines sharing sets 0x20/
+    0x21 so the data walks evict them (I-misses too) - all while auto-refresh
+    (RTCOR=4) churns the SDRAM engine. An IRL-13 request lands at every
+    offset; acceptance mid-fill/drain/refresh must be transparent.
+*/
+task automatic test_int_sdram_sweep;
+    integer off, w, k, e0, cb0, sb0;
+    begin
+        begin_test("Interrupt vs SDRAM fill/drain/refresh: acceptance mid-machinery is transparent");
+        cb0 = entry_cache_busy;
+        sb0 = entry_sdram_busy;
+        eidx = 0;
+        emit_sdram_init(16'h503C, 16'hFFDF, 32'hFFFF_E880);  //AP CL2 + RFSH=1
+        emit_wreg_w(32'hFFFF_FF72, 16'hA504);        // RTCOR = 4: refresh every ~16 bus cyc
+        emit_wreg_w(32'hFFFF_FF6E, 16'hA508);        // RTCSR: CKS=001 (bus/4)
+        emit_wreg_w(32'hFFFF_FF80, 16'h0100);        // FRQCR: P-phi /1 (IRL sampling grain)
+        imem[eidx] = 16'hE0EC; eidx = eidx + 1;      // MOV   #0xEC,R0    ; CCR
+        imem[eidx] = 16'hE109; eidx = eidx + 1;      // MOV   #9,R1       ; CE|CF (WT=0: P0 WB)
+        imem[eidx] = 16'h2012; eidx = eidx + 1;      // MOV.L R1,@R0
+        emit_sr_imask(eidx, 4'h0);                   // BL=0, IMASK=0
+        imem[eidx] = 16'hED00; eidx = eidx + 1;      // MOV   #0,R13      ; handler counter
+        emit_ldrn(1, 32'h0C00_1200);                 // dirty walk base (P0 SDRAM, set 0x20)
+        imem[eidx] = 16'h6713; eidx = eidx + 1;      // MOV   R1,R7
+        imem[eidx] = 16'h7710; eidx = eidx + 1;      // ADD   #0x10,R7    ; cold walk (set 0x21)
+        imem[eidx] = 16'hE310; eidx = eidx + 1;      // MOV   #0x10,R3
+        imem[eidx] = 16'h4318; eidx = eidx + 1;      // SHLL8 R3          ; 0x1000 same-set stride
+        imem[eidx] = 16'hE508; eidx = eidx + 1;      // MOV   #8,R5       ; 8 lines > 4 ways
+        emit_ldrn(2, 32'h0000_0200);
+        imem[eidx] = 16'h422B; eidx = eidx + 1;      // JMP   @R2         ; P0 cacheable loop
+        imem[eidx] = 16'h0009; eidx = eidx + 1;      //   delay slot
+        chk_true("setup fits below the P0 loop", eidx <= 'h100);
+        //loop at P0 0x200 (imem 'h100): its own lines live in sets 0x20/0x21
+        imem['h100] = 16'hE200;  // MOV   #0,R2    ; anchor (loop is starting)
+        imem['h101] = 16'hE600;  // MOV   #0,R6
+        imem['h102] = 16'h7201;  // ADD   #1,R2    ; loop head
+        imem['h103] = 16'h2122;  // MOV.L R2,@R1   ; write-allocate miss (dirty)
+        imem['h104] = 16'h6412;  // MOV.L @R1,R4   ; load-back on the fresh line
+        imem['h105] = 16'h313C;  // ADD   R3,R1    ; next same-set line
+        imem['h106] = 16'h6972;  // MOV.L @R7,R9   ; COLD-MISS load (set 0x21)
+        imem['h107] = 16'h373C;  // ADD   R3,R7
+        imem['h108] = 16'h4510;  // DT    R5
+        imem['h109] = 16'h8FF7;  // BF/S  loop head ; delayed
+        imem['h10A] = 16'h7601;  // ADD   #1,R6    ;   delay slot
+        imem['h10B] = 16'h0009;  // sentinel
+        imem['h10C] = 16'hAFFE;  // guard
+        imem['h10D] = 16'h0009;
+        emit_count_handler;
+        for(off = 0; off < 120; off = off + 1) begin
+            //fresh SDRAM content: zeroed store lines, signed cold-load lines
+            for(k = 0; k < 8; k = k + 1) begin
+                sdram_poke(32'h0C00_1200 + k*32'h1000, 32'd0);
+                sdram_poke(32'h0C00_1210 + k*32'h1000, 32'hC01D_0000 + k);
+            end
+            do_reset;
+            e0 = test_errors;
+            run_until_retire('h100, 60000);          //loop is starting
+            repeat(off) @(posedge clk);
+            irq_pin[3:0] = 4'b0010;                  //IRL level 13 (table 6.3, p.122)
+            w = 0;
+            while(int_ack_cnt == 0 && w < 60000) begin @(posedge clk); w = w + 1; end
+            @(posedge clk);
+            irq_pin[3:0] = 4'b1111;                  //release after acceptance (p.123)
+            run_until_retire('h30B, 60000);          //handler RTE retired
+            run_until_retire('h10B, 60000);          //main line completed
+            chk($sformatf("off=%0d: exactly one ack", off), int_ack_cnt, 32'd1);
+            chk($sformatf("off=%0d: exactly one entry", off), entry_count, 32'd1);
+            chk($sformatf("off=%0d: handler ran once", off), gpr(13), 32'd1);
+            chk($sformatf("off=%0d: accumulator transparent", off), gpr(2), 32'd8);
+            chk($sformatf("off=%0d: load-back transparent", off), gpr(4), 32'd8);
+            chk($sformatf("off=%0d: cold-miss data transparent", off), gpr(9), 32'hC01D_0007);
+            chk($sformatf("off=%0d: slot count transparent", off), gpr(6), 32'd8);
+            chk($sformatf("off=%0d: loop count consumed", off), gpr(5), 32'd0);
+            chk_true($sformatf("off=%0d: no spurious exception", off), !exc_seen);
+            chk($sformatf("off=%0d: INTEVT = IRL code", off), intevt_o, 32'h0000_0240);
+            chk($sformatf("off=%0d: INTEVT2 = IRL code", off), intevt2_reg, 32'h0000_0240);
+            if(test_errors != e0)
+                $display("      [dbg] EXPEVT=%08h INTEVT=%08h entries=%0d ack=%0d R13=%0d R2=%0d R5=%0d R6=%0d cst=%0d est=%0d",
+                         expevt_o, intevt_o, entry_count, int_ack_cnt,
+                         gpr(13), gpr(2), gpr(5), gpr(6), cache_st, bsc_est);
+        end
+        //coverage verdict: entries really landed inside machinery windows. The
+        //cache count is intrinsically small at the SoC - excursions stall the
+        //whole pipe (no retire boundaries inside), so only the excursion-entry
+        //edge can coincide with an acceptance, and the IRL resolver quantizes
+        //arrivals to the P-phi grid. The SDRAM-engine count is the rich gate:
+        //wb-buffer drains and refreshes run under a retiring pipe.
+        $display("      entry-vs-machinery coverage: %0d cache-busy / %0d SDRAM-engine-busy entries",
+                 entry_cache_busy - cb0, entry_sdram_busy - sb0);
+        chk_true("entries landed at excursion edges (cache)", (entry_cache_busy - cb0) > 2);
+        chk_true("entries landed mid-cycle (SDRAM engine)",   (entry_sdram_busy - sb0) > 30);
+        end_test;
+    end
+endtask
+
+/*
+    Twin of cpu_core_tb test 88 on the real BSC: two back-to-back TAS.B locked
+    RMW pairs, phase 0 on SDRAM (engine lock path), phase 1 on an ordinary
+    handshake area stretched by d_latency (front-end lock path). An IRL-13
+    request lands at every offset: acceptance must never split a pair (the
+    MA-inflight defer), T flows exactly once, and the CORE_I_BUS lock-pairing
+    counters must show exactly 2 reads / 2 writes per run.
+*/
+task automatic test_int_tas_sweep;
+    integer ph, off, w, e0, marker, sent;
+    begin
+        begin_test("Interrupt vs TAS.B: locked RMW indivisible on both BSC paths (offset sweep)");
+        for(ph = 0; ph < 2; ph = ph + 1) begin
+            init_knobs;
+            clear_imem;
+            clear_dmem;
+            if(ph == 1) d_latency = 8;               //stretch the ordinary locked pair
+            eidx = 0;
+            if(ph == 0) emit_sdram_init(16'h5038, 16'hFFDF, 32'hFFFF_E880);
+            emit_wreg_w(32'hFFFF_FF80, 16'h0100);    // FRQCR: P-phi /1 (IRL sampling grain)
+            emit_sr_imask(eidx, 4'h0);               // BL=0, IMASK=0
+            imem[eidx] = 16'hED00; eidx = eidx + 1;  // MOV   #0,R13
+            emit_ldrn(1, (ph == 0) ? 32'hAC00_0070 : 32'hA000_0070);  //P2 uncached byte
+            marker = eidx;
+            imem[eidx] = 16'hE400; eidx = eidx + 1;  // MOV   #0,R4       ; anchor
+            imem[eidx] = 16'hE600; eidx = eidx + 1;  // MOV   #0,R6
+            imem[eidx] = 16'h0009; eidx = eidx + 1;  // offset-window NOPs
+            imem[eidx] = 16'h0009; eidx = eidx + 1;
+            imem[eidx] = 16'h0009; eidx = eidx + 1;
+            imem[eidx] = 16'h411B; eidx = eidx + 1;  // TAS.B @R1: pair #1 (byte 0 -> T=1, set 0x80)
+            imem[eidx] = 16'h0429; eidx = eidx + 1;  // MOVT  R4
+            imem[eidx] = 16'h411B; eidx = eidx + 1;  // TAS.B @R1: pair #2 (byte 0x80 -> T=0)
+            imem[eidx] = 16'h0629; eidx = eidx + 1;  // MOVT  R6
+            sent = eidx;
+            imem[eidx] = 16'h0009; eidx = eidx + 1;  // sentinel
+            imem[eidx] = 16'hAFFE; eidx = eidx + 1;  // guard
+            imem[eidx] = 16'h0009; eidx = eidx + 1;
+            emit_count_handler;
+            for(off = 0; off < 45; off = off + 1) begin
+                do_reset;
+                e0 = test_errors;
+                if(ph == 0) sdram_poke(32'h0C00_0070, 32'h00FF_00FF);  //byte@0x70 = 0x00
+                else        dmem['h1C] = 32'h00FF_00FF;
+                run_until_retire(marker, 60000);
+                repeat(off) @(posedge clk);
+                irq_pin[3:0] = 4'b0010;              //IRL level 13
+                w = 0;
+                while(int_ack_cnt == 0 && w < 60000) begin @(posedge clk); w = w + 1; end
+                @(posedge clk);
+                irq_pin[3:0] = 4'b1111;              //release after acceptance (p.123)
+                run_until_retire('h30B, 60000);      //handler RTE retired
+                run_until_retire(sent, 60000);
+                chk($sformatf("ph=%0d off=%0d: TAS#1 saw the pre-RMW byte once (T=1)", ph, off), gpr(4), 32'd1);
+                chk($sformatf("ph=%0d off=%0d: TAS#2 saw bit7 already set (T=0)", ph, off), gpr(6), 32'd0);
+                if(ph == 0)
+                    chk($sformatf("ph=%0d off=%0d: byte mutated exactly once", ph, off),
+                        sdram_peek(32'h0C00_0070), 32'h80FF_00FF);
+                else
+                    chk($sformatf("ph=%0d off=%0d: byte mutated exactly once", ph, off),
+                        dmem['h1C], 32'h80FF_00FF);
+                chk($sformatf("ph=%0d off=%0d: locked reads paired", ph, off), locked_rd_cnt, 32'd2);
+                chk($sformatf("ph=%0d off=%0d: locked writes paired", ph, off), locked_wr_cnt, 32'd2);
+                chk($sformatf("ph=%0d off=%0d: exactly one entry", ph, off), entry_count, 32'd1);
+                chk($sformatf("ph=%0d off=%0d: handler ran once", ph, off), gpr(13), 32'd1);
+                chk_true($sformatf("ph=%0d off=%0d: no spurious exception", ph, off), !exc_seen);
+                if(test_errors != e0)
+                    $display("      [dbg] EXPEVT=%08h INTEVT=%08h entries=%0d ack=%0d lockR=%0d lockW=%0d cst=%0d est=%0d",
+                             expevt_o, intevt_o, entry_count, int_ack_cnt,
+                             locked_rd_cnt, locked_wr_cnt, cache_st, bsc_est);
+            end
+        end
+        end_test;
+    end
+endtask
+
+/*
+    Twin of cpu_core_tb test 89 (minus the bus-fault flavor: no pin-level
+    mechanism can fault a beat on this board - that flavor stays core-only).
+    A synchronous event at F (illegal / misaligned address / TRAPA) collides
+    with a pending IRL-13 request at every offset, over two ordinary-bus
+    latencies (i_WAIT_n stretch). Whatever the order: one ack, one exception,
+    EXPEVT/INTEVT never mix, and the pre-decrement store runs exactly once.
+*/
+task automatic test_exc_int_collision_soc;
+    integer f, ws, off, w, e0, marker, sent;
+    logic [15:0] f_op;
+    logic [31:0] exp_ev;
+    logic        skip;
+    string       fname;
+    begin
+        begin_test("Exception x interrupt collision: both once, never mixed (3 flavors x offsets)");
+        for(f = 0; f < 3; f = f + 1) begin
+            case(f)
+                0:       begin fname = "illegal"; f_op = 16'hF000; exp_ev = 32'h0000_0180; skip = 1'b1; end
+                1:       begin fname = "address"; f_op = 16'h6402; exp_ev = 32'h0000_00E0; skip = 1'b1; end
+                default: begin fname = "trapa";   f_op = 16'hC342; exp_ev = 32'h0000_0160; skip = 1'b0; end
+            endcase
+        for(ws = 0; ws <= 5; ws = ws + 5) begin
+            init_knobs;
+            clear_imem;
+            clear_dmem;
+            wait_stretch = ws;                       //i_WAIT_n latency axis
+            eidx = 0;
+            emit_wreg_w(32'hFFFF_FF66, 16'hFFF9);    // WCR2: A0W=001 (1 wait, pin sampled)
+            emit_wreg_w(32'hFFFF_FF80, 16'h0100);    // FRQCR: P-phi /1 (IRL sampling grain)
+            emit_sr_imask(eidx, 4'h0);               // BL=0, IMASK=0
+            imem[eidx] = 16'hED00; eidx = eidx + 1;  // MOV   #0,R13   ; interrupt counter
+            imem[eidx] = 16'hEB00; eidx = eidx + 1;  // MOV   #0,R11   ; exception counter
+            imem[eidx] = 16'hE200; eidx = eidx + 1;  // MOV   #0,R2
+            imem[eidx] = 16'hE001; eidx = eidx + 1;  // MOV   #1,R0    ; odd EA (ADDRESS flavor)
+            imem[eidx] = 16'hE304; eidx = eidx + 1;  // MOV   #4,R3
+            marker = eidx;
+            imem[eidx] = 16'h4318; eidx = eidx + 1;  // SHLL8 R3       ; 0x400 + anchor
+            imem[eidx] = 16'h7201; eidx = eidx + 1;  // ADD   #1,R2
+            imem[eidx] = 16'h7201; eidx = eidx + 1;  // ADD   #1,R2
+            imem[eidx] = f_op;     eidx = eidx + 1;  // F: the flavor's faulting/trapping op
+            imem[eidx] = 16'h7201; eidx = eidx + 1;  // G: younger ADD
+            imem[eidx] = 16'h2326; eidx = eidx + 1;  // MOV.L R2,@-R3  ; double-execution detector
+            imem[eidx] = 16'h6432; eidx = eidx + 1;  // MOV.L @R3,R4   ; load-back of the store
+            sent = eidx;
+            imem[eidx] = 16'h0009; eidx = eidx + 1;  // sentinel
+            imem[eidx] = 16'hAFFE; eidx = eidx + 1;  // guard
+            imem[eidx] = 16'h0009; eidx = eidx + 1;
+            //general-exception handler (VBR+0x100): count, skip F when it faulted
+            if(skip) begin
+                imem['h80] = 16'h0942;  // STC SPC,R9
+                imem['h81] = 16'h7902;  // ADD #2,R9
+                imem['h82] = 16'h494E;  // LDC R9,SPC   ; resume past F
+                imem['h83] = 16'h7B01;  // ADD #1,R11
+                imem['h84] = 16'h002B;  // RTE
+                imem['h85] = 16'h0009;  //   delay slot
+            end
+            else begin
+                imem['h80] = 16'h7B01;  // ADD #1,R11   ; TRAPA: SPC is already F+2
+                imem['h81] = 16'h002B;  // RTE
+                imem['h82] = 16'h0009;  //   delay slot
+            end
+            emit_count_handler;
+            for(off = 0; off < 25; off = off + 1) begin
+                dmem['hFF] = 32'd0;                  //pre-dec target (0x3FC) fresh per run
+                do_reset;
+                e0 = test_errors;
+                run_until_retire(marker, 60000);
+                repeat(off) @(posedge clk);
+                irq_pin[3:0] = 4'b0010;              //IRL level 13
+                w = 0;
+                while(int_ack_cnt == 0 && w < 60000) begin @(posedge clk); w = w + 1; end
+                @(posedge clk);
+                irq_pin[3:0] = 4'b1111;              //release after acceptance (p.123)
+                w = 0;                               //the synchronous event must also fire
+                while(!exc_seen && !trapa_seen && w < 60000) begin @(posedge clk); w = w + 1; end
+                run_until_retire('h30B, 60000);      //interrupt handler returned
+                run_until_retire(sent, 60000);       //main line completed
+                run_cycles(30);
+                chk($sformatf("%s ws=%0d off=%0d: interrupt ack'd exactly once", fname, ws, off), int_ack_cnt, 32'd1);
+                chk($sformatf("%s ws=%0d off=%0d: interrupt handler ran once", fname, ws, off), gpr(13), 32'd1);
+                chk($sformatf("%s ws=%0d off=%0d: exception handler ran once", fname, ws, off), gpr(11), 32'd1);
+                chk($sformatf("%s ws=%0d off=%0d: exactly two entries", fname, ws, off), entry_count, 32'd2);
+                chk($sformatf("%s ws=%0d off=%0d: INTEVT = IRL code", fname, ws, off), intevt_o, 32'h0000_0240);
+                chk($sformatf("%s ws=%0d off=%0d: INTEVT2 = IRL code", fname, ws, off), intevt2_reg, 32'h0000_0240);
+                chk($sformatf("%s ws=%0d off=%0d: EXPEVT", fname, ws, off), expevt_o, exp_ev);
+                chk($sformatf("%s ws=%0d off=%0d: mainline result transparent", fname, ws, off), gpr(2), 32'd3);
+                chk($sformatf("%s ws=%0d off=%0d: pre-dec store executed once", fname, ws, off), gpr(3), 32'h0000_03FC);
+                chk($sformatf("%s ws=%0d off=%0d: stored word load-back", fname, ws, off), gpr(4), 32'd3);
+                chk($sformatf("%s ws=%0d off=%0d: stored word in memory", fname, ws, off), dmem['hFF], 32'd3);
+                if(f == 1) chk($sformatf("%s ws=%0d off=%0d: TEA = misaligned EA", fname, ws, off), tea_o, 32'd1);
+                if(f == 2) begin
+                    chk_true($sformatf("%s ws=%0d off=%0d: TRAPA pulsed", fname, ws, off), trapa_seen);
+                    chk($sformatf("%s ws=%0d off=%0d: TRA = imm<<2", fname, ws, off), tra_o, 32'h0000_0108);
+                end
+                if(test_errors != e0)
+                    $display("      [dbg] EXPEVT=%08h INTEVT=%08h TEA=%08h entries=%0d ack=%0d R2=%0d R11=%0d R13=%0d cst=%0d est=%0d",
+                             expevt_o, intevt_o, tea_o, entry_count, int_ack_cnt,
+                             gpr(2), gpr(11), gpr(13), cache_st, bsc_est);
+            end
+        end
+        end
+        end_test;
+    end
+endtask
+
+//suite-wide verdicts on the passive checkers - exercised gates make a silent
+//(vacuous) pass fail loudly, the cpu_core_tb pattern.
+task automatic test_boundary_summary;
+    begin
+        begin_test("SoC boundary contracts: lock pairing + ack law exercised, zero violations");
+        $display("      locked pairs checked: %0d   acks checked: %0d", lock_pairs_checked, ack_checks);
+        chk_true("locked-pair law exercised (>100 pairs)", lock_pairs_checked > 100);
+        chk("locked-pair violations",       lock_pair_viol[31:0], 32'd0);
+        chk_true("interrupt-ack law exercised (>200 acks)", ack_checks > 200);
+        chk("ack-without-entry / INTEVT violations", ack_viol[31:0], 32'd0);
+        end_test;
+    end
+endtask
+
+
+///////////////////////////////////////////////////////////
 //////  Main Sequence
 ////
 
@@ -3473,6 +3901,12 @@ initial begin
     test_rtc_periodic;
     test_rtc_alarm;
     test_tmu_rtc_tick;
+
+    group("13. Interrupt x machinery collision (SoC twins of the core-level sweeps)");
+    test_int_sdram_sweep;
+    test_int_tas_sweep;
+    test_exc_int_collision_soc;
+    test_boundary_summary;
 
     $display("");
     $display("################################");
