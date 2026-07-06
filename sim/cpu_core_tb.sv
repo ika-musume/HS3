@@ -1294,10 +1294,10 @@ endtask
 //Self-modify visibility threshold (instructions ahead of the store): targets k < K were
 //already fetched when the store commits and execute STALE (real SH pipelines prefetch the
 //same way); targets k >= K are fetched at/after the commit edge and MUST run the new
-//opcode (unified array + the same-edge RDW bypass on the I side). Relocked 2026-07-05
-//with the FETCH PAIR: the prefetch window is now IF/ID + the pair slot + the in-flight
-//longword fetch, so k=1..3 execute stale (uniform over target parity, k-sweep measured).
-localparam integer SELFMOD_K = 4;
+//opcode (unified array + the same-edge RDW bypass on the I side). Relocked 2026-07-07
+//with the WRAP FILL-FORWARD (p.110 early restart): fetches complete at their fill's
+//first beat, so only IF/ID + the pair slot hold stale opcodes - k=1 alone (measured).
+localparam integer SELFMOD_K = 2;
 
 //GOLDEN E - self-modifying code distance sweep (I-side coherency law). MOV.W pokes a new
 //opcode k instructions ahead of the store, INSIDE the store's own line - resident by
@@ -1543,10 +1543,24 @@ task automatic test_cached_fill_fault_d;
             run_until_exc(20000);
             chk_true($sformatf("beat %0d: exception fired", b), exc_seen);
             chk($sformatf("beat %0d: cause", b), {29'd0, exc_cause_l}, {29'd0, EXC_DATA});
-            chk($sformatf("beat %0d: exc pc", b), exc_pc_l, 32'h0000_004E);
-            chk($sformatf("beat %0d: access addr", b), exc_aaddr_l, 32'h0000_0200);
-            chk($sformatf("beat %0d: canary R7", b), gpr(7), 32'h0000_0066);
-            chk_true($sformatf("beat %0d: younger killed", b), !retired_seen['h28]);
+            if(b == 0) begin
+                //the requested word itself faults: precise EXC_DATA on the load
+                chk($sformatf("beat %0d: exc pc", b), exc_pc_l, 32'h0000_004E);
+                chk($sformatf("beat %0d: access addr", b), exc_aaddr_l, 32'h0000_0200);
+                chk($sformatf("beat %0d: canary R7", b), gpr(7), 32'h0000_0066);
+                chk_true($sformatf("beat %0d: younger killed", b), !retired_seen['h28]);
+            end
+            else begin
+                //wrap fill-forward (p.110): the requested word arrived first, the
+                //load COMPLETED; the later beat's fault only killed the line. The
+                //exception migrates to the retry load of the faulting word itself.
+                chk($sformatf("beat %0d: exc pc = faulting word's load", b),
+                    exc_pc_l, 32'h0000_0130 + 32'(2*b));
+                chk($sformatf("beat %0d: access addr = faulting word", b),
+                    exc_aaddr_l, 32'h0000_0200 + 32'(4*b));
+                chk($sformatf("beat %0d: load completed (word 0)", b), gpr(7), 32'h0000_00A0);
+                chk_true($sformatf("beat %0d: younger retired", b), retired_seen['h28]);
+            end
             //Phase 2: NEW memory truth. A stale partial line would hit and expose it.
             d_fault_en = 1'b0;
             dmem['h80] = 32'h0000_00B0;
@@ -1607,17 +1621,32 @@ task automatic test_cached_fill_fault_i;
             run_until_exc(20000);
             chk_true($sformatf("beat %0d: exception fired", b), exc_seen);
             chk($sformatf("beat %0d: cause", b), {29'd0, exc_cause_l}, {29'd0, EXC_IFETCH});
-            chk($sformatf("beat %0d: exc pc = requested PC", b), exc_pc_l, 32'h0000_0060);
-            chk($sformatf("beat %0d: stale opcodes never ran", b), gpr(12), 32'd0);
-            //Phase 2: poke the NEW opcode; the refetch must refill from imem.
+            if(b == 0) begin
+                //the requested longword itself faults: precise EXC_IFETCH
+                chk($sformatf("beat %0d: exc pc = requested PC", b), exc_pc_l, 32'h0000_0060);
+                chk($sformatf("beat %0d: no target opcode ran", b), gpr(12), 32'd0);
+            end
+            else begin
+                //wrap fill-forward (p.110): each fetch completes at its own first
+                //beat; pre-fault opcodes legitimately ran. The exception migrates
+                //to the fetch whose OWN longword is the faulting one.
+                chk($sformatf("beat %0d: exc pc = faulting word's fetch", b),
+                    exc_pc_l, 32'h0000_0060 + 32'(4*b));
+                chk($sformatf("beat %0d: pre-fault opcodes ran", b), gpr(12), 32'h0000_0011);
+            end
+            //Phase 2: poke the NEW opcode; the refetch must refill from imem. The
+            //sentinel moves to 'h36 (pc 0x6C): pcs up to 0x6A may have retired in
+            //phase 1 (the scoreboard is sticky within a run).
             if_fault_en = 1'b0;
             imem['h30] = 16'hEC22;  // MOV #0x22,R12  ; the new opcode
             imem['h31] = 16'h0009;
             imem['h32] = 16'h0009;
             imem['h33] = 16'h0009;
             imem['h34] = 16'h0009;
-            imem['h35] = 16'h0009;  // sentinel
-            run_until_retire('h35, 20000);
+            imem['h35] = 16'h0009;
+            imem['h36] = 16'h0009;  // sentinel (fresh slot)
+            imem['h37] = 16'hAFFE;  // guard
+            run_until_retire('h36, 20000);
             chk($sformatf("beat %0d: refetch runs the new opcode", b), gpr(12), 32'h0000_0022);
         end
         end
@@ -1681,10 +1710,14 @@ task automatic test_cached_fill_fault_victim;
         d_fault_en   = 1'b1;
         d_fault_widx = 8'h82;         // Z fill beat 2
         run_until_exc(20000);
+        //Wrap fill-forward: Z's requested word arrived first, so the Z load
+        //COMPLETES; beat 2's fault kills the line (and the victim X - the core
+        //law). Execution falls through to the X rereads with the fault still
+        //armed: the exception fires on the retry load of the faulting word.
         chk_true("exception fired", exc_seen);
         chk("cause", {29'd0, exc_cause_l}, {29'd0, EXC_DATA});
-        chk("access addr", exc_aaddr_l, 32'h0000_4200);
-        chk_true("younger killed", !retired_seen['h43]);
+        chk("access addr = faulting word of X's reread", exc_aaddr_l, 32'h0000_0208);
+        chk_true("Z load's younger retired", retired_seen['h43]);
         d_fault_en = 1'b0;
         run_until_retire('h9C, 20000);
         //A stale-valid X returns {B0,B1,A2,A3} (corrupt); a clean refill returns all B.
@@ -1888,9 +1921,10 @@ task automatic test_pair_fetch_law;
         run_until_retire('h41, 20000);
         $display("      even-entry fetch accepts = %0d", lbus_ifetch_acc - n0);
         chk("even-entry ALU block result", gpr(2), 32'd32);
-        //Locked 2026-07-05 (whole run incl. bootstrap + guard spin): ~36 instructions
-        //retire on 30 accepted fetches - pre-pair this cost one accept per instruction.
-        chk("even-entry fetch accepts (law)", lbus_ifetch_acc - n0, 32'd30);
+        //Locked 2026-07-07 (whole run incl. bootstrap + guard spin): the wrap
+        //fill-forward retires the run on fewer accepts (fills release the pipe at
+        //beat 0, so fewer guard-spin refetches land inside the law window).
+        chk("even-entry fetch accepts (law)", lbus_ifetch_acc - n0, 32'd24);
         //Odd entry: JMP into byte 0x46 - the first fetch is unpaired.
         cacheable_bootstrap(8'h09);
         imem['h20] = 16'hE146;                              // MOV #0x46,R1

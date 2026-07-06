@@ -160,9 +160,8 @@ logic   [3:0]   cur_wstrb;
 logic           cur_lock;
 logic   [1:0]   cur_way;        //resolved hit/victim/addressed way
 logic           mm_assoc_wr;    //memory-mapped tag write is associative (keep tag/LRU)
-logic   [1:0]   fill_word;      //line fill: 4 longwords per 16-byte line (I and D alike)
+logic   [1:0]   fill_word;      //line fill: 4 longwords per line, WRAPPING from the missed word
 logic   [31:0]  fill_base;
-logic   [31:0]  fill_words [0:3];
 logic   [18:0]  victim_tag;     //evicted way's tag, for the write-back address
 
 //Write-back buffer (one cache line + its physical address). See Fig 5.5.
@@ -483,7 +482,7 @@ always_comb begin
                 tag_wdata       = 21'd0;                    //kill V (and U) of the victim way
                 tag_we[cur_way] = 1'b1;
             end
-            else if(fill_word == 2'd3) begin
+            else if(fill_last) begin
                 tag_wdata       = {1'b1, 1'b0, tag_of(cur_addr)};
                 tag_we[cur_way] = 1'b1;
             end
@@ -493,7 +492,7 @@ always_comb begin
                 tag_wdata       = 21'd0;
                 tag_we[cur_way] = 1'b1;
             end
-            else if(fill_word == 2'd3) begin
+            else if(fill_last) begin
                 tag_wdata       = {1'b1, cur_write, tag_of(cur_addr)};  //U=1 for write-allocate
                 tag_we[cur_way] = 1'b1;
             end
@@ -531,7 +530,7 @@ always_comb begin
         end
         else if((state == S_IFILL_WAIT || state == S_DFILL_WAIT) &&
                 I_BUS.rsp_valid && I_BUS.rsp_ready &&
-                !I_BUS.rsp_fault && fill_word == 2'd3) begin
+                !I_BUS.rsp_fault && fill_last) begin
             lru_wdata = lru_update(cur_way, lru_rdata);
             lru_we    = 1'b1;
         end
@@ -754,10 +753,11 @@ assign  cur_way_nx[1] = hit ? (!hit_w[0] && !hit_w[1])                : victim[1
 assign  cur_way_nx[0] = hit ? (!hit_w[0] && (hit_w[1] || !hit_w[2])) : victim[0];
 
 
-//Completed-I-fill response longword: the addressed word is either the just-arrived
-//final beat or one already held in fill_words (consumed at fill_word == 3 only).
-wire    [31:0]  ifill_word = (cur_addr[3:2] == fill_word) ? I_BUS.rsp_rdata
-                                                          : fill_words[cur_addr[3:2]];
+//Wrap-order fill (p.110): beats leave from the MISSED word and wrap round the
+//line, so the first beat is the requested word (forwarded to the CPU "in
+//parallel with being loaded to the cache") and the last is its mod-4 neighbor.
+wire            fill_first = (fill_word == cur_addr[3:2]);
+wire            fill_last  = (fill_word == (cur_addr[3:2] - 2'd1));
 
 
 ///////////////////////////////////////////////////////////
@@ -789,10 +789,6 @@ always_ff @(posedge i_CLK or negedge i_RST_n) begin
         mm_assoc_wr   <= 1'b0;
         fill_word     <= 2'd0;
         fill_base     <= 32'd0;
-        fill_words[0] <= 32'd0;
-        fill_words[1] <= 32'd0;
-        fill_words[2] <= 32'd0;
-        fill_words[3] <= 32'd0;
         victim_tag    <= 19'd0;
         wb_valid      <= 1'b0;
         wb_pa         <= 28'd0;
@@ -916,6 +912,13 @@ always_ff @(posedge i_CLK or negedge i_RST_n) begin
                                 state    <= S_STORE_WR;
                             end
                             //else: load / write-back store hit -> served, stay S_IDLE.
+                            //A hit resolve writes no state: an early-restarted hit
+                            //stream has no request-free edges, so the background
+                            //drain launches HERE (still yields to a live accept).
+                            else if(wb_valid && !acc_d_nx && !acc_i_nx) begin
+                                drain_for_vic <= 1'b0;
+                                state         <= S_DRAIN_REQ;
+                            end
                         end
                         else if(bram_write && !bram_wb_mode)
                             state <= S_DBYP_REQ;            //write-through store miss: no allocate
@@ -934,7 +937,14 @@ always_ff @(posedge i_CLK or negedge i_RST_n) begin
                 else if(acc_i_q) begin
                     //I resolve site (D not competing). bram_* == this fetch.
                     if(bram_cacheable_i) begin
-                        if(hit) ; //inst hit -> served live, stay S_IDLE
+                        if(hit) begin
+                            //inst hit -> served live; a hit resolve writes no state,
+                            //so the background drain may launch (see the D twin)
+                            if(wb_valid && !acc_d_nx && !acc_i_nx) begin
+                                drain_for_vic <= 1'b0;
+                                state         <= S_DRAIN_REQ;
+                            end
+                        end
                         else if(i_I_SQUASH) begin
                             //Wrong-path instruction miss: the pipeline is discarding this fetch,
                             //so do NOT allocate; ack with a dummy response and free at once.
@@ -1088,28 +1098,34 @@ always_ff @(posedge i_CLK or negedge i_RST_n) begin
                 end
             end
 
-            //Instruction fill: 4 longwords, same shape as the data fill. The
-            //addressed 16-bit opcode is picked from its longword at completion.
+            //Instruction fill: 4 longwords wrapping from the missed word. The FIRST
+            //beat IS the addressed longword: its opcode (and pair sibling) go to the
+            //pipe at that beat, in parallel with the array write (p.110) - the fill
+            //then completes in the background while the pipe runs on.
             S_IFILL_WAIT: begin
                 if(I_BUS.rsp_valid && I_BUS.rsp_ready) begin
                     mem_pending <= 1'b0;
                     if(I_BUS.rsp_fault) begin
-                        rsp_inst    <= 16'd0;
-                        rsp_pair_q  <= 1'b0;        //a faulted response never pairs
-                        rsp_fault_i <= 1'b1;
-                        rsp_valid_i <= 1'b1;
-                        state       <= S_IDLE;
+                        //First beat: the fetch itself faults. A LATER beat's fault only
+                        //kills the line validation (tag control block) - the pipe
+                        //already consumed correct memory data at the first beat.
+                        if(fill_first) begin
+                            rsp_inst    <= 16'd0;
+                            rsp_pair_q  <= 1'b0;    //a faulted response never pairs
+                            rsp_fault_i <= 1'b1;
+                            rsp_valid_i <= 1'b1;
+                        end
+                        state <= S_IDLE;
                     end
                     else begin
-                        fill_words[fill_word] <= I_BUS.rsp_rdata;
-                        if(fill_word == 2'd3) begin
-                            rsp_inst    <= pick_inst(ifill_word, cur_addr[1], BIG_ENDIAN);
-                            rsp_sib     <= pick_inst(ifill_word, !cur_addr[1], BIG_ENDIAN);
+                        if(fill_first) begin
+                            rsp_inst    <= pick_inst(I_BUS.rsp_rdata, cur_addr[1], BIG_ENDIAN);
+                            rsp_sib     <= pick_inst(I_BUS.rsp_rdata, !cur_addr[1], BIG_ENDIAN);
                             rsp_pair_q  <= !cur_addr[1];
                             rsp_fault_i <= 1'b0;
                             rsp_valid_i <= 1'b1;
-                            state       <= S_IDLE;
                         end
+                        if(fill_last) state <= S_IDLE;
                         else begin
                             fill_word <= fill_word + 2'd1;
                             state     <= S_IFILL_REQ;
@@ -1125,32 +1141,34 @@ always_ff @(posedge i_CLK or negedge i_RST_n) begin
                 end
             end
 
+            //Data fill: 4 longwords wrapping from the missed word. A read miss (and
+            //a PREF allocate) answers the pipe at the FIRST beat - the requested word
+            //arrives first and transfers "in parallel with being loaded" (p.110);
+            //remaining beats fill in the background. A write-allocate store is
+            //notify-only (S_ALLOC_WR merges after the fill, no pipe ack needed).
             S_DFILL_WAIT: begin
                 if(I_BUS.rsp_valid && I_BUS.rsp_ready) begin
                     mem_pending <= 1'b0;
                     if(I_BUS.rsp_fault) begin
-                        //A prefetch silently abandons a faulting fill (no exception).
-                        //The victim way is invalidated at this edge (tag control block).
-                        rsp_rdata   <= 32'd0;
-                        rsp_fault_d <= cur_pref ? 1'b0 : 1'b1;
-                        rsp_valid_d <= 1'b1;
-                        state       <= S_IDLE;
+                        //First beat: the load itself faults (a prefetch abandons
+                        //silently). A LATER beat's fault only kills the line
+                        //validation - the pipe already got correct memory data.
+                        //The victim way is invalidated either way (tag block).
+                        if(fill_first) begin
+                            rsp_rdata   <= 32'd0;
+                            rsp_fault_d <= cur_pref ? 1'b0 : 1'b1;
+                            rsp_valid_d <= 1'b1;
+                        end
+                        state <= S_IDLE;
                     end
                     else begin
-                        fill_words[fill_word] <= I_BUS.rsp_rdata;
-                        if(fill_word == 2'd3) begin
-                            if(cur_write)
-                                state <= S_ALLOC_WR;       //write-allocate: merge store next
-                            else begin
-                                //Read miss returns the requested word; a prefetch
-                                //allocate just acknowledges (data ignored).
-                                rsp_rdata   <= (cur_addr[3:2] == fill_word) ?
-                                               I_BUS.rsp_rdata : fill_words[cur_addr[3:2]];
-                                rsp_fault_d <= 1'b0;
-                                rsp_valid_d <= 1'b1;
-                                state       <= S_IDLE;
-                            end
+                        if(fill_first && !cur_write) begin
+                            rsp_rdata   <= I_BUS.rsp_rdata;     //the missed word itself
+                            rsp_fault_d <= 1'b0;
+                            rsp_valid_d <= 1'b1;
                         end
+                        if(fill_last)
+                            state <= cur_write ? S_ALLOC_WR : S_IDLE;
                         else begin
                             fill_word <= fill_word + 2'd1;
                             state     <= S_DFILL_REQ;
@@ -1280,7 +1298,7 @@ always_ff @(posedge i_CLK or negedge i_RST_n) begin
         if(state == S_IDLE) begin
             victim_tag  <= victim_tag_w;                    //one-hot AND-OR, no index chain
             fill_base   <= {bram_addr[31:4], 4'b0000};
-            fill_word   <= 2'd0;
+            fill_word   <= bram_addr[3:2];                  //fills WRAP from the missed word (p.110)
             mem_pending <= 1'b0;
             after_wb    <= bram_is_data ? AW_DFILL : AW_IFILL;  //D flag alone selects the site
         end

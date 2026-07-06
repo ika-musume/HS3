@@ -82,7 +82,8 @@ module ioport (
     output  wire    [7:0]   o_SCPT_PU,
 
     /* PFC FANOUT */
-    output  wire            o_PH7_FN        //PTH7 mode 00: pad belongs to TCLK (TMU, p.392)
+    output  wire            o_PH7_FN,       //PTH7 mode 00: pad belongs to TCLK (TMU, p.392)
+    output  wire    [7:0]   o_PC_FN         //PTC mode 00: pad belongs to MCS (BSC, p.323)
 );
 
 ///////////////////////////////////////////////////////////
@@ -226,6 +227,9 @@ assign  o_SCPT_O  = pdr[11];    assign  o_SCPT_OE = pin_oe[11]; assign  o_SCPT_P
 
 //PTH7 mode 00 hands the pad to the TMU's TCLK (table 18.1; merge at the top)
 assign  o_PH7_FN  = (pcr[7][15:14] == 2'b00);
+
+//PTC mode 00 hands each pad to its MCS output (table 18.1; merge at the top)
+assign  o_PC_FN   = ~md1[2] & ~md0[2];
 
 endmodule
 

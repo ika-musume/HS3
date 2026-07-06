@@ -135,10 +135,14 @@ assign  o_PCEN = i_CEN & pcen;
     rate and FRQCR only re-paces I-phi/P-phi around it (table 9.4); with no
     FPGA PLLs the /2 is wired. The SH7709S FRQCR has NO CKOEN bit (bit 8 is
     reserved-1, p.212), so CKIO always drives in the output modes 0-2
-    (p.207). The pin is the phase register itself: it RISES mid bus-cycle,
-    180 degrees from the BCEN-enabled command edges, giving a synchronous
-    device (SDRAM) half a bus cycle of setup and of hold. Raw-pin POR domain:
-    the SDRAM engine phase must survive manual resets (p.297).
+    (p.207). DATASHEET PHASE: the pin RISES at the BCEN-enabled command
+    edges - every bus pin changes at the CKIO rise and the mid-state shapes
+    (RD/WEn, WAIT sampling) sit at the fall, as figs 10.14/23.16 draw them.
+    Board note: a synchronous device clocked straight off this pin samples
+    at the same edge the pins change; the board must phase-shift/delay the
+    device clock (output-delay constraint or a small trace/clock-tree skew,
+    ~1/4 cycle) exactly as with the real chip's tOD window. Raw-pin POR
+    domain: the SDRAM engine phase must survive manual resets (p.297).
 */
 
 logic           ckio_ph;
@@ -150,7 +154,7 @@ always_ff @(posedge i_CLK or negedge i_POR_n) begin
 end
 
 assign  o_BCEN = i_CEN & ckio_ph;
-assign  o_CKIO = ckio_ph;
+assign  o_CKIO = ~ckio_ph;      //rises at the command edges (datasheet phase)
 
 
 
