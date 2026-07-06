@@ -67,8 +67,10 @@ module int_pipe #(
     //not retired (defer acceptance, 4.5.3), and the restart PC = the OLDEST instruction
     //the redirect will discard (mawb..fetch_pc priority; retire+2 on a plain stream,
     //the branch-target stream head after a taken branch).
-    output  logic           o_RETIRE_INT_DEFER,
-    output  logic           o_MA_INFLIGHT,      //accepted D access / RMW-MAC mid-sequence: defer acceptance
+    output  wire            o_INT_BOUNDARY,     //this edge is a LEGAL interrupt-acceptance
+                                                //boundary: an instruction just retired, no
+                                                //delayed pair is open, no accepted D access /
+                                                //RMW-MAC sequence is in flight (4.5.3)
     output  logic   [31:0]  o_INT_NEXT_PC,
     output  logic           o_RETIRE_GPR_WE,
     output  logic   [4:0]   o_RETIRE_GPR,
@@ -377,8 +379,12 @@ end
 
 //The registered bank mirror must equal the live SR-derived select on every live packet
 //(staleness may exist only inside redirect shadows, where IF/ID holds no instruction).
+//Exception: during an RTE restore the mirror legally LEADS the committed SR by the two
+//snoop cycles (rte_wr_wb lookahead + the o_RTE_VALID commit cycle) - the held target's
+//read must already use the restored bank while SR still shows the handler's.
 always_comb begin
-    if(ifid.valid && r_bank1 !== gpr_active_bank1)
+    if(ifid.valid && r_bank1 !== gpr_active_bank1 &&
+       !o_RTE_VALID && !(wb_valid && mawb.event_rte))
         $fatal(1, "r_bank1 stale under live packet: r=%b sr=%b", r_bank1, gpr_active_bank1);
 end
 // synthesis translate_on
@@ -1145,6 +1151,8 @@ logic           sr_write_pending;  //an older LDC ...,SR may change the active b
 logic           rte_pending;       //an older RTE restores SR and PC
 logic           ctrl_misc_write_pending;//older GBR/VBR/SSR/SPC/PR write still uncommitted
 
+logic  retire_int_defer;   //retiree was a delayed branch: slot still owed (pair atomicity)
+
 assign data_response = data_req_sent && d_rsp_valid;
 assign wb_valid      = mawb.valid;
 assign wb_fault_pending = wb_valid && mawb.fault;
@@ -1153,7 +1161,10 @@ assign wb_fault_pending = wb_valid && mawb.fault;
 //every later fetch - and killing between the legs of a locked RMW / MAC pair splits an
 //indivisible sequence (dangling bus lock). Acceptance waits until the op leaves MA; a
 //not-yet-granted request stays killable (L-bus withdrawal is legal). Registered terms.
-assign o_MA_INFLIGHT = data_req_sent || (exma.valid && !exma.fault && ma_second_access);
+wire   ma_inflight   = data_req_sent || (exma.valid && !exma.fault && ma_second_access);
+//The pipe OWNS the whole acceptance-boundary invariant and exports ONE bit; the
+//exception handler no longer reassembles it from three raw pipeline signals.
+assign o_INT_BOUNDARY = o_RETIRE_VALID && !retire_int_defer && !ma_inflight;
 //!i_REDIRECT_VALID: the packet in WB at an interrupt-redirect edge is KILLED (its
 //retirement and every other commit lane are suppressed) - without this gate its GPR
 //write leaked and the resumed instruction ran twice (interrupt-sweep golden).
@@ -2018,6 +2029,8 @@ always_comb begin
     ex_result.gpr1_data     = idex.mem_op == MEM_MAC ? address_update_second : address_update;
     ex_result.mem_op        = idex.mem_op;
     ex_result.dbr           = idex.branch_delayed;  //interrupt-defer marker (pair atomicity)
+    ex_result.nd_taken      = idex.branch_op != BR_NONE && !idex.branch_delayed &&
+                              branch_taken;         //commit successor = redirect target
     ex_result.mem_size      = idex.mem_size;
     ex_result.load_signed   = idex.load_signed;
     ex_result.byte_op       = idex.byte_op;
@@ -2282,8 +2295,24 @@ wire    agu_ce    = agu_hold_sel || idex_allow;       //agu_base_q capture (hold
 //must address the read captured at its own commit edge, one cycle before i_SR shows them.
 wire            sr_wr_wb  = wb_valid && !i_REDIRECT_VALID && !mawb.fault &&
                             mawb.ctrl_dst == CTRL_SR;
-wire            bank1_nx  = sr_wr_wb ? (mawb.ctrl_data[30] && mawb.ctrl_data[29])
-                                     : gpr_active_bank1;
+//An RTE restores SR from SSR with NO external redirect (its PC redirect is
+//internal, and the serialized target WAITS live in IF/ID), so the mirror must
+//snoop the restore like the LDC arm - found by the RB-flip SR-race sweep and the
+//random-interrupt oracle (an RTE back into the OTHER bank read the target's
+//operands from the handler bank). TWO phases are needed: the WB-cycle arm
+//(rte_wr_wb) gives the one-cycle LOOKAHEAD the read-address capture needs - the
+//serialized target can issue on the cycle right after the pulse, and its GPR
+//BRAM read is addressed AT the pulse edge; the pulse arm (o_RTE_VALID) then
+//holds the value through the cycle where ctrl_reg commits SR<=SSR. A general
+//exception cannot share the pulse (one commit point), and the RTE's own dbr
+//defer blocks an interrupt redirect there, so both arms always mean "the
+//restore commits". SSR is stable across both cycles (nothing else commits).
+wire            rte_wr_wb = wb_valid && !i_REDIRECT_VALID && !mawb.fault &&
+                            mawb.event_rte;
+wire            bank1_nx  = (rte_wr_wb || o_RTE_VALID)
+                                        ? (i_SSR[30] && i_SSR[29]) :
+                            sr_wr_wb    ? (mawb.ctrl_data[30] && mawb.ctrl_data[29]) :
+                                          gpr_active_bank1;
 
 //r_bank1 declared at the GPR section; SR resets to MD=1/RB=1 (ctrl_reg 32'h7000_00F0).
 always_ff @(posedge i_CLK or negedge i_RST_n) begin
@@ -2363,18 +2392,49 @@ assign  o_D_PREF = early_bus_d_req.pref;
 //cache may abort its line fill instead of allocating wrong-path instructions.
 assign  o_I_SQUASH = fetch_drop;
 
-//Interrupt restart PC: the oldest packet the external redirect will DISCARD (the
-//retiree already committed). Plain stream -> mawb = retire+2; post-taken-branch ->
-//every live stage holds the TARGET stream, so the mux lands on its head. The old
-//retire_pc+2 rule lost taken branches when the accept hit a branch/slot retire.
-//!fetch_drop: a DROPPED wrong-path fetch (unwithdrawable at a branch redirect) still
-//holds its stale fall-through PC - the live resume point is fetch_pc (miss sweep).
-assign  o_INT_NEXT_PC = mawb.valid    ? mawb.pc :
-                        exma.valid    ? exma.pc :
-                        idex.valid    ? idex.pc :
-                        ifid.valid    ? ifid.pc :
-                        pair_ready    ? pair_pc :
-                        (fetch_pending && !fetch_drop) ? fetch_pending_pc : fetch_pc;
+///////////////////////////////////////////////////////////
+//////  Interrupt Restart PC (commit-time architectural register)
+////
+
+//o_INT_NEXT_PC = the PC of the next instruction to execute after the last COMMIT,
+//maintained AT the commit point instead of scanning the pipe for its oldest live
+//PC. The old scan needed one patched arm per frontier state (taken-branch loss,
+//dropped-fetch, held pair - two of those shipped as bugs); the register makes the
+//whole class unreachable. Update per retiring packet X:
+//  X.nd_taken                  -> the EX redirect target (taken non-delayed BT/BF)
+//  X.delay_slot && pair_taken  -> the EX redirect target (slot of a TAKEN pair)
+//  otherwise                   -> X.pc + 2
+//rdir_target_q holds the ONE outstanding EX redirect target: in-order EX with the
+//1-deep fetch cannot resolve a second taken branch before the first's consumer
+//commits (the target's first instruction reaches EX no earlier than that edge; a
+//same-edge re-arm is read-old/write-new safe). pair_taken_q marks a taken DELAYED
+//pair in flight; kills clear it (the pair re-executes and re-arms). Acceptance is
+//legal only on a retire pulse, so the register is always fresh at a boundary, and
+//interrupts never split a pair, so a mid-pair value is never consumed.
+logic   [31:0]  arch_next_pc;   //next PC to execute, as of the last commit
+logic   [31:0]  rdir_target_q;  //last EX branch-redirect target (single outstanding)
+logic           pair_taken_q;   //taken delayed pair in flight (slot commit consumes)
+
+wire            commit_fire = wb_valid && !i_REDIRECT_VALID && !mawb.fault;
+always_ff @(posedge i_CLK or negedge i_RST_n) begin
+    if(!i_RST_n) begin
+        arch_next_pc  <= RESET_PC;
+        rdir_target_q <= RESET_PC;
+        pair_taken_q  <= 1'b0;
+    end
+    else begin if(cen) begin
+        if(branch_redirect) rdir_target_q <= branch_target;
+        if(i_REDIRECT_VALID || wb_fault_kill)            pair_taken_q <= 1'b0; //pair re-executes
+        else if(branch_redirect && idex.branch_delayed)  pair_taken_q <= 1'b1; //arm beats consume
+        else if(commit_fire && mawb.delay_slot)          pair_taken_q <= 1'b0;
+        if(commit_fire) begin
+            arch_next_pc <= (mawb.nd_taken || (mawb.delay_slot && pair_taken_q))
+                            ? rdir_target_q : mawb.pc + 32'd2;
+        end
+    end end
+end
+
+assign  o_INT_NEXT_PC = arch_next_pc;
 
 //The former o_D_REQ_RAW sideband is now L_BUS.req_fetch (= !l_is_data), driven above; the
 //former o_I_REQ_RAW cold-accept sideband died with the cache's reqn machinery (the single
@@ -2388,6 +2448,7 @@ always_comb begin
     ma_result.inst          = exma.inst;
     ma_result.delay_slot    = exma.delay_slot;
     ma_result.dbr           = exma.dbr;
+    ma_result.nd_taken      = exma.nd_taken;
     ma_result.gpr0_we       = exma.gpr0_we;
     ma_result.gpr0_dst      = exma.gpr0_dst;
     ma_result.gpr0_data     = exma.mem_op == MEM_LOAD ? load_value : exma.gpr0_data;
@@ -2680,9 +2741,10 @@ always_ff @(posedge i_CLK or negedge i_RST_n) begin
         o_SLEEP_VALID        <= 1'b0;
         o_LDTLB_VALID        <= 1'b0;
         o_RETIRE_VALID       <= 1'b0;
+        retire_int_defer     <= 1'b0;
         o_RETIRE_PC          <= 32'd0;
         o_RETIRE_INST        <= 16'd0;
-        o_RETIRE_INT_DEFER   <= 1'b0;
+
         o_RETIRE_GPR_WE      <= 1'b0;
         o_RETIRE_GPR         <= 5'd0;
         o_RETIRE_GPR_DATA    <= 32'd0;
@@ -2696,7 +2758,7 @@ always_ff @(posedge i_CLK or negedge i_RST_n) begin
         o_SLEEP_VALID       <= 1'b0;
         o_LDTLB_VALID       <= 1'b0;
         o_RETIRE_VALID      <= 1'b0;
-        o_RETIRE_INT_DEFER  <= 1'b0;
+        retire_int_defer    <= 1'b0;
         o_RETIRE_GPR_WE     <= 1'b0;
 
         //External reset/exception control has priority over all internal advancement.
@@ -2774,7 +2836,7 @@ always_ff @(posedge i_CLK or negedge i_RST_n) begin
                     o_RETIRE_VALID <= 1'b1;
                     o_RETIRE_PC    <= mawb.pc;
                     o_RETIRE_INST  <= mawb.inst;
-                    o_RETIRE_INT_DEFER <= mawb.dbr;  //slot still owed: defer acceptance
+                    retire_int_defer <= mawb.dbr;    //slot still owed: defer acceptance
                 end
             end
 
@@ -3127,15 +3189,25 @@ always_comb begin
         d_req.lock  = i_ex_req.lock;
         d_req.pref  = i_ex_req.pref;
     end
-    d_req.valid = i_ex_req.valid | ma_req_valid;
+    d_req.valid = (i_ex_req.valid && !second_access) | ma_req_valid;  //phase gate (see ex_val)
 end
+
+//EX-valid phase gate: on the phase-two COMPLETION-response cycle exma_allow opens
+//combinationally, so the next instruction's EX request raises valid while the
+//field mux (registered second_access) still presents the stale phase-two write -
+//a one-cycle PHANTOM the bus could accept as a spurious extra locked write.
+//Found by the random-interrupt oracle's D-request stability checker. Gating with
+//the registered phase bit costs nothing legitimate: any acceptance on that cycle
+//would carry wrong fields by construction; the request presents cleanly one
+//cycle later when second_access has cleared.
+wire    ex_val = i_ex_valid && !second_access;
 
 //Next-state tail: original priority "flush > advance(reload) > {fire sets, capture
 //clears}", with capture written LAST in the old block so it beats a same-edge fire.
 always_comb begin
     data_resp   = req_sent && i_rsp_valid;
-    ex_accept   = i_ex_valid && i_req_ready;
-    fire        = (i_ex_valid | ma_req_valid) && i_req_ready;
+    ex_accept   = ex_val && i_req_ready;
+    fire        = (ex_val | ma_req_valid) && i_req_ready;
     cap         = data_resp && !second_access && !i_rsp_fault &&
                   (i_ma_op == MEM_MAC || i_ma_op == MEM_RMW);
     req_sent_nx = i_flush ? 1'b0 :

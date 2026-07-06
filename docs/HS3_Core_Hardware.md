@@ -7,10 +7,11 @@ in this folder. Manual page citations (`p.NNN`) point at the SH7709S hardware
 manual or the SH-3 software manual unless noted.
 
 **Target:** Intel Cyclone V FPGA, 100 MHz deliverable. **Verification:** Verilator
-(`cpu_core_tb` = 64/64, `HS3_tb` = 53/53). **Physical status:** Quartus out-of-context
-(OOC) restricted Fmax ≈ **80–83 MHz** today; the gap to 100 MHz is three protected
-single-cycle datapath loops (see §0 and §5), not the cache, bus, or peripherals —
-every OOC critical path is CPU-internal.
+(`cpu_core_tb` = 103/103, `HS3_tb` = 57/57 — see §7). **Physical status:** Quartus
+out-of-context (OOC) restricted Fmax **≈ 76–79 MHz across seeds** on the full SoC
+(§6); the gap to 100 MHz is a flat plateau of protected single-cycle datapath loops
+(see §0 and §6), not the cache, bus, or peripherals — every OOC critical path is
+CPU-internal, and none passes through the interrupt/exception machinery.
 
 ---
 
@@ -46,7 +47,7 @@ mutually-exclusive enables on alternating edges, so a `cen_n` register was a
 *half-cycle* register (zero added latency) that gave the EX address path a clean
 5 ns window. It reached its 5 ns goals (AGU, cache address capture) but converged on
 the **same** architectural operand cone as the single-clock design (~78 MHz master →
-~78 MHz arch). The single-clock **model-b** cache (§2) was then adopted as the
+~78 MHz arch). The single-clock **model-b** cache (§3) was then adopted as the
 shipping structure. Read `cen_p`/`cen_n` in comments as design history, not two live
 clocks — the RTL ports are `i_CLK` + `i_CEN` only.
 
@@ -57,8 +58,10 @@ baseline.** No inserted pipeline bubbles, no extra handshake/acknowledge beats. 
 Cyclone V the goal is to *minimize* setup slack, not necessarily to reach perfect
 closure — residual negative slack is accepted when the only alternative would cost a
 cycle. Any new register must land on an *already-enabled* edge its consumers already
-wait for. This is why the three residual timing walls (§5) are left open rather than
-pipelined away.
+wait for. This is why the residual timing walls (§6) are left open rather than
+pipelined away. Correctness terms discovered by the interrupt-collision suites
+(§2, §7) are folded into existing cones under the same rule — as registered
+qualifiers at final gate levels, never as new beats.
 
 ---
 
@@ -76,15 +79,41 @@ Classic SH 5-stage in-order pipeline (SH-1/SH-2 baseline, extended per SH-3):
 
 | File | Lines | Role |
 |---|---|---|
-| `int_pipe.sv` | 3073 | the integer pipeline (IF/ID/EX/MA/WB, hazard/forward, GPR, MAC) |
-| `int_pipe_pkg.sv` | 916 | inter-stage packet typedefs (`ifid`/`idex`/`exma`/`mawb`), decode |
+| `int_pipe.sv` | 3388 | the integer pipeline (IF/ID/EX/MA/WB, hazard/forward, GPR, MAC, MA sequencer) |
+| `int_pipe_pkg.sv` | 848 | inter-stage packet typedefs (`ifid`/`idex`/`exma`/`mawb`), decode |
 | `agu.sv` | 68 | the single time-shared address adder |
-| `int_pipe_mem.sv`, `ctrl_reg.sv` | | memory-op sequencer, control registers (SR/GBR/VBR/…) |
-| `exc_handler.sv` | 325 | exception/interrupt entry + the P4 exception MMIO registers |
+| `int_pipe_mem.sv`, `ctrl_reg.sv` | 102 / 111 | GPR M10K banks, control registers (SR/GBR/VBR/SSR/SPC) |
+| `exc_handler.sv` | 345 | exception/interrupt entry + the P4 exception MMIO registers |
 
 The stage registers are the packet structs; a **single global stall** (from the
-cache, §2) freezes every stage register at once — there is no per-stage skid buffer,
+cache, §3) freezes every stage register at once — there is no per-stage skid buffer,
 FIFO, or outstanding-transaction tracking. Back-pressure *is* the freeze.
+
+### Instruction fetch — 32-bit pair fetch, like the real chip
+
+The IF stage fetches **one longword per bus access and executes both halfwords**
+from it, matching the SH7709S's 32-bit instruction fetch (two 16-bit opcodes per
+access, p.454). Mechanically:
+
+- A fetch response for an **even** address carries the addressed opcode plus its
+  odd **sibling** (`rsp_pair` / `rsp_inst_sib` on the L bus). The sibling parks in
+  a one-entry **pair slot** in the pipe and feeds IF/ID on the next issue with *no
+  bus request* — steady-state code makes one cache/bus access per two instructions,
+  which is what frees data-side port slots (§3) and lifts memory-heavy IPC.
+- The pair slot is kill-exact: a taken branch, external redirect, or WB fault kills
+  the held sibling by the same terms that kill IF/ID (`pair_serve`/`pair_capture`
+  fold every kill gate); a paired response never pairs across a fault.
+- On the **non-cacheable** path the same longword economy holds: the bypass keeps a
+  halfword-reuse buffer (`ibyp_buf_*` in `cache.sv`) that serves the sibling of a
+  non-cacheable longword read without a second external transaction. The buffer
+  mirrors memory — loaded only from fault-free reads, blanket-invalidated on any
+  external write.
+- A wrong-path outstanding fetch is marked by a sticky **drop flag** (`fetch_drop`)
+  written at every kill/accept edge and consumed when the stale response arrives
+  (consume-and-discard, so the single fetch slot can never wedge). The flag's
+  update is an absorbing set/clear chain — once wrong-path, always wrong-path until
+  consumed — which is what makes it safe under back-to-back kills (a branch kill
+  followed by an interrupt entry while the same fetch is still outstanding).
 
 ### Address generation — one adder, no mux
 
@@ -114,10 +143,22 @@ redirect mux is gone. PC-relative targets are precomputed in ID
   registered LVT select is one 2:1 mux after the RAM read. Same-edge write/read
   hazards are closed by one-cycle WB shadow lanes (`wb0z`/`wb1z`) in the operand
   early legs.
-- **Forwarding:** EX-result and MA-result forward into the ID/EX operand latches.
-  The forward-source select is pre-decoded and (where it survives timing) registered
-  at the IF/ID edge from the "next-ifid" cone, so it is a live recompute equivalent
-  without a late combinational path.
+- **Forwarding:** EX-result and MA-result forward into the ID/EX operand latches
+  through per-port *registered lanes* patched at the head of EX (EX-head
+  forwarding): every forward mux-select is a single FF and every data leg launches
+  from a register. The select is pre-decoded at the IF/ID edge from the "next-ifid"
+  cone.
+- **Bank select:** the active GPR bank (`SR.MD & SR.RB`) is mirrored in a local
+  registered copy (`r_bank1`) so the read-address cone launches from a flop, never
+  from the cross-module live SR. The mirror snoops every event that can change the
+  bank coherently with the read-address capture it must serve: a retiring
+  `LDC ...,SR` (one-cycle lookahead off the WB packet), and an **RTE restore** with
+  a two-phase arm — the RTE-in-WB cycle (lookahead, because the serialized RTE
+  target's BRAM read is addressed one cycle before the restore commits) held
+  through the commit-pulse cycle, both taking the bank from SSR. External redirects
+  need no arm: they flush IF/ID and the mirror reconverges off live SR inside the
+  shadow. A simulation assertion pins the mirror to the live SR under every live
+  packet, with the RTE restore's legal two-cycle lead carved out.
 
 ### Control-flow timing (this is cycle-law, cite it)
 
@@ -136,27 +177,106 @@ control-register interlock — no new PR forward path.
 
 A cache **load hit costs zero stall cycles**; only a 1-slot load-use interlock
 remains, and even that is avoided for `MOV.L` (longword loads need no aligner, so
-they are zero-bubble). Byte/halfword loads carry the aligner/sign-extend in the
-`cen_n→cen_p` window; its residual slack is accepted rather than paid for with a
-bubble (the no-bubbles rule).
+they are zero-bubble). Byte/halfword loads carry the aligner/sign-extend cone; its
+residual slack is accepted rather than paid for with a bubble (the no-bubbles rule).
 
-### Measured IPC (verified against the current `main` tree)
+### The MA sequencer — two-phase memory ops
+
+Multi-access instructions (`MAC.W/L` second read, byte read-modify-write
+`AND.B/OR.B/XOR.B/TST.B/TAS.B` write phase) are owned by a small MA-side sequencer
+(`ma_seq`, bottom of `int_pipe.sv`). The EX primary access and the sequencer's
+second access share one D request descriptor whose data fields select on the
+*registered* phase bit (`second_access`) so the deep request-valid cone stays off
+the address and store-data paths. The EX-side request valid is gated with the same
+phase bit: the two phases can therefore never overlap on the bus — on the phase-two
+completion cycle (when the pipeline's advance opens combinationally with the
+response) the next instruction's request presents one cycle later, when the phase
+bit has cleared. Any acceptance in the overlap cycle would have carried stale
+phase-two fields, so the gate costs nothing legitimate. Locked pairs (`TAS.B` and
+the GBR byte-RMW forms except `TST.B`) assert `req_lock` on both legs; the BSC
+holds bus ownership across the pair (§4).
+
+### Measured IPC (locked laws, verified on every run)
 
 | Workload | Retires / cycles | IPC | Meaning |
 |---|---|---|---|
-| Straight-line NOPs, **non-cacheable** (P2 bypass) | 201 / 706 | **0.284** | front-end fetch ceiling with the halfword-reuse buffer |
+| Straight-line NOPs, **non-cacheable** (P2 bypass) | 203 / 506 | **0.401** | front-end ceiling with pair fetch over the external bus |
 | Dependent add loop, **cacheable hit** | 1137 / 1167 | **0.974** | ≈ 1.0; the 2.6 % gap is the 2 taken-branch bubbles per iteration |
-| 100 %-store loop, **cacheable hit** | 414 / 848 | **0.488** | the 0.5 unified-single-port ceiling (each store = 1 fetch + 1 data-port cycle) |
+| 100 %-store loop, **cacheable hit** | 415 / 748 | **0.554** | the unified-single-port ceiling, softened by pair fetch (a fetched longword covers two stores' issue slots) |
 
-The bypass path was lifted 0.199 → 0.285 by a **halfword-reuse buffer** (`ibyp_buf_*`
-in `cache.sv`): a non-cacheable longword read serves its sibling halfword from a
-registered buffer instead of a second bus transaction (2 cycles, no bus run). The
-buffer mirrors memory — loaded only from fault-free reads, blanket-invalidated on any
-external write.
+The core bench measures these ratios on every run; `HS3_tb` **asserts** them as
+cycle-exact parity laws (the SoC fabric must add zero beats), so any structural
+change that moves a cycle count fails the suite.
 
 ---
 
-## 2. Cache
+## 2. Interrupts and exceptions — precise acceptance
+
+`exc_handler.sv` owns event selection and the exception register file
+(TRA/EXPEVT/INTEVT/TEA as P4 MMIO through the cache's register-access fold, §3);
+`ctrl_reg.sv` applies the SR/SSR/SPC updates through one arbiter (reset >
+reset-like > entry > RTE restore > pipeline write-back). This is a bare-metal
+SH7709S handler: memory faults map to CPU address errors; MMU/TLB vectors are
+intentionally absent.
+
+### Event priority and the same-edge yield
+
+One architectural event enters per cycle: **general exception / TRAPA → RTE →
+NMI → maskable interrupt**. The interrupt/NMI *acks* yield to a same-edge
+synchronous event — the loser stays latched in the INTC and enters after the
+handler, so a request is never consumed without its entry (`o_INT_ACK` implies an
+entry, checked suite-wide). A general exception raised while `SR.BL=1` is a
+**reset-like** event: manual-reset recovery with `EXPEVT=0x020` (§4.6,
+p.100–101). NMI honors `BL` unless `ICR1.BLMSK` overrides it.
+
+### The acceptance boundary — one exported invariant
+
+The pipeline owns the whole "is this edge a legal acceptance point" invariant and
+exports it as a single bit, `o_INT_BOUNDARY`:
+
+- an instruction retired this edge (interrupts complete the current instruction);
+- no **delayed-branch pair** is open — a retired branch whose slot is still owed
+  defers acceptance (§4.5.3, p.98–100), so an interrupt can never split the pair;
+- no **accepted data access or locked-RMW/MAC sequence** is in flight in MA —
+  killing an accepted access would orphan its bus response (wedging the shared
+  response channel) and killing between the legs of a locked pair would split an
+  indivisible sequence. A *not-yet-granted* request stays killable: L-bus request
+  withdrawal is legal, and stores commit at accept (notify semantics) so a killed
+  re-executed store is idempotent.
+
+### The restart PC — a commit-time register
+
+The interrupt SPC (the PC the handler returns to) is an **architectural register
+maintained at the commit point**, `arch_next_pc`, not a scan of the pipeline. At
+each retirement it takes the retiring instruction's successor: the EX redirect
+target for a taken non-delayed branch (`nd_taken` packet bit), the redirect target
+at the *slot's* commit for a taken delayed pair (`pair_taken_q` + the
+single-outstanding `rdir_target_q`, which in-order EX cannot re-arm before its
+consumer commits), and `pc+2` otherwise. RTE flows through the same path (its
+"target" is SPC). Acceptance is only legal on a retire edge, so the register is
+always fresh at any boundary, and because interrupts never split a pair, a
+mid-pair value is never consumed. `SPC` therefore never points at a delay slot,
+never loses a taken branch, and is independent of the fetch frontier's state —
+by construction rather than by per-case mux arms.
+
+Synchronous events keep their own SPC rules: TRAPA saves `pc+2` (it retires),
+delay-slot faults save the *branch* (`pc−2`, slot flag set, `EXPEVT=0x1A0` for
+slot-illegal), and other faults save the faulting PC.
+
+### Running-state mirrors
+
+EX-stage consumers read SR bits from local running registers (`r_t`, `r_s`,
+`r_m`, `r_q`) deposited as each producer leaves EX/MA and resynchronized to the
+committed SR on redirects and on pipeline drain; the GPR bank mirror (`r_bank1`,
+§1) follows the same doctrine with explicit LDC-commit and two-phase RTE-restore
+snoop arms. The rule these mirrors implement: **every SR-derived select launches
+from a register that is coherent with the committed SR at the edge its consumer
+captures** — including across an RTE that returns to a different register bank or
+mask level, which the SR-race and random-interrupt suites sweep exhaustively (§7).
+
+---
+
+## 3. Cache
 
 ### Geometry (SH7709S p.103–104)
 
@@ -172,7 +292,7 @@ external write.
 | Index | PA[11:4], 8 bits |
 | Replacement | 6-bit pseudo-LRU, Table 5.2 (one-hot victim decode, one LUT/bit) |
 
-Files: `cache.sv` (1277, the wrapper + FSM), `cache_mem.sv` (157, the M10K banks),
+Files: `cache.sv` (1344, the wrapper + FSM), `cache_mem.sv` (157, the M10K banks),
 `cache_pkg.sv` (108, geometry + `tag_of`/`cacheable`/`lru_*`/`merge_word` helpers).
 
 ### The lookup model — folded into the pipe, no handshake
@@ -192,6 +312,10 @@ a two-beat overlapped lookup:
   same edge the *next* access is captured. Back-to-back hits therefore run at one per
   cycle. A live hit response the pipe can't consume this cycle **retires into a
   registered `rsp_*` flag** (loss-free hold), so no response is ever overwritten.
+- **Pair delivery:** an even I-side hit (or fill/bypass read) returns the addressed
+  halfword *and* its sibling (`rsp_pair`); a hit never faults and a registered
+  response excludes a same-side live hit, so the pair qualifier is a pure
+  registered-flag product (§1, instruction fetch).
 
 There is no held-response slot for hits (the resolve *is* the response), which is
 exactly why an earlier "held-slot overlap" attempt deadlocked and was abandoned.
@@ -211,40 +335,59 @@ IF and MA present addresses to the **same** single read port. Arbitration is
 **MA-priority**: when both want the same cycle, the data access wins and the fetch
 stalls one cycle (the "MA contends with IF" fetch bubble, p.454–455). This is why
 memory-heavy code runs below 1 IPC — loads/stores structurally steal fetch slots.
-The store ceiling of 0.5 is this port limit, and it is *correct* RISC behavior
-(adding a second read port was explicitly rejected).
+Pair fetch halves the fetch-side demand on the port (one access per two
+instructions), which is where the 0.554 store-loop IPC comes from; the residual
+ceiling is this port limit, and it is *correct* RISC behavior (adding a second
+read port was explicitly rejected).
 
 ### Write policy, fills, MMIO fold
 
 - **Per-region write policy** (p.105, 110–111): P1→`CCR.CB`, P0/U0/P3→`~CCR.WT`
   (`wb_mode`), with a `U` (dirty) bit in the tag. WB write hit = cache+U; WT write
-  hit = cache+memory; WB write miss = write-allocate; WT write miss = memory only.
+  hit = cache+memory (a WT hit on a still-dirty line writes through its own word
+  and neither drains nor cleans the resident dirty data — `CCR.CF` later discards
+  it, a locked law); WB write miss = write-allocate; WT write miss = memory only.
 - **Write-back buffer:** one line (p.111–112, Fig 5.5); line fills are 4 sequential
-  longword reads, word-0-first.
+  longword reads, word-0-first. A mid-line fill fault invalidates the victim way
+  (earlier beats already overwrote its words) rather than leaving a stale-valid
+  hybrid line.
 - **Store fast path:** a write-back store hit commits its strobed bytes at the
   resolve edge and retires in one MA cycle (a store is a *notify*, not an ack — the
   pipe retires it via `ma_complete`); the next access's read at that same edge gets
   the just-written bytes through `cache_mem`'s write-through bypass registers
   (write-before-read order; Cyclone V M10K has no silicon mixed-port new-data).
-- **MMIO fold:** CCR/CCR2 and the exception registers (TRA/EXPEVT/INTEVT/INTEVT2/TEA)
+- **MMIO fold:** CCR/CCR2 and the exception registers (TRA/EXPEVT/INTEVT/TEA)
   are served as a *local-register access class* through the cache's shared `do_d`
   output flop, matched off the **latched** address — deliberately keeping MMIO decode
   off the AGU 5 ns fan-out. Writes are fire-and-forget; reads return a 1-cycle
-  registered response. Memory-mapped cache windows: tag `0xF0xx_xxxx`, data
-  `0xF1xx_xxxx` (p.112–114).
+  registered response.
+- **Memory-mapped array windows** (p.112–114): tag `0xF0xx_xxxx`, data
+  `0xF1xx_xxxx`; way in `A[13:12]`, set in `A[11:4]`, associative bit `A[3]`. Tag
+  reads return `{tag, LRU, U, V}`. An **associative write is the purge
+  primitive**: a tag match with `U=1` writes the line back, then invalidates
+  (miss = silent no-op). A **non-associative tag write to a dirty entry drains it
+  first** before installing the new tag/V/U/LRU — direct array writes cannot
+  silently destroy dirty data. Data-array pokes are visible to subsequent cached
+  hits. All of this is locked by a dedicated law suite (§7).
 - **Non-cacheable bypass:** P2 (`101`) and P4 (`111`) are non-cacheable control
   spaces (`cacheable()` in `cache_pkg`); the reset PC lives in P2 (`0xA000_0000`).
+  Locked accesses (`TAS.B` and friends) always bypass the array.
+- **PREF** allocates through the normal D-fill path but is architecturally
+  fire-and-forget: a faulting PREF fill is silently abandoned (no allocation, no
+  exception), interrupt or not.
 
 ### Miss / external-bus FSM
 
 Only a miss leaves the running state. The miss/refill/write-back/bypass/MMIO states
 each last a full cycle (each state's RAM read lands one state later), and drive the
-external I-bus (§3). The FSM is unchanged from the earlier design; the model-b work
-replaced only the hit/accept/respond path.
+external I-bus (§4). Interrupt acceptance composes freely with every excursion —
+including the 256-set `CCR.CF` flush walk and the memory-mapped array states — via
+the boundary invariant of §2 (the collision suites sweep an acceptance edge across
+each excursion type).
 
 ---
 
-## 3. Bus structure
+## 4. Bus structure
 
 ### On-chip tiers (SH7709S Fig 1.1, p.6)
 
@@ -264,6 +407,12 @@ zero bus/peripheral cone appears in any OOC top-20).
 Fabric glue: `ibus_splitter.sv` (86, mux-only, zero beats, `owner_q` steers the
 response), `ibus_bridge.sv` (159, IDLE→ACCESS→RESP, right-justified writes,
 lane-replicated reads), `peri_bus_if.sv` (the slim register-bus interface).
+
+**Bus contracts (checked suite-wide, §7):** an unaccepted D request re-presents
+identical fields every cycle until accepted or withdrawn (withdrawal = a pipeline
+kill, legal; mutation, never); an unconsumed D response re-presents identically
+(loss-free retirement); an external MEM-bus request is never withdrawn or mutated
+once presented; locked accesses alternate strictly read→write (one open pair).
 
 ### BSC — the external bus controller (`bsc.sv`, 1383 lines)
 
@@ -297,15 +446,15 @@ read and write (p.320). Cache line fills present as `req_burst` on I bus 1.
 
 ---
 
-## 4. Peripherals
+## 5. Peripherals
 
 All on-chip peripherals are timing-free in OOC (zero cones in any top-20); the CPU
-remains the critical path. Full-SoC OOC (all peripherals) lands ≈ 81–82 MHz.
+remains the critical path.
 
 | Module | File | Function |
 |---|---|---|
 | **CPG / WDT** | `cpg_wdt.sv` (282) | FRQCR/STBCR/STBCR2 clock-pulse generator; Pφ divider N∈{1,2,3,4,6}; watchdog timer with keyed `0x5A`/`0xA5` writes + reset stretcher; owns `o_BCEN` and the `o_CKIO` pin (B-φ = core/2, p.207 — FRQCR has no CKOEN, CKIO always drives in modes 0–2). |
-| **INTC** | `intc.sv` (455) | Full §6 interrupt controller: IRQ / IRL / IRLS / PINT / NMI, a 37-entry **2-stage registered priority resolver**, `INTEVT2`, `o_INT_ACK`/`o_NMI_ACK`. Interrupt inputs now tap the I/O pads (below). |
+| **INTC** | `intc.sv` (455) | Full §6 interrupt controller: IRQ / IRL / IRLS / PINT / NMI, a 37-entry **2-stage registered priority resolver**, `INTEVT2`, `o_INT_ACK`/`o_NMI_ACK` (the acks latch/clear pending state — the core's ack-implies-entry law makes the handshake lossless). Interrupt inputs tap the I/O pads (below). |
 | **TMU** | `tmu.sv` (262) | 3× 32-bit auto-reload down-counters; shared Pφ prescaler taps (P/4, /16, /64, /256); external TCLK clock (per CKEG, 2FF + edge detect); ch2 input capture (TCPR2, ICPF); underflow interrupts `TUNI0-2`/`TICPI2` → INTC (IPRA). |
 | **I/O ports / PFC** | `ioport.sv` (232) | All 12 ports (A–L, SCP) as `pcr[]`/`pdr[]` arrays with per-port capability masks (drive/pull-up), PFC mode muxing (`MD1 ? pin : (DRV & DR)`), the PGCR PTG0 quirk (p.577). |
 | **RTC** | `rtc.sv` (407) | §13, **two clock domains**: the `i_EXTAL2` 32.768 kHz oscillator (7-bit prescaler → RTCCLK 16.384 kHz + 256 Hz tap) and the bus domain (R64CNT, BCD calendar, alarms, periodic interrupt). CDC by tick-sync + no-reset toggles. Counters/alarms never pin-reset (Table 13.2). Feeds TMU `i_RTCCLK`/`i_RTC_TICK`. |
@@ -319,61 +468,124 @@ multiplex on the same physical pins.
 
 ---
 
-## 5. Timing summary — where the Fmax goes
+## 6. Timing summary — where the Fmax goes
 
-Single-clock OOC restricted-Fmax history (Quartus 17, Cyclone V, `set_max_delay`
-false-paths on the M10K RDW arcs):
+Full-SoC OOC (Quartus 17, Cyclone V `5CSEBA6U23I7`, AGGRESSIVE PERFORMANCE,
+`set_max_delay` false-paths on the M10K RDW arcs), measured across seeds on the
+final tree:
 
-| Configuration | Worst slack @ 10 ns | Fmax |
+| Seed | Worst multicorner slack @ 10 ns | Restricted Fmax | Top-20 headline class |
+|---|---|---|---|
+| 3 | −3.196 ns | 75.8 MHz | forward lanes → EX adder → `exma.t_data` |
+| 4 | −2.86 ns | 77.8 MHz | request front → cache accept qualifier (`acc_d_q`) |
+| 5 | −2.61 ns | **79.3 MHz** | MA-seq state → fetch-pair capture (`pair_inst`) |
+
+> **Read this as a plateau, not a ranking.** The design sits on a *flat cluster* of
+> single-cycle protected loops all within ~0.4 ns of each other; each seed's
+> placement picks a different one as the headline, and per-seed coarse Fmax moves
+> by more than real structural changes do. Judge any change by worst-slack trend
+> *and cone composition across seeds*, never by one fit. The 100 MHz deliverable
+> corresponds to worst slack ≥ 0; the measured gap is ~2.6–3.2 ns of mostly
+> interconnect (55–65 % of every failing path is routing).
+
+The recurring cone classes, all protected by the no-bubbles rule (each is a
+single-cycle loop that cannot take a register without costing an architectural
+cycle):
+
+1. **Advance loop / request front** — `{mawb.gpr0_data, fwd_*_agu,
+   second_access_agu}` → AGU adder → request valid/accept → `idex_allow`
+   (fanout ~350) → GPR read-ahead address capture. The oldest and deepest family;
+   its accept-side tail also captures the cache FSM next-state and the
+   write-through bypass registers (`byp_q`).
+2. **Wall A — I-response → predecode** — cache I-side response formation
+   (`bram_addr` → RAM `q` → way/word select → `rsp_inst`) → predecode → the same
+   GPR read-ahead capture. Shares the capture with class 1; any read-ahead
+   late-select helps both.
+3. **Operand → EX flags** — forward-lane selects → operand mux → the EX adder
+   carry chain → T/compare select tree → `exma.t_data` / `r_t`. ~9 levels, ~60 %
+   interconnect; a placement-spread cone rather than a logic-depth one.
+
+The interrupt/exception machinery (§2) contributes **no logic to any failing
+path**: the acceptance boundary, restart-PC register, bank/flag mirrors, and MA
+phase gate are all registered-launch, registered-capture structures placed off the
+walls — confirmed by name-search over every top-20 path across seeds.
+
+Levers still open toward 100 MHz: a late-select on the GPR read-ahead tail
+(classes 1+2 share it), shortening the I-response way/word select feeding
+predecode, or floorplanning the operand cluster (class 3 is wire-dominated).
+Fallbacks remain a LogicLock floorplan pin or a C6 speed grade — **not** an
+operand- or address-capture pipeline beat (that would break cycle accuracy).
+
+*Flow note:* the OOC flow (`eval_ooc/tools/quartus_ooc.py all <config>`) reuses the
+run directory named in the config; the STA/summary regenerate on every run but the
+`probe_*.rpt` cone probes do **not** — check file mtimes before reading probes
+against a fresh fit.
+
+---
+
+## 7. Verification
+
+Two self-checking Verilator benches gate every change; both must pass bit-exact,
+and the three IPC laws (§1) are asserted values, not observations.
+
+| Bench | Scope | Tests |
 |---|---|---|
-| Core only, single-clock port (sclk fit4) | −2.556 ns | 79.64 MHz |
-| Core only, pre-forwarding baseline (seed 3) | −2.488 ns | 80.08 MHz |
-| Core only, **EX-head forwarding (v3, seed 3)** | −2.472 ns | **80.18 MHz** |
-| Full SoC + peripherals (RTC session, seed 3) | −2.273 ns | 81.11 MHz |
-| Full SoC + peripherals (**v3, seed 3**) | −2.252 ns | **81.62 MHz** |
+| `cpu_core_tb` | core only (`src/cpu_core`), bus modeled in the tb | **103** |
+| `HS3_tb` | full SoC on the real pin set, vendor SDRAM/flash models | **57** |
 
-> The older "82.75 MHz (rounds 5–7)" figure is **not reproducible** on the current
-> tree under the same flow — ~80.1 MHz is the real core-only baseline. Judge progress
-> by worst-slack and cone composition, not coarse Fmax (fit noise is ±0.4 ns; seeds
-> 1/5/7 all fitted worse than seed 3 on v3). The 85 MHz gate corresponds to worst
-> slack ≥ **−1.765 ns** @ 10 ns.
+The suite is built in four layers:
 
-**EX-head forwarding (v3)** moved the live forwarding legs (the `ex_result` ALU tail
-and the `ld_word` load aligner) out of the ID operand mux and onto per-port
-*registered lanes* patched at the head of EX (with WB-view deposit shadows). Every
-forward mux-select is now a single FF and every data leg launches from a register.
-This deleted the three protected forwarding loops from every top-20 path — but it is
-timing-neutral overall (bit-exact, IPC-identical), because the plateau is now set by
-two **cache-side** walls at the same depth. Both are single-cycle protected loops:
-they cannot be pipelined without a bubble, which the IPC-first rule forbids.
+1. **Directed goldens** — every ISA class, addressing mode, exception cause,
+   hazard/interlock, cache law (fills, write policies, per-beat fill faults,
+   victim drains, flush/CE semantics, LRU thrash, self-modification, the
+   memory-mapped tag/data window matrix, WT-flip on dirty lines), fetch-pair laws,
+   and the BSC's device-level behaviors (boot-from-flash, refresh, self-refresh,
+   `BREQ` arbitration, `i_WAIT_n`).
+2. **Collision sweeps** — an interrupt (and separately an NMI) is swept cycle-by-
+   cycle across every machinery excursion: plain execution, miss/fill/drain walks,
+   locked `TAS.B` pairs, the `CCR.CF` flush walk, memory-mapped array accesses,
+   faulting and clean PREF fills, and two-event collisions (each synchronous
+   exception flavor — illegal, slot-illegal, address error, TRAPA, D-fill bus
+   fault, I-fill fetch fault — colliding with a pending interrupt at every
+   offset). Laws at every offset: exactly one entry per event, `EXPEVT`/`INTEVT`
+   never mix, the interrupted computation is transparent, `SPC` is never a delay
+   slot, and no request is lost (an ack without an entry fails). SR-write races
+   (`LDC ...,SR` flipping IMASK/BL/RB at the acceptance edge) and nested-enable
+   re-entry (BL cleared inside a handler with the level still held) are swept the
+   same way. `HS3_tb` carries SoC twins of the collision sweeps over the real
+   INTC/IRL pin protocol.
+3. **Suite-wide passive checkers** — always-on monitors that fail the run from any
+   test: an independent true-LRU mirror cross-checked at every LRU write and
+   victim choice, the L-bus/MEM-bus stability contracts (§4), locked-pair
+   alternation, ack-implies-entry with `INTEVT` settlement, and acceptance
+   **coverage histograms** (entries per cache FSM state, restart-PC source arm)
+   asserted non-empty so the sweeps provably reach the deep states.
+4. **Random oracles** — constrained-random programs (ALU, R14-window loads/stores,
+   byte stores, `TAS.B`, `PREF`, plain and delayed conditional branches over live
+   T) run once as their own reference and re-run under (a) random I/D wait states
+   and (b) random INT/NMI waves at random offsets in three SR flavors (privileged
+   RB=1, privileged RB=0, user mode — the latter two flip the register bank on
+   every entry/RTE). The architectural end state must be identical and the handler
+   count must equal the wave count. This layer subsumes the hand-built offset
+   enumeration and is the strongest regression net in the suite.
 
-1. **Wall A — I-response → GPR read-ahead** (~−2.4…−2.5 ns; ~10 levels, ~60 %
-   interconnect): cache I-side response formation (`bram_addr` → RAM `q` / way select
-   / word select → `rsp_inst`) → predecode (`nx_inst` / `pd_fetch`) → the 2R2W GPR
-   read-ahead address (`portb_address_reg`). The read-ahead must capture at the IF/ID
-   edge (operands are needed during ID), so no bubble is allowed.
-2. **Wall B — request → cache FSM/captures** (~−2.2…−2.5 ns; SoC worst): the request
-   cone (`mawb.gpr0_data`, `fwd_*_agu`, `second_access_agu`, `exma.valid`) → AGU adder
-   → `req_addr` / `req_valid` → cache lookup index and FSM next-state
-   (`S_FLUSH` / `S_DBYP_REQ` / `S_STORE_WR`) plus the write-through bypass captures
-   (`byp_q`). The AGU's +1-level WB-leg tax lands on this cone.
-
-Levers under investigation toward 100 MHz: shorten the cache I-response way/word
-select feeding predecode, or feed the GPR read-ahead from a narrower early slice of
-the response (Wall A); shallow-grant / late-select the FSM next-state on a narrow
-index decode, or cut the request carry-chain high bits out of the FSM cone (Wall B).
-Fallbacks remain a LogicLock floorplan pin or a C6 speed grade — **not** an operand-
-or address-capture pipeline beat (that would break cycle accuracy).
+Testbench conventions worth knowing (they encode real pitfalls): the `AFFE` guard
+word is a delayed branch, so the word after it must stay a NOP; GPRs persist across
+the tb's reset, so programs zero their own *active-bank* registers and any detector
+registers; interrupt-visible state is initialized *before* the BL-clearing `LDC`
+(a wave accepted at the init's own boundary would re-execute the init over the
+handler's counts); and `gpr()` sampling at a retire marker races the pipeline's
+~7-word lookahead, so multi-step checks use write-once result registers read after
+the sentinel.
 
 ---
 
 ## References
 
 - `SH7709S_Hardware_Manual[REJ09B0081-0500O].pdf` — cache (§5, p.103–114), BSC
-  (§10), INTC (§6), TMU, RTC (§13), ports (§18), CPG (p.207–212).
+  (§10), INTC (§6), exceptions (§4, p.85–101), TMU, RTC (§13), ports (§18), CPG
+  (p.207–212).
 - `SH-3_SH-3E_SH3-DSP_Software_Manual.pdf` — pipeline timing (Fig 10.40/10.41
-  p.476), branch/PR rules (§10.2.3 p.432).
+  p.476), branch/PR rules (§10.2.3 p.432), interrupt/pair semantics (§4.5.3).
 - `SH-1_SH-2_Programming_Manual.pdf` — 5-stage pipeline baseline.
 - `SH7604_Hardware_Manual[ADE-602-085C].pdf` — cache operation reference.
-</content>
-</invoke>

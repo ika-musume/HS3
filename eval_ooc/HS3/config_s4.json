@@ -1,0 +1,71 @@
+{
+  "project_name": "HS3",
+  "top_module": "HS3_ooc_top",
+  "top_source": "HS3_ooc_top.sv",
+  "sources": [
+    "../../src/cpu_core/int_pipe_pkg.sv",
+    "../../src/cpu_core/cache_pkg.sv",
+    "../../src/cpu_core/cpu_bus_if.sv",
+    "../../src/cpu_core/int_pipe_mem.sv",
+    "../../src/cpu_core/int_pipe.sv",
+    "../../src/cpu_core/cache_mem.sv",
+    "../../src/cpu_core/cache.sv",
+    "../../src/cpu_core/agu.sv",
+    "../../src/cpu_core/ctrl_reg.sv",
+    "../../src/cpu_core/exc_handler.sv",
+    "../../src/cpu_core/cpu_core.sv",
+    "../../src/peri/peri_bus_if.sv",
+    "../../src/peri/ibus_splitter.sv",
+    "../../src/peri/ibus_bridge.sv",
+    "../../src/peri/cpg_wdt.sv",
+    "../../src/peri/intc.sv",
+    "../../src/peri/bsc.sv",
+    "../../src/peri/tmu.sv",
+    "../../src/peri/rtc.sv",
+    "../../src/peri/ioport.sv",
+    "../../src/HS3.sv",
+    "HS3_ooc_top.sv"
+  ],
+  "clock_port": "i_CLK",
+  "clock_ports": [
+    "i_CLK",
+    "i_EXTAL2"
+  ],
+  "async_clocks": {
+    "i_EXTAL2": 0.032768
+  },
+  "reset_ports": [
+    "i_POR_n",
+    "i_RST_n"
+  ],
+  "clock_enable": {
+    "mode": "tie_high",
+    "port": "i_CEN"
+  },
+  "clock_mhz": 100.0,
+  "critical_paths": 20,
+  "quartus": {
+    "family": "Cyclone V",
+    "device": "5CSEBA6U23I7",
+    "docker_image": "raetro/quartus:17.0",
+    "revision": "HS3_quartus_ooc",
+    "run_name": "quartus_cyclonev_100_s4",
+    "seed": 4
+  },
+  "false_paths": [
+    {
+      "comment": "M10K mixed-port RDW modeling arcs inside the SDP RAMs (cache tag/data/LRU and the GPR LVT banks): a write-port we/datain input reg has NO real launch arc - the write completes inside the following cycle and the read capture launches from the read-side regs. The colliding read value is never consumed: the explicit write-through bypass registers (cache_mem/int_pipe forward lanes) supply it.",
+      "from": [
+        "*|cache:u_cache|*WRITE_ENABLE*",
+        "*|cache:u_cache|*we_reg*",
+        "*|cache:u_cache|*DATA_IN*",
+        "*|cache:u_cache|*datain_reg*",
+        "*u_gpr_bram*WRITE_ENABLE*",
+        "*u_gpr_bram*we_reg*",
+        "*u_gpr_bram*DATA_IN*",
+        "*u_gpr_bram*datain_reg*"
+      ],
+      "to": []
+    }
+  ]
+}

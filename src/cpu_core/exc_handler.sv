@@ -34,8 +34,9 @@ module exc_handler #(
     input   wire            i_PIPE_RTE_VALID,
     input   wire            i_PIPE_RETIRE_VALID,
     input   wire    [31:0]  i_PIPE_RETIRE_PC,
-    input   wire            i_PIPE_RETIRE_INT_DEFER, //retiree is a delayed branch: slot owed
-    input   wire            i_PIPE_MA_INFLIGHT,      //accepted D access / RMW mid-sequence: defer
+    input   wire            i_PIPE_INT_BOUNDARY,     //legal acceptance boundary this edge: an
+                                                     //instruction retired, no open delayed pair,
+                                                     //no in-flight D access (pipe-owned, 4.5.3)
     input   wire    [31:0]  i_PIPE_INT_NEXT_PC,      //oldest instruction the redirect discards
 
     /* ALREADY-PRIORITIZED EXTERNAL INTERRUPTS - the INTC owns INTEVT2 (I bus, Appendix B
@@ -171,13 +172,9 @@ logic   [31:0]  interrupt_spc;
 
 assign  sr_bl              = i_SR[28];
 assign  sr_imask           = i_SR[7:4];
-//Deferred while a delayed-branch pair is open (branch retired, slot owed): no
-//interrupt is accepted between them (section 4.5.3, pp.98-100). Also deferred while
-//an ACCEPTED data access or a locked-RMW/MAC pair is in flight in MA: the redirect
-//would orphan the bus response (wedging the L-bus response channel) or split an
-//indivisible sequence - found by the interrupt-vs-TAS and busfault collision sweeps.
-assign  interrupt_boundary = i_PIPE_RETIRE_VALID && !i_PIPE_RETIRE_INT_DEFER &&
-                             !i_PIPE_MA_INFLIGHT;
+//The acceptance-boundary invariant (retire edge, no open pair, no in-flight D
+//access - section 4.5.3, pp.98-100) is OWNED BY THE PIPE and arrives as one bit.
+assign  interrupt_boundary = i_PIPE_INT_BOUNDARY;
 assign  general_accept     = i_PIPE_EXC_VALID || i_PIPE_TRAPA_VALID;
 assign  general_reset_like = general_accept && sr_bl;
 assign  rte_accept         = i_PIPE_RTE_VALID;
