@@ -306,6 +306,8 @@ typedef struct packed {
     logic           delay_slot;
     logic           dbr;         //instruction IS a delayed branch (its slot must follow
                                  //before an interrupt is accepted; see 4.5.3 pp.98-100)
+    logic           nd_taken;    //non-delayed TAKEN branch (BT/BF): its commit-time
+                                 //successor is the redirect target, not pc+2
 
     //Forwardable GPR results
     logic           gpr0_we;
@@ -367,6 +369,7 @@ typedef struct packed {
     logic   [15:0]  inst;
     logic           delay_slot;
     logic           dbr;         //delayed branch (interrupt-defer marker, see exma_t)
+    logic           nd_taken;    //non-delayed taken branch (see exma_t)
 
     //Final GPR commit values
     logic           gpr0_we;

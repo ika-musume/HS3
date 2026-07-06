@@ -43,6 +43,12 @@ logic   [3:0]   int_level_q = 4'd0;
 logic   [11:0]  int_code_q  = 12'd0;
 wire            int_ack_w;
 
+//NMI drive (INTC edge-pending stand-in): held until the core's o_NMI_ACK, the
+//same latch-and-clear the SoC INTC edge detector implements (section 6, p.143).
+logic           nmi_valid_q = 1'b0;
+logic           nmi_blmsk_q = 1'b0;
+wire            nmi_ack_w;
+
 logic           exc_valid;
 logic   [2:0]   exc_cause;
 logic   [31:0]  exc_pc;
@@ -95,13 +101,13 @@ cpu_core u_dut (
 
     .I_BUS                     (MEM_BUS),
 
-    .i_NMI_VALID               (1'b0),
-    .i_NMI_BLMSK               (1'b0),
+    .i_NMI_VALID               (nmi_valid_q),
+    .i_NMI_BLMSK               (nmi_blmsk_q),
     .i_INT_VALID               (int_valid_q),
     .i_INT_LEVEL               (int_level_q),
     .i_INT_CODE                (int_code_q),
     .o_INT_ACK                 (int_ack_w),
-    .o_NMI_ACK                 (),
+    .o_NMI_ACK                 (nmi_ack_w),
 
     .dbg_o_RETIRE_VALID        (retire_valid),
     .dbg_o_RETIRE_PC           (retire_pc),
@@ -276,6 +282,7 @@ integer         entry_count;         //exception/interrupt entries since reset
 logic           entry_z;             //one-cycle-delayed entry pulse (SPC settle)
 logic   [31:0]  entry_spc_l;         //SPC captured the cycle after each entry
 integer         int_ack_count;       //o_INT_ACK pulses since reset (INTC drop key)
+integer         nmi_ack_count;       //o_NMI_ACK pulses since reset (edge-pending clear key)
 logic           gpr_phase_write_seen;
 logic           gpr_phase_read_seen;
 logic           gpr_phase_capture_seen;
@@ -319,6 +326,7 @@ always_ff @(posedge clk or negedge rst_n) begin
         entry_z              <= 1'b0;
         entry_spc_l          <= 32'd0;
         int_ack_count        <= 0;
+        nmi_ack_count        <= 0;
         gpr_phase_write_seen   <= 1'b0;
         gpr_phase_read_seen    <= 1'b0;
         gpr_phase_capture_seen <= 1'b0;
@@ -370,6 +378,7 @@ always_ff @(posedge clk or negedge rst_n) begin
             //Clocked ack sampling: the SoC INTC drops its request on this pulse, so an
             //ack WITHOUT a matching interrupt entry is a lost interrupt (collision law).
             if(int_ack_w) int_ack_count <= int_ack_count + 1;
+            if(nmi_ack_w) nmi_ack_count <= nmi_ack_count + 1;
         end
 
         //IPC benchmark window. One architectural cycle per posedge; counting starts
@@ -468,6 +477,8 @@ integer         lru_mismatches   = 0;
 
 integer         squash_fill_hits = 0;       //cycles with I_SQUASH high during an I-fill run
 integer         entry_cache_busy = 0;       //interrupt/exception entries with the cache FSM mid-excursion
+integer         entry_state_cov [0:31];     //entries per cache FSM state (acceptance-coverage histogram)
+integer         int_arm_cov [0:6];          //interrupt acks per o_INT_NEXT_PC restart-PC source arm
 
 integer         lbus_dreq_pends  = 0;       //unaccepted-and-held D-request cycles observed
 integer         lbus_dreq_viol   = 0;       //D-request field mutated while pending
@@ -585,7 +596,29 @@ always @(posedge clk) begin
         //acceptance edges while the cache FSM is mid-fill/drain/bypass (not IDLE).
         if(exception_entry_valid && cst != CS_IDLE)
             entry_cache_busy = entry_cache_busy + 1;
+        if(exception_entry_valid)
+            entry_state_cov[cst] = entry_state_cov[cst] + 1;
+
+        //(4b) Restart-PC source coverage: which o_INT_NEXT_PC mux arm each interrupt
+        //acceptance actually used (mirrors the priority in int_pipe). Proves the
+        //sweeps reach the deep arms (held pair / pending fetch), not just mawb.
+        if(int_ack_w || nmi_ack_w) begin
+            if     (u_dut.u_int_pipe.mawb.valid)  int_arm_cov[0] = int_arm_cov[0] + 1;
+            else if(u_dut.u_int_pipe.exma.valid)  int_arm_cov[1] = int_arm_cov[1] + 1;
+            else if(u_dut.u_int_pipe.idex.valid)  int_arm_cov[2] = int_arm_cov[2] + 1;
+            else if(u_dut.u_int_pipe.ifid.valid)  int_arm_cov[3] = int_arm_cov[3] + 1;
+            else if(u_dut.u_int_pipe.pair_ready)  int_arm_cov[4] = int_arm_cov[4] + 1;
+            else if(u_dut.u_int_pipe.fetch_pending && !u_dut.u_int_pipe.fetch_drop)
+                                                  int_arm_cov[5] = int_arm_cov[5] + 1;
+            else                                  int_arm_cov[6] = int_arm_cov[6] + 1;
+        end
     end
+end
+
+initial begin
+    integer k;
+    for(k = 0; k < 32; k = k + 1) entry_state_cov[k] = 0;
+    for(k = 0; k < 7;  k = k + 1) int_arm_cov[k]     = 0;
 end
 
 /*
@@ -635,7 +668,22 @@ always @(posedge clk) begin
             $display("      [ACK] INTEVT %03h != acked code %03h @%0t", intevt_o[11:0], ack_code_z, $time);
         end
         ack_z      = int_ack_w;
-        ack_code_z = int_code_q;
+        ack_code_z = nmi_ack_w ? 12'h1C0 : int_code_q;  //NMI ack: DUT must write EV_NMI
+
+        //(7) NMI acks obey the same laws: entry on the ack edge, INTEVT=0x1C0 after,
+        //and the two acks are mutually exclusive (one architectural event per edge).
+        if(nmi_ack_w) begin
+            ack_checks = ack_checks + 1;
+            if(!exception_entry_valid) begin
+                ack_viol = ack_viol + 1;
+                $display("      [ACK] o_NMI_ACK without an interrupt entry @%0t", $time);
+            end
+            if(int_ack_w) begin
+                ack_viol = ack_viol + 1;
+                $display("      [ACK] NMI and INT acked on the same edge @%0t", $time);
+            end
+        end
+        if(nmi_ack_w) ack_z = 1'b1;   //reuse the settle check: INTEVT reads 0x1C0 next cycle
     end
 end
 
@@ -665,6 +713,23 @@ always @(posedge clk) begin
                  u_dut.u_int_pipe.mawb.pc, u_dut.u_int_pipe.mawb.inst,
                  u_dut.u_int_pipe.mawb.gpr0_we, u_dut.u_int_pipe.mawb.gpr0_dst, u_dut.u_int_pipe.mawb.gpr0_data,
                  u_dut.u_int_pipe.mawb.gpr1_we, u_dut.u_int_pipe.mawb.gpr1_dst, u_dut.u_int_pipe.mawb.gpr1_data);
+    if(dbg_trace && u_dut.u_int_pipe.u_ma_seq.fv_ce)
+        $display("        [trace %0t] CAP val=%08h hit=%b rmiss=%08h addr=%08h op=%0d", $time,
+                 u_dut.u_int_pipe.ma_capture_value, u_dut.PIPE_L_BUS.rsp_hit_d,
+                 u_dut.PIPE_L_BUS.rsp_rdata_miss, u_dut.u_int_pipe.exma.mem_addr,
+                 u_dut.u_int_pipe.exma.mem_op);
+    if(dbg_trace && u_dut.PIPE_L_BUS.req_valid && !u_dut.PIPE_L_BUS.req_fetch && u_dut.PIPE_L_BUS.req_ready)
+        $display("        [trace %0t] DREQ addr=%08h wr=%b lock=%b wdata=%08h wstrb=%b second=%b", $time,
+                 u_dut.PIPE_L_BUS.req_addr, u_dut.PIPE_L_BUS.req_write, u_dut.PIPE_L_BUS.req_lock,
+                 u_dut.PIPE_L_BUS.req_wdata, u_dut.PIPE_L_BUS.req_wstrb,
+                 u_dut.u_int_pipe.ma_second_access);
+    if(dbg_trace && u_dut.u_int_pipe.o_SR_T_WE)
+        $display("        [trace %0t] TWR t=%b (wb pc=%08h)", $time,
+                 u_dut.u_int_pipe.o_SR_T, u_dut.u_int_pipe.mawb.pc);
+    if(dbg_trace && exception_entry_valid)
+        $display("        [trace %0t] SREG sr=%08h ssr=%08h spc=%08h", $time, sr, ssr_o, spc_o);
+    if(dbg_trace && rte_valid)
+        $display("        [trace %0t] RTE  sr=%08h ssr=%08h spc=%08h", $time, sr, ssr_o, spc_o);
     if(dbg_trace && exception_entry_valid)
         $display("        [trace %0t] ENTRY nextpc=%08h stages mawb=%b/%08h exma=%b/%08h idex=%b/%08h ifid=%b/%08h pair=%b/%08h fpend=%b/%08h fpc=%08h",
                  $time, u_dut.u_int_pipe.o_INT_NEXT_PC,
@@ -718,7 +783,10 @@ always @(posedge clk) begin
                u_dut.PIPE_L_BUS.req_lock  !== lb_lock_z  ||
                (lb_write_z && u_dut.PIPE_L_BUS.req_wdata !== lb_wdata_z)) begin
                 lbus_dreq_viol = lbus_dreq_viol + 1;
-                $display("      [LBUS] D-request mutated while unaccepted @%0t", $time);
+                $display("      [LBUS] D-request mutated while unaccepted @%0t: addr %08h->%08h wr %b->%b size %0d->%0d lock %b->%b wdata %08h->%08h",
+                         $time, lb_addr_z, u_dut.PIPE_L_BUS.req_addr, lb_write_z, u_dut.PIPE_L_BUS.req_write,
+                         lb_size_z, u_dut.PIPE_L_BUS.req_size, lb_lock_z, u_dut.PIPE_L_BUS.req_lock,
+                         lb_wdata_z, u_dut.PIPE_L_BUS.req_wdata);
             end
         end
         //D-response hold until consumed (identical data/fault re-presentation).
@@ -2560,8 +2628,1028 @@ task automatic test_squash_victim_drain;
     end
 endtask
 
+//GOLDEN Y1 - SR-write races at the acceptance boundary. A tight LDC ...,SR loop
+//flips one SR field (IMASK 0<->15 / BL 0<->1 / RB 1<->0) while a level-8 request is
+//held; the acceptance edge is swept across every loop phase. LAWS: exactly one
+//entry per window, the saved SSR must be a state that legally PERMITTED acceptance
+//(IMASK<8, BL=0), and the interrupted loop is transparent. Targets the LDC-SR
+//snoop path: an acceptance decided on a stale SR would save a masking SSR.
+task automatic test_int_sr_race;
+    integer ph, off, w;
+    string  phname;
+    begin
+        begin_test("Interrupt vs LDC-SR races: IMASK/BL/RB flip at the boundary (3 phases x offsets)");
+        for(ph = 0; ph < 3; ph = ph + 1) begin
+            phname = (ph == 0) ? "imask" : (ph == 1) ? "bl" : "rb";
+        for(off = 0; off < 30; off = off + 1) begin
+            cacheable_bootstrap(8'h09);
+            imem['h20] = 16'hE860;  // MOV    #0x60,R8 ; BL-clear prologue (IMASK=0)
+            imem['h21] = 16'h4818;  // SHLL8  R8
+            imem['h22] = 16'h4828;  // SHLL16 R8       ; R8 = 0x60000000 (MD,RB / BL=0 / IMASK=0)
+            imem['h23] = 16'h480E;  // LDC    R8,SR
+            imem['h24] = 16'hED00;  // MOV   #0,R13    ; handler entry counter
+            if(ph == 0) begin
+                //R9 = 0x600000F0: same SR with IMASK=15 (masks the level-8 request).
+                imem['h25] = 16'hE060;  // MOV   #0x60,R0
+                imem['h26] = 16'h4018;  // SHLL8 R0
+                imem['h27] = 16'h4028;  // SHLL16 R0
+                imem['h28] = 16'hCBF0;  // OR    #0xF0,R0 ; IMASK=15
+                imem['h29] = 16'h6903;  // MOV   R0,R9
+                imem['h2A] = 16'hEB00;  // MOV   #0,R11   ; work counter
+                imem['h2B] = 16'hEC08;  // MOV   #8,R12   ; loop count
+                //loop: flip masked/unmasked around real work; all regs unbanked (>=R8).
+                imem['h2C] = 16'h490E;  // LDC   R9,SR    ; IMASK=15 boundary
+                imem['h2D] = 16'h7B01;  // ADD   #1,R11
+                imem['h2E] = 16'h480E;  // LDC   R8,SR    ; IMASK=0 boundary
+                imem['h2F] = 16'h7B01;  // ADD   #1,R11
+                imem['h30] = 16'h4C10;  // DT    R12
+                imem['h31] = 16'h8FF9;  // BF/S  loop ('h2C)
+                imem['h32] = 16'h0009;  //   delay slot
+                imem['h33] = 16'h0009;  // sentinel
+                imem['h34] = 16'hAFFE;  // guard
+                imem['h35] = 16'h0009;
+            end
+            else begin
+                //R9 = 0x70000000 (BL=1, blocks) or 0x40000000 (RB=0, bank flip).
+                imem['h25] = (ph == 1) ? 16'hE070 : 16'hE040;   // MOV #0x70/#0x40,R0
+                imem['h26] = 16'h4018;  // SHLL8 R0
+                imem['h27] = 16'h4028;  // SHLL16 R0
+                imem['h28] = 16'h6903;  // MOV   R0,R9
+                imem['h29] = 16'hEB00;  // MOV   #0,R11
+                imem['h2A] = 16'hEC08;  // MOV   #8,R12
+                imem['h2B] = 16'h490E;  // LDC   R9,SR    ; BL=1 / RB=0 boundary
+                imem['h2C] = 16'h7B01;  // ADD   #1,R11
+                imem['h2D] = 16'h480E;  // LDC   R8,SR    ; BL=0 / RB=1 boundary
+                imem['h2E] = 16'h7B01;  // ADD   #1,R11
+                imem['h2F] = 16'h4C10;  // DT    R12
+                imem['h30] = 16'h8FF9;  // BF/S  loop ('h2B)
+                imem['h31] = 16'h0009;  //   delay slot
+                imem['h32] = 16'h0009;  // sentinel
+                imem['h33] = 16'hAFFE;  // guard
+                imem['h34] = 16'h0009;
+            end
+            imem['h300] = 16'h7D01; // ADD   #1,R13   ; VBR+0x600 handler
+            imem['h301] = 16'h002B; // RTE
+            imem['h302] = 16'h0009; //   delay slot
+            do_reset;
+            run_until_retire((ph == 0) ? 'h2B : 'h2A, 20000);   //loop is starting
+            repeat(off) @(posedge clk);
+            int_level_q = 4'd8;
+            int_code_q  = 12'h600;
+            int_valid_q = 1'b1;
+            w = 0;
+            while(entry_count == 0 && w < 20000) begin @(posedge clk); w = w + 1; end
+            @(posedge clk);
+            int_valid_q = 1'b0;
+            run_until_retire('h301, 20000);                       //handler RTE retired
+            run_until_retire((ph == 0) ? 'h33 : 'h32, 20000);     //sentinel
+            chk($sformatf("%s off=%0d: exactly one entry", phname, off), entry_count, 32'd1);
+            chk($sformatf("%s off=%0d: handler ran once", phname, off), gpr(13), 32'd1);
+            chk($sformatf("%s off=%0d: work transparent", phname, off), gpr(11), 32'd16);
+            chk($sformatf("%s off=%0d: loop count consumed", phname, off), gpr(12), 32'd0);
+            chk_true($sformatf("%s off=%0d: no spurious exception", phname, off), !exc_seen);
+            chk("INTEVT carries the driven code", intevt_o, 32'h0000_0600);
+            //Acceptance-legality laws on the SAVED SSR: the state the hardware claims
+            //it accepted under must itself permit a level-8 interrupt.
+            chk($sformatf("%s off=%0d: SSR.IMASK permitted the entry", phname, off),
+                {28'd0, ssr_o[7:4]}, 32'd0);
+            chk($sformatf("%s off=%0d: SSR.BL=0 at acceptance", phname, off),
+                {31'd0, ssr_o[28]}, 32'd0);
+            chk($sformatf("%s off=%0d: SSR.MD preserved", phname, off),
+                {31'd0, ssr_o[30]}, 32'd1);
+            if(ph == 2)
+                chk($sformatf("rb off=%0d: final SR restored (RB=1 leg)", off),
+                    sr & 32'hFFFF_FFFE, 32'h6000_0000);
+        end
+        end
+        do_reset;
+        end_test;
+    end
+endtask
+
+//GOLDEN Y2 - nested-enable precision. The first handler instance saves SPC/SSR, then
+//clears BL via LDC while the level is STILL held: the nested entry must land exactly
+//at the first post-LDC boundary (SPC inside the NOP window), and the restored main
+//context must be intact. The level drops only at the SECOND entry.
+task automatic test_int_bl_nested;
+    integer off, w;
+    begin
+        begin_test("Nested enable: BL-clear inside the handler re-enters at the next boundary");
+        for(off = 0; off < 12; off = off + 1) begin
+            cacheable_bootstrap(8'h09);
+            imem['h20] = 16'hE860;  // MOV    #0x60,R8 ; BL-clear prologue
+            imem['h21] = 16'h4818;  // SHLL8  R8
+            imem['h22] = 16'h4828;  // SHLL16 R8       ; R8 = 0x60000000 (kept: handler uses it)
+            imem['h23] = 16'h480E;  // LDC    R8,SR
+            imem['h24] = 16'hED00;  // MOV   #0,R13    ; entry counter
+            imem['h25] = 16'hEB00;  // MOV   #0,R11    ; work counter
+            imem['h26] = 16'hEC10;  // MOV   #16,R12   ; loop count
+            imem['h27] = 16'h7B01;  // ADD   #1,R11    ; loop
+            imem['h28] = 16'h4C10;  // DT    R12
+            imem['h29] = 16'h8FFC;  // BF/S  loop ('h27)
+            imem['h2A] = 16'h0009;  //   delay slot
+            imem['h2B] = 16'h0009;  // sentinel
+            imem['h2C] = 16'hAFFE;  // guard
+            imem['h2D] = 16'h0009;
+            //VBR+0x600 handler: entry #2 returns immediately; entry #1 saves context,
+            //clears BL (nested window), then restores and returns to main.
+            imem['h300] = 16'h7D01; // ADD   #1,R13
+            imem['h301] = 16'h60D3; // MOV   R13,R0
+            imem['h302] = 16'h8801; // CMP/EQ #1,R0
+            imem['h303] = 16'h8903; // BT    first ('h308)
+            imem['h304] = 16'h002B; // RTE            ; second entry: back into instance #1
+            imem['h305] = 16'h0009; //   delay slot
+            imem['h306] = 16'h0009;
+            imem['h307] = 16'h0009;
+            imem['h308] = 16'h0942; // STC   SPC,R9   ; save main restart
+            imem['h309] = 16'h0A32; // STC   SSR,R10  ; save main SR
+            imem['h30A] = 16'h480E; // LDC   R8,SR    ; BL=0, level held -> nested entry
+            imem['h30B] = 16'h0009; // NOP            ; nested acceptance window
+            imem['h30C] = 16'h0009; // NOP
+            imem['h30D] = 16'h0009; // NOP
+            imem['h30E] = 16'h4A3E; // LDC   R10,SSR  ; restore main context
+            imem['h30F] = 16'h494E; // LDC   R9,SPC
+            imem['h310] = 16'h002B; // RTE
+            imem['h311] = 16'h0009; //   delay slot
+            do_reset;
+            run_until_retire('h26, 20000);
+            repeat(off) @(posedge clk);
+            int_level_q = 4'd8;
+            int_code_q  = 12'h600;
+            int_valid_q = 1'b1;
+            w = 0;
+            while(entry_count < 2 && w < 20000) begin @(posedge clk); w = w + 1; end
+            @(posedge clk);
+            int_valid_q = 1'b0;
+            run_until_retire('h2B, 20000);        //sentinel: main completed
+            chk($sformatf("off=%0d: exactly two entries", off), entry_count, 32'd2);
+            chk($sformatf("off=%0d: handler body ran twice", off), gpr(13), 32'd2);
+            chk($sformatf("off=%0d: work transparent", off), gpr(11), 32'd16);
+            chk($sformatf("off=%0d: loop count consumed", off), gpr(12), 32'd0);
+            chk_true($sformatf("off=%0d: no spurious exception", off), !exc_seen);
+            //Nested precision: the second entry's SPC must sit in the post-LDC window
+            //('h30B..'h30E bytes 0x616..0x61C) - never back in main, never pre-LDC.
+            chk_true($sformatf("off=%0d: nested SPC in the BL-clear window (spc=%08h)", off, entry_spc_l),
+                     entry_spc_l >= 32'h0000_0616 && entry_spc_l <= 32'h0000_061C);
+            //Saved main context: SSR1 = main SR (T may differ), SPC1 inside the loop.
+            chk($sformatf("off=%0d: saved main SR intact", off),
+                gpr(10) & 32'hFFFF_FFFE, 32'h6000_0000);
+            chk_true($sformatf("off=%0d: saved main SPC in the loop (spc1=%08h)", off, gpr(9)),
+                     gpr(9) >= 32'h0000_004E && gpr(9) <= 32'h0000_0058);
+            chk($sformatf("off=%0d: final SR restored", off), sr & 32'hFFFF_FFFE, 32'h6000_0000);
+        end
+        do_reset;
+        end_test;
+    end
+endtask
+
+//GOLDEN Y3 - NMI vs miss/fill/drain machinery. The core-level NMI arm (BL gate,
+//NMI>INT priority, EV_NMI=0x1C0) has only been protocol-tested at the SoC; this
+//drives the same-set dirtying walk of the INT miss sweep with an NMI instead.
+task automatic test_nmi_miss_sweep;
+    integer g, off, w;
+    integer il_g [0:1];
+    integer dl_g [0:1];
+    begin
+        begin_test("NMI vs miss/fill/drain: acceptance mid-excursion is transparent (grid sweep)");
+        il_g = '{0, 3};
+        dl_g = '{0, 5};
+        for(g = 0; g < 2; g = g + 1) begin
+        for(off = 0; off < 120; off = off + 4) begin
+            cacheable_bootstrap(8'h09);
+            i_latency = il_g[g];
+            d_latency = dl_g[g];
+            imem['h20] = 16'hE860;  // MOV    #0x60,R8 ; BL-clear prologue (NMI needs BL=0 too)
+            imem['h21] = 16'h4818;  // SHLL8  R8
+            imem['h22] = 16'h4828;  // SHLL16 R8
+            imem['h23] = 16'h480E;  // LDC    R8,SR
+            imem['h24] = 16'hED00;  // MOV   #0,R13   ; handler entry counter
+            imem['h25] = 16'hE110;  // MOV   #0x10,R1
+            imem['h26] = 16'h4118;  // SHLL8 R1
+            imem['h27] = 16'h7160;  // ADD   #0x60,R1 ; R1 = 0x1060 (set 6)
+            imem['h28] = 16'h6713;  // MOV   R1,R7
+            imem['h29] = 16'h7710;  // ADD   #0x10,R7 ; R7 = 0x1070 (set 7, never stored)
+            imem['h2A] = 16'hE310;  // MOV   #0x10,R3
+            imem['h2B] = 16'h4318;  // SHLL8 R3       ; R3 = 0x1000 same-set stride
+            imem['h2C] = 16'hE508;  // MOV   #8,R5    ; 8 lines > 4 ways: iters 5+ drain
+            imem['h2D] = 16'hE200;  // MOV   #0,R2
+            imem['h2E] = 16'hE600;  // MOV   #0,R6
+            imem['h2F] = 16'h7201;  // ADD   #1,R2    ; loop
+            imem['h30] = 16'h2122;  // MOV.L R2,@R1   ; write-allocate miss (dirty)
+            imem['h31] = 16'h6412;  // MOV.L @R1,R4   ; load-back on the fresh line
+            imem['h32] = 16'h313C;  // ADD   R3,R1
+            imem['h33] = 16'h6972;  // MOV.L @R7,R9   ; COLD-MISS load (set 7)
+            imem['h34] = 16'h373C;  // ADD   R3,R7
+            imem['h35] = 16'h4510;  // DT    R5
+            imem['h36] = 16'h8FF7;  // BF/S  loop     ; delayed
+            imem['h37] = 16'h7601;  // ADD   #1,R6    ;   delay slot
+            imem['h38] = 16'h0009;  // sentinel
+            imem['h39] = 16'hAFFE;  // guard
+            imem['h3A] = 16'h0009;
+            imem['h300] = 16'h7D01; // ADD   #1,R13   ; VBR+0x600 handler
+            imem['h301] = 16'h002B; // RTE
+            imem['h302] = 16'h0009; //   delay slot
+            do_reset;
+            run_until_retire('h2E, 30000);
+            repeat(off) @(posedge clk);
+            nmi_valid_q = 1'b1;
+            w = 0;
+            while(entry_count == 0 && w < 20000) begin @(posedge clk); w = w + 1; end
+            @(posedge clk);
+            nmi_valid_q = 1'b0;
+            run_until_retire('h301, 60000);
+            run_until_retire('h38, 60000);
+            chk($sformatf("g=%0d off=%0d: exactly one entry", g, off), entry_count, 32'd1);
+            chk($sformatf("g=%0d off=%0d: exactly one NMI ack", g, off), nmi_ack_count[31:0], 32'd1);
+            chk($sformatf("g=%0d off=%0d: handler ran once", g, off), gpr(13), 32'd1);
+            chk($sformatf("g=%0d off=%0d: accumulator transparent", g, off), gpr(2), 32'd8);
+            chk($sformatf("g=%0d off=%0d: load-back transparent", g, off), gpr(4), 32'd8);
+            chk($sformatf("g=%0d off=%0d: cold-miss load transparent", g, off), gpr(9), 32'd0);
+            chk($sformatf("g=%0d off=%0d: slot count transparent", g, off), gpr(6), 32'd8);
+            chk($sformatf("g=%0d off=%0d: loop count consumed", g, off), gpr(5), 32'd0);
+            chk_true($sformatf("g=%0d off=%0d: no spurious exception", g, off), !exc_seen);
+            chk("INTEVT = EV_NMI", intevt_o, 32'h0000_01C0);
+            chk_true($sformatf("g=%0d off=%0d: SPC is never the delay slot (spc=%08h)", g, off, entry_spc_l),
+                     entry_spc_l[11:0] != 12'h06E);
+        end
+        end
+        do_reset;
+        end_test;
+    end
+endtask
+
+//GOLDEN Y4 - NMI and INT pending on the SAME edge: NMI must win, and the loser must
+//NOT be lost - it stays pending (its ack never fired) and enters after the NMI
+//handler's RTE restores BL=0. The handler logs INTEVT per entry into R12.
+task automatic test_nmi_int_order;
+    integer off, w;
+    begin
+        begin_test("NMI+INT same edge: NMI first, INT preserved and entered second (offset sweep)");
+        for(off = 0; off < 25; off = off + 1) begin
+            cacheable_bootstrap(8'h09);
+            imem['h20] = 16'hE860;  // MOV    #0x60,R8 ; BL-clear prologue
+            imem['h21] = 16'h4818;  // SHLL8  R8
+            imem['h22] = 16'h4828;  // SHLL16 R8
+            imem['h23] = 16'h480E;  // LDC    R8,SR
+            imem['h24] = 16'hED00;  // MOV   #0,R13   ; entry counter
+            imem['h25] = 16'hEC00;  // MOV   #0,R12   ; INTEVT sequence log
+            imem['h26] = 16'hEB00;  // MOV   #0,R11   ; work counter
+            imem['h27] = 16'h7B01;  // ADD   #1,R11   ; 12 work slots
+            imem['h28] = 16'h7B01;
+            imem['h29] = 16'h7B01;
+            imem['h2A] = 16'h7B01;
+            imem['h2B] = 16'h7B01;
+            imem['h2C] = 16'h7B01;
+            imem['h2D] = 16'h7B01;
+            imem['h2E] = 16'h7B01;
+            imem['h2F] = 16'h7B01;
+            imem['h30] = 16'h7B01;
+            imem['h31] = 16'h7B01;
+            imem['h32] = 16'h7B01;
+            imem['h33] = 16'h0009;  // sentinel
+            imem['h34] = 16'hAFFE;  // guard
+            imem['h35] = 16'h0009;
+            //VBR+0x600 handler: shift the logged sequence, append this entry's INTEVT.
+            imem['h300] = 16'h4C28; // SHLL16 R12
+            imem['h301] = 16'hE0D8; // MOV   #0xD8,R0 ; 0xFFFFFFD8 = INTEVT
+            imem['h302] = 16'h6A02; // MOV.L @R0,R10
+            imem['h303] = 16'h2CAB; // OR    R10,R12
+            imem['h304] = 16'h7D01; // ADD   #1,R13
+            imem['h305] = 16'h002B; // RTE
+            imem['h306] = 16'h0009; //   delay slot
+            do_reset;
+            run_until_retire('h26, 20000);
+            repeat(off) @(posedge clk);
+            //Both requests raised on the SAME edge.
+            int_level_q = 4'd8;
+            int_code_q  = 12'h600;
+            int_valid_q = 1'b1;
+            nmi_valid_q = 1'b1;
+            w = 0;
+            while(nmi_ack_count == 0 && w < 20000) begin @(posedge clk); w = w + 1; end
+            @(posedge clk);
+            nmi_valid_q = 1'b0;
+            w = 0;
+            while(int_ack_count == 0 && w < 20000) begin @(posedge clk); w = w + 1; end
+            @(posedge clk);
+            int_valid_q = 1'b0;
+            run_until_retire('h33, 20000);
+            w = 0;
+            while(gpr(13) != 32'd2 && w < 20000) begin @(posedge clk); w = w + 1; end
+            run_cycles(30);
+            chk($sformatf("off=%0d: exactly two entries", off), entry_count, 32'd2);
+            chk($sformatf("off=%0d: one NMI ack", off), nmi_ack_count[31:0], 32'd1);
+            chk($sformatf("off=%0d: one INT ack (never lost)", off), int_ack_count[31:0], 32'd1);
+            chk($sformatf("off=%0d: handler ran twice", off), gpr(13), 32'd2);
+            chk($sformatf("off=%0d: order NMI(0x1C0) then INT(0x600)", off), gpr(12), 32'h01C0_0600);
+            chk($sformatf("off=%0d: work transparent", off), gpr(11), 32'd12);
+            chk_true($sformatf("off=%0d: no spurious exception", off), !exc_seen);
+        end
+        do_reset;
+        end_test;
+    end
+endtask
+
+//GOLDEN Y5 - NMI vs locked TAS.B RMW: the atomicity laws must hold under the NMI
+//arm exactly as under INT (same defer machinery, different accept path).
+task automatic test_nmi_tas_atomic;
+    integer dl, off, w, e0;
+    begin
+        begin_test("NMI vs TAS.B: locked RMW is indivisible and exactly-once (offset sweep)");
+        for(dl = 0; dl <= 6; dl = dl + 6) begin
+        for(off = 0; off < 35; off = off + 1) begin
+            cacheable_bootstrap(8'h09);
+            d_latency = dl;
+            imem['h20] = 16'hE860;  // MOV    #0x60,R8 ; BL-clear prologue
+            imem['h21] = 16'h4818;  // SHLL8  R8
+            imem['h22] = 16'h4828;  // SHLL16 R8
+            imem['h23] = 16'h480E;  // LDC    R8,SR
+            imem['h24] = 16'hED00;  // MOV   #0,R13
+            imem['h25] = 16'hE118;  // MOV   #0x18,R1
+            imem['h26] = 16'h4108;  // SHLL2 R1
+            imem['h27] = 16'h4108;  // SHLL2 R1       ; R1 = 0x180
+            imem['h28] = 16'hE400;  // MOV   #0,R4
+            imem['h29] = 16'hE600;  // MOV   #0,R6    ; anchor
+            imem['h2A] = 16'h0009;  // NOP
+            imem['h2B] = 16'h0009;  // NOP
+            imem['h2C] = 16'h0009;  // NOP
+            imem['h2D] = 16'h411B;  // TAS.B @R1      ; locked RMW #1
+            imem['h2E] = 16'h0429;  // MOVT  R4
+            imem['h2F] = 16'h411B;  // TAS.B @R1      ; locked RMW #2
+            imem['h30] = 16'h0629;  // MOVT  R6
+            imem['h31] = 16'h0009;  // sentinel
+            imem['h32] = 16'hAFFE;  // guard
+            imem['h33] = 16'h0009;
+            imem['h300] = 16'h7D01; // ADD   #1,R13   ; VBR+0x600 handler
+            imem['h301] = 16'h002B; // RTE
+            imem['h302] = 16'h0009; //   delay slot
+            do_reset;
+            e0 = test_errors;
+            dmem['h60] = 32'h0000_0041;   //byte 0x180 = 0x00 (big-endian MSB lane)
+            run_until_retire('h29, 30000);
+            repeat(off) @(posedge clk);
+            nmi_valid_q = 1'b1;
+            w = 0;
+            while(entry_count == 0 && w < 20000) begin @(posedge clk); w = w + 1; end
+            @(posedge clk);
+            nmi_valid_q = 1'b0;
+            run_until_retire('h301, 20000);
+            run_until_retire('h31, 20000);
+            chk($sformatf("dl=%0d off=%0d: TAS#1 saw the pre-RMW byte once (T=1)", dl, off), gpr(4), 32'd1);
+            chk($sformatf("dl=%0d off=%0d: TAS#2 saw bit7 already set (T=0)", dl, off), gpr(6), 32'd0);
+            chk($sformatf("dl=%0d off=%0d: memory byte mutated exactly once", dl, off), dmem['h60], 32'h8000_0041);
+            chk($sformatf("dl=%0d off=%0d: locked reads paired", dl, off), locked_read_count, 32'd2);
+            chk($sformatf("dl=%0d off=%0d: locked writes paired", dl, off), locked_write_count, 32'd2);
+            chk($sformatf("dl=%0d off=%0d: exactly one entry", dl, off), entry_count, 32'd1);
+            chk($sformatf("dl=%0d off=%0d: handler ran once", dl, off), gpr(13), 32'd1);
+            chk("INTEVT = EV_NMI", intevt_o, 32'h0000_01C0);
+            chk_true($sformatf("dl=%0d off=%0d: no spurious exception", dl, off), !exc_seen);
+            if(test_errors != e0)
+                $display("      [dbg] EXPEVT=%08h INTEVT=%08h SR=%08h SPC=%08h entries=%0d nmiack=%0d cstate=%0d",
+                         expevt_o, intevt_o, sr, spc_o, entry_count, nmi_ack_count, u_dut.u_cache.state);
+        end
+        end
+        do_reset;
+        end_test;
+    end
+endtask
+
+//GOLDEN Y6 - two exception flavors the 4-flavor collision test does not cover:
+//an I-FILL FAULT (fetch-side fault path: fault_hold / ifid fault mark, a different
+//kill machinery than the D-side busfault) and a SLOT-ILLEGAL (0x1A0: the delayed
+//pair's own defer arm colliding with a general exception). Same laws: each event
+//exactly once, EXPEVT/INTEVT never mixed, tail executes exactly once.
+task automatic test_exc_int_collision2;
+    integer f, lat, off, w, e0;
+    string  fname;
+    begin
+        begin_test("Exception x interrupt collision 2: I-fill fault and slot-illegal flavors");
+        for(f = 0; f < 2; f = f + 1) begin
+            fname = (f == 0) ? "ifill" : "slotill";
+        for(lat = 0; lat <= 2; lat = lat + 2) begin
+        for(off = 0; off < 25; off = off + 1) begin
+            cacheable_bootstrap(8'h09);
+            i_latency = lat;
+            d_latency = lat;
+            imem['h20] = 16'hE860;  // MOV    #0x60,R8 ; BL-clear prologue
+            imem['h21] = 16'h4818;  // SHLL8  R8
+            imem['h22] = 16'h4828;  // SHLL16 R8
+            imem['h23] = 16'h480E;  // LDC    R8,SR
+            imem['h24] = 16'hED00;  // MOV   #0,R13   ; interrupt handler counter
+            imem['h25] = 16'hEB00;  // MOV   #0,R11   ; exception handler counter
+            imem['h26] = 16'hE200;  // MOV   #0,R2
+            imem['h27] = 16'hE304;  // MOV   #4,R3
+            imem['h28] = 16'h4318;  // SHLL8 R3       ; R3 = 0x400 (pre-dec store target)
+            imem['h29] = 16'h7201;  // ADD   #1,R2    ; anchor: arm fault + interrupt after this
+            if(f == 0) begin
+                //F sits alone in line 0xC0, 3 cold I-lines past the anchor: the fill
+                //fault is armed at the swept offset, long before fetch reaches it.
+                imem['h2A] = 16'h7201;  // ADD   #1,R2   ; second counted ADD
+                //'h2B..'h5F NOP filler (two more cold lines to cross)
+                imem['h60] = 16'h0009;  // F: fetch of THIS line faults at beat 0
+                imem['h61] = 16'h7201;  // G: ADD #1,R2 (runs after the skip handler)
+                imem['h62] = 16'h2326;  // MOV.L R2,@-R3  ; double-execution detector
+                imem['h63] = 16'h6432;  // MOV.L @R3,R4   ; load-back
+                imem['h64] = 16'h0009;  // sentinel
+                imem['h65] = 16'hAFFE;  // guard
+                imem['h66] = 16'h0009;
+                //General-exception handler (VBR+0x100): count, skip F (SPC+2).
+                imem['h80] = 16'h0942;  // STC SPC,R9
+                imem['h81] = 16'h7902;  // ADD #2,R9
+                imem['h82] = 16'h494E;  // LDC R9,SPC
+                imem['h83] = 16'h7B01;  // ADD #1,R11
+                imem['h84] = 16'h002B;  // RTE
+                imem['h85] = 16'h0009;  //   delay slot
+            end
+            else begin
+                imem['h2A] = 16'h7201;  // ADD   #1,R2   ; second counted ADD
+                imem['h2B] = 16'hE700;  // MOV   #0,R7   ; poison detector (GPRs persist reset!)
+                imem['h2C] = 16'hA005;  // F: BRA +5 (target = poison 'h33)
+                imem['h2D] = 16'hF000;  //   slot: ILLEGAL -> EXC_ILLEGAL_SLOT 0x1A0, SPC=F
+                imem['h2E] = 16'h2326;  // tail: MOV.L R2,@-R3 (handler redirects here)
+                imem['h2F] = 16'h6432;  // MOV.L @R3,R4
+                imem['h30] = 16'h0009;  // sentinel
+                imem['h31] = 16'hAFFE;  // guard ('h32 NOP is its DELAY SLOT - keep it clean)
+                imem['h32] = 16'h0009;
+                imem['h33] = 16'hE77F;  // poison: BRA target - must NEVER execute
+                imem['h34] = 16'hAFFE;  // guard 2
+                imem['h35] = 16'h0009;  //   its delay slot
+                //General-exception handler: count, redirect PAST the broken pair.
+                imem['h80] = 16'hE95C;  // MOV #0x5C,R9   ; tail address ('h2E)
+                imem['h81] = 16'h494E;  // LDC R9,SPC
+                imem['h82] = 16'h7B01;  // ADD #1,R11
+                imem['h83] = 16'h002B;  // RTE
+                imem['h84] = 16'h0009;  //   delay slot
+            end
+            imem['h300] = 16'h7D01; // ADD   #1,R13   ; VBR+0x600 interrupt handler
+            imem['h301] = 16'h002B; // RTE
+            imem['h302] = 16'h0009; //   delay slot
+            do_reset;
+            e0 = test_errors;
+            dbg_trace = $test$plusargs("traceslot") && (f == 1) && (lat == 0) && (off == 0);
+            run_until_retire('h29, 30000);
+            repeat(off) @(posedge clk);
+            if(f == 0) begin
+                if_fault_en   = 1'b1;
+                if_fault_widx = 11'h60;   //halfword index of F (byte 0xC0, fill beat 0)
+            end
+            int_level_q = 4'd8;
+            int_code_q  = 12'h600;
+            int_valid_q = 1'b1;
+            w = 0;
+            while(int_ack_count == 0 && w < 20000) begin @(posedge clk); w = w + 1; end
+            @(posedge clk);
+            int_valid_q = 1'b0;
+            w = 0;
+            while(!exc_seen && w < 20000) begin @(posedge clk); w = w + 1; end
+            if(f == 0) begin @(posedge clk); if_fault_en = 1'b0; end
+            run_until_retire((f == 0) ? 'h64 : 'h30, 30000);
+            w = 0;
+            while(gpr(13) == 32'd0 && w < 20000) begin @(posedge clk); w = w + 1; end
+            run_cycles(30);
+            chk($sformatf("%s lat=%0d off=%0d: interrupt ack'd exactly once", fname, lat, off), int_ack_count, 32'd1);
+            chk($sformatf("%s lat=%0d off=%0d: interrupt handler ran exactly once", fname, lat, off), gpr(13), 32'd1);
+            chk($sformatf("%s lat=%0d off=%0d: exception handler ran exactly once", fname, lat, off), gpr(11), 32'd1);
+            chk($sformatf("%s lat=%0d off=%0d: exactly two entries", fname, lat, off), entry_count, 32'd2);
+            chk($sformatf("%s lat=%0d off=%0d: INTEVT", fname, lat, off), intevt_o, 32'h0000_0600);
+            chk($sformatf("%s lat=%0d off=%0d: mainline result transparent", fname, lat, off), gpr(2),
+                (f == 0) ? 32'd3 : 32'd2);      //ifill: G runs after the skip; slotill: no G
+            chk($sformatf("%s lat=%0d off=%0d: pre-dec store executed once", fname, lat, off), gpr(3), 32'h0000_03FC);
+            chk($sformatf("%s lat=%0d off=%0d: stored word load-back", fname, lat, off), gpr(4),
+                (f == 0) ? 32'd3 : 32'd2);
+            if(f == 0) begin
+                chk($sformatf("%s lat=%0d off=%0d: EXPEVT (read fault)", fname, lat, off), expevt_o, 32'h0000_00E0);
+                chk($sformatf("%s lat=%0d off=%0d: cause", fname, lat, off), {29'd0, exc_cause_l}, {29'd0, EXC_IFETCH});
+                chk($sformatf("%s lat=%0d off=%0d: exc pc = F", fname, lat, off), exc_pc_l, 32'h0000_00C0);
+                chk($sformatf("%s lat=%0d off=%0d: TEA = faulting fetch", fname, lat, off), tea_o, 32'h0000_00C0);
+            end
+            else begin
+                chk($sformatf("%s lat=%0d off=%0d: EXPEVT (illegal slot)", fname, lat, off), expevt_o, 32'h0000_01A0);
+                chk($sformatf("%s lat=%0d off=%0d: slot flag latched", fname, lat, off), {31'd0, exc_delay_l}, 32'd1);
+                chk($sformatf("%s lat=%0d off=%0d: poison never executed", fname, lat, off), gpr(7), 32'd0);
+            end
+            if(test_errors != e0)
+                $display("      [dbg] EXPEVT=%08h INTEVT=%08h TEA=%08h SPC=%08h entries=%0d ack=%0d R2=%0d R11=%0d R13=%0d epc=%08h",
+                         expevt_o, intevt_o, tea_o, spc_o, entry_count, int_ack_count,
+                         gpr(2), gpr(11), gpr(13), exc_pc_l);
+        end
+        end
+        end
+        do_reset;
+        end_test;
+    end
+endtask
+
+//GOLDEN Y7 - interrupt vs the CCR.CF flush walk (256-set S_FLUSH excursion, the
+//longest the cache has; the CCR write itself is a notify-at-accept MMIO store).
+//End state is offset-invariant: dirty data discarded, one entry, no deadlock.
+task automatic test_int_flush_collision;
+    integer off, w;
+    begin
+        begin_test("Interrupt vs CCR.CF flush walk: one entry, discard law holds, no deadlock");
+        for(off = 0; off < 300; off = off + 6) begin
+            cacheable_bootstrap(8'h09);
+            imem['h20] = 16'hE860;  // MOV    #0x60,R8 ; BL-clear prologue
+            imem['h21] = 16'h4818;  // SHLL8  R8
+            imem['h22] = 16'h4828;  // SHLL16 R8
+            imem['h23] = 16'h480E;  // LDC    R8,SR
+            imem['h24] = 16'hED00;  // MOV   #0,R13
+            imem['h25] = 16'hE101;  // MOV   #1,R1
+            imem['h26] = 16'h4118;  // SHLL8 R1       ; R1 = 0x100
+            imem['h27] = 16'hE202;  // MOV   #2,R2
+            imem['h28] = 16'h4218;  // SHLL8 R2       ; R2 = 0x200
+            imem['h29] = 16'hE977;  // MOV   #0x77,R9 ; anchor
+            imem['h2A] = 16'h2192;  // MOV.L R9,@R1   ; dirty line A (WB write-allocate)
+            imem['h2B] = 16'h2292;  // MOV.L R9,@R2   ; dirty line B
+            imem['h2C] = 16'hE0EC;  // MOV   #0xEC,R0 ; CCR (0xFFFFFFEC)
+            imem['h2D] = 16'hE509;  // MOV   #9,R5    ; CE|CF
+            imem['h2E] = 16'h2052;  // MOV.L R5,@R0   ; FLUSH WALK - dirty data discarded
+            imem['h2F] = 16'h6412;  // MOV.L @R1,R4   ; reload A: memory truth (0)
+            imem['h30] = 16'h6522;  // MOV.L @R2,R5   ; reload B: memory truth (0)
+            imem['h31] = 16'h0009;  // sentinel
+            imem['h32] = 16'hAFFE;  // guard
+            imem['h33] = 16'h0009;
+            imem['h300] = 16'h7D01; // ADD   #1,R13   ; VBR+0x600 handler
+            imem['h301] = 16'h002B; // RTE
+            imem['h302] = 16'h0009; //   delay slot
+            do_reset;
+            run_until_retire('h29, 30000);
+            repeat(off) @(posedge clk);
+            int_level_q = 4'd8;
+            int_code_q  = 12'h600;
+            int_valid_q = 1'b1;
+            w = 0;
+            while(entry_count == 0 && w < 20000) begin @(posedge clk); w = w + 1; end
+            @(posedge clk);
+            int_valid_q = 1'b0;
+            run_until_retire('h31, 60000);
+            chk($sformatf("off=%0d: exactly one entry", off), entry_count, 32'd1);
+            chk($sformatf("off=%0d: handler ran once", off), gpr(13), 32'd1);
+            chk($sformatf("off=%0d: dirty A discarded (reload=mem truth)", off), gpr(4), 32'd0);
+            chk($sformatf("off=%0d: dirty B discarded (reload=mem truth)", off), gpr(5), 32'd0);
+            chk($sformatf("off=%0d: A never drained to memory", off), dmem['h40], 32'd0);
+            chk($sformatf("off=%0d: B never drained to memory", off), dmem['h80], 32'd0);
+            chk_true($sformatf("off=%0d: no spurious exception", off), !exc_seen);
+            chk("INTEVT carries the driven code", intevt_o, 32'h0000_0600);
+        end
+        do_reset;
+        end_test;
+    end
+endtask
+
+//GOLDEN Y8 - interrupt vs memory-mapped array access (S_MMTAG/S_MMDATA dispatch:
+//mm ops are D-side accesses, so the accept-edge vs acceptance-edge race is live).
+//Reads a dirty line's tag/data through the 0xF0/0xF1 windows, then an ASSOCIATIVE
+//PURGE (write-back + invalidate, p.112-114); end state is offset-invariant.
+task automatic test_int_mm_collision;
+    integer off, w, e0;
+    begin
+        begin_test("Interrupt vs mm tag/data access + assoc purge: transparent at every offset");
+        for(off = 0; off < 40; off = off + 1) begin
+            cacheable_bootstrap(8'h09);
+            imem['h20] = 16'hE860;  // MOV    #0x60,R8 ; BL-clear prologue
+            imem['h21] = 16'h4818;  // SHLL8  R8
+            imem['h22] = 16'h4828;  // SHLL16 R8
+            imem['h23] = 16'h480E;  // LDC    R8,SR
+            imem['h24] = 16'hED00;  // MOV   #0,R13
+            imem['h25] = 16'hE101;  // MOV   #1,R1
+            imem['h26] = 16'h4118;  // SHLL8 R1       ; R1 = 0x100 (set 0x10)
+            imem['h27] = 16'hE95A;  // MOV   #0x5A,R9
+            imem['h28] = 16'h2192;  // MOV.L R9,@R1   ; dirty the line (way 3 post-flush)
+            imem['h29] = 16'hE0F0;  // MOV   #0xF0,R0
+            imem['h2A] = 16'h4018;  // SHLL8 R0
+            imem['h2B] = 16'h4028;  // SHLL16 R0      ; R0 = 0xF0000000
+            imem['h2C] = 16'h6703;  // MOV   R0,R7    ; keep the window base
+            imem['h2D] = 16'hE431;  // MOV   #0x31,R4
+            imem['h2E] = 16'h4418;  // SHLL8 R4       ; R4 = 0x3100 (way 3, set 0x10)
+            imem['h2F] = 16'h304C;  // ADD   R4,R0    ; R0 = 0xF0003100 (mm TAG address)
+            imem['h30] = 16'hE6F1;  // MOV   #0xF1,R6
+            imem['h31] = 16'h4618;  // SHLL8 R6
+            imem['h32] = 16'h4628;  // SHLL16 R6      ; R6 = 0xF1000000
+            imem['h33] = 16'h364C;  // ADD   R4,R6    ; R6 = 0xF1003100 (mm DATA word 0)
+            imem['h34] = 16'hE801;  // MOV   #1,R8    ; (R8 free after the prologue LDC)
+            imem['h35] = 16'h4818;  // SHLL8 R8
+            imem['h36] = 16'h7808;  // ADD   #8,R8    ; 0x108
+            imem['h37] = 16'h387C;  // ADD   R7,R8    ; R8 = 0xF0000108 (assoc bit set)
+            imem['h38] = 16'hE500;  // MOV   #0,R5    ; purge wdata: tag=0, U=0, V=0 (anchor)
+            imem['h39] = 16'h6A02;  // MOV.L @R0,R10  ; mm tag read (swept window from here)
+            imem['h3A] = 16'h6B62;  // MOV.L @R6,R11  ; mm data read
+            imem['h3B] = 16'h6A02;  // MOV.L @R0,R10  ; repeat: more dispatch edges
+            imem['h3C] = 16'h6B62;  // MOV.L @R6,R11
+            imem['h3D] = 16'h2852;  // MOV.L R5,@R8   ; ASSOCIATIVE PURGE (drain + invalidate)
+            imem['h3E] = 16'h6C12;  // MOV.L @R1,R12  ; reload: memory truth = drained 0x5A
+            imem['h3F] = 16'h0009;  // sentinel
+            imem['h40] = 16'hAFFE;  // guard
+            imem['h41] = 16'h0009;
+            imem['h300] = 16'h7D01; // ADD   #1,R13   ; VBR+0x600 handler
+            imem['h301] = 16'h002B; // RTE
+            imem['h302] = 16'h0009; //   delay slot
+            do_reset;
+            e0 = test_errors;
+            run_until_retire('h38, 30000);
+            repeat(off) @(posedge clk);
+            int_level_q = 4'd8;
+            int_code_q  = 12'h600;
+            int_valid_q = 1'b1;
+            w = 0;
+            while(entry_count == 0 && w < 20000) begin @(posedge clk); w = w + 1; end
+            @(posedge clk);
+            int_valid_q = 1'b0;
+            run_until_retire('h3F, 60000);
+            chk($sformatf("off=%0d: exactly one entry", off), entry_count, 32'd1);
+            chk($sformatf("off=%0d: handler ran once", off), gpr(13), 32'd1);
+            chk($sformatf("off=%0d: mm tag read V=1,U=1,tag=0 (LRU masked)", off),
+                gpr(10) & ~32'h0000_03F0, 32'h0000_0003);
+            chk($sformatf("off=%0d: mm data read returns the stored word", off), gpr(11), 32'h0000_005A);
+            chk($sformatf("off=%0d: purge drained then invalidated (reload=0x5A)", off), gpr(12), 32'h0000_005A);
+            chk($sformatf("off=%0d: purge write-back reached memory", off), dmem['h40], 32'h0000_005A);
+            chk_true($sformatf("off=%0d: no spurious exception", off), !exc_seen);
+            if(test_errors != e0)
+                $display("      [dbg] R10=%08h R11=%08h R12=%08h dmem40=%08h entries=%0d cstate=%0d",
+                         gpr(10), gpr(11), gpr(12), dmem['h40], entry_count, u_dut.u_cache.state);
+        end
+        do_reset;
+        end_test;
+    end
+endtask
+
+//GOLDEN Y9 - interrupt vs in-flight PREF fills (fire-and-forget: no response is
+//owed, and a squashed PREF must be inert). Phase 1 adds a FAULTING PREF fill:
+//PREF must never raise an exception, interrupt or not (p.106 no-fault law).
+task automatic test_int_pref_collision;
+    integer ph, off, w;
+    begin
+        begin_test("Interrupt vs PREF fills (clean + faulting): inert, exactly-once, no deadlock");
+        for(ph = 0; ph < 2; ph = ph + 1) begin
+        for(off = 0; off < 40; off = off + 2) begin
+            cacheable_bootstrap(8'h09);
+            imem['h20] = 16'hE860;  // MOV    #0x60,R8 ; BL-clear prologue
+            imem['h21] = 16'h4818;  // SHLL8  R8
+            imem['h22] = 16'h4828;  // SHLL16 R8
+            imem['h23] = 16'h480E;  // LDC    R8,SR
+            imem['h24] = 16'hED00;  // MOV   #0,R13
+            imem['h25] = 16'hE202;  // MOV   #2,R2
+            imem['h26] = 16'h4218;  // SHLL8 R2       ; R2 = 0x200 (first PREF line)
+            imem['h27] = 16'hE640;  // MOV   #0x40,R6 ; line stride
+            imem['h28] = 16'hEB00;  // MOV   #0,R11
+            imem['h29] = 16'hEC06;  // MOV   #6,R12   ; 6 PREF excursions (anchor)
+            imem['h2A] = 16'h0283;  // PREF  @R2      ; fire-and-forget fill
+            imem['h2B] = 16'h326C;  // ADD   R6,R2
+            imem['h2C] = 16'h7B01;  // ADD   #1,R11
+            imem['h2D] = 16'h4C10;  // DT    R12
+            imem['h2E] = 16'h8FFA;  // BF/S  loop ('h2A)
+            imem['h2F] = 16'h0009;  //   delay slot
+            imem['h30] = 16'hE101;  // MOV   #1,R1
+            imem['h31] = 16'h4118;  // SHLL8 R1       ; R1 = 0x100
+            imem['h32] = 16'h6412;  // MOV.L @R1,R4   ; plain load (transparency)
+            imem['h33] = 16'h0009;  // sentinel
+            imem['h34] = 16'hAFFE;  // guard
+            imem['h35] = 16'h0009;
+            imem['h300] = 16'h7D01; // ADD   #1,R13   ; VBR+0x600 handler
+            imem['h301] = 16'h002B; // RTE
+            imem['h302] = 16'h0009; //   delay slot
+            if(ph == 1) begin
+                d_fault_en   = 1'b1;
+                d_fault_widx = 8'hA0;     //PREF line 0x280 fill beat 0 faults
+            end
+            do_reset;
+            if(ph == 1) begin d_fault_en = 1'b1; d_fault_widx = 8'hA0; end //do_reset knob-safe
+            run_until_retire('h29, 30000);
+            repeat(off) @(posedge clk);
+            int_level_q = 4'd8;
+            int_code_q  = 12'h600;
+            int_valid_q = 1'b1;
+            w = 0;
+            while(entry_count == 0 && w < 20000) begin @(posedge clk); w = w + 1; end
+            @(posedge clk);
+            int_valid_q = 1'b0;
+            run_until_retire('h33, 60000);
+            d_fault_en = 1'b0;
+            chk($sformatf("ph=%0d off=%0d: exactly one entry", ph, off), entry_count, 32'd1);
+            chk($sformatf("ph=%0d off=%0d: handler ran once", ph, off), gpr(13), 32'd1);
+            chk($sformatf("ph=%0d off=%0d: loop transparent", ph, off), gpr(11), 32'd6);
+            chk($sformatf("ph=%0d off=%0d: loop count consumed", ph, off), gpr(12), 32'd0);
+            chk($sformatf("ph=%0d off=%0d: plain load transparent", ph, off), gpr(4), 32'd0);
+            chk_true($sformatf("ph=%0d off=%0d: PREF never faults architecturally", ph, off), !exc_seen);
+            chk("INTEVT carries the driven code", intevt_o, 32'h0000_0600);
+        end
+        end
+        do_reset;
+        end_test;
+    end
+endtask
+
+//GOLDEN Z1 - CCR.WT flip with a dirty line resident (pp.104-106). The WB-dirtied
+//word is never drained by the mode flip nor by a WT store HIT on the same line;
+//the WT store writes through its own word only; CCR.CF then discards the rest.
+task automatic test_wt_flip_dirty;
+    begin
+        begin_test("CCR.WT flip on a dirty line: WT hit writes through, dirty word still discards");
+        cacheable_bootstrap(8'h09);              //start in write-back mode
+        imem['h20] = 16'hE101;  // MOV   #1,R1
+        imem['h21] = 16'h4118;  // SHLL8 R1       ; R1 = 0x100 (word 0 of the line)
+        imem['h22] = 16'hE277;  // MOV   #0x77,R2
+        imem['h23] = 16'h2122;  // MOV.L R2,@R1   ; WB store: line dirty, memory stale
+        imem['h24] = 16'hE366;  // MOV   #0x66,R3
+        imem['h25] = 16'h6813;  // MOV   R1,R8
+        imem['h26] = 16'h7804;  // ADD   #4,R8    ; R8 = 0x104 (word 1, same line)
+        imem['h27] = 16'hE0EC;  // MOV   #0xEC,R0 ; CCR
+        imem['h28] = 16'hE503;  // MOV   #3,R5    ; CE|WT - NO flush
+        imem['h29] = 16'h2052;  // MOV.L R5,@R0   ; flip to write-through, dirty line resident
+        imem['h2A] = 16'h0009;  // NOP
+        imem['h2B] = 16'h2832;  // MOV.L R3,@R8   ; WT store HIT on the dirty line (word 1)
+        imem['h2C] = 16'h0009;  // NOP
+        imem['h2D] = 16'h6982;  // MOV.L @R8,R9   ; cache readback of the WT-stored word
+        imem['h2E] = 16'h0009;  // mid-point marker (tb checks memory truth here)
+        imem['h2F] = 16'hE60B;  // MOV   #0x0B,R6 ; CE|WT|CF
+        imem['h30] = 16'h2062;  // MOV.L R6,@R0   ; flush walk: DISCARD (word 0 lost)
+        imem['h31] = 16'h6712;  // MOV.L @R1,R7   ; reload word 0: memory truth
+        imem['h32] = 16'h6A82;  // MOV.L @R8,R10  ; reload word 1: written-through value
+        imem['h33] = 16'h0009;  // sentinel
+        imem['h34] = 16'hAFFE;  // guard
+        imem['h35] = 16'h0009;
+        do_reset;
+        run_until_retire('h2E, 30000);
+        run_cycles(30);                          //let the posted write-through land
+        chk("WT hit readback from the line", gpr(9), 32'h0000_0066);
+        chk("WT store wrote through word 1", dmem['h41], 32'h0000_0066);
+        chk("dirty word 0 NOT drained by the flip or the WT hit", dmem['h40], 32'd0);
+        run_until_retire('h33, 30000);
+        chk("word 0 reload = memory truth (dirty discarded)", gpr(7), 32'd0);
+        chk("word 1 reload = written-through value", gpr(10), 32'h0000_0066);
+        chk("word 0 never reached memory", dmem['h40], 32'd0);
+        chk_true("no spurious exception", !exc_seen);
+        do_reset;
+        end_test;
+    end
+endtask
+
+//GOLDEN Z2 - memory-mapped array LAW SUITE (p.112-114). The 0xF0/0xF1 windows have
+//only been used as a tool (wb_alias); this locks the full matrix: tag read-back
+//V/U, mm data write visibility, assoc-purge miss/hit-clean/hit-dirty, and the
+//non-assoc write's drain-before-write behavior on a dirty entry. Two phases with
+//WRITE-ONCE result registers, all checks after the sentinel (the pipe runs ~7
+//words past a retire marker, so mid-run same-register sampling races).
+task automatic test_mm_array_laws;
+    begin
+        begin_test("mm tag/data array laws: readback, purge matrix, non-assoc dirty drain");
+        //Phase A: tag readback clean/dirty, mm data poke, assoc-purge MISS no-op.
+        cacheable_bootstrap(8'h09);
+        imem['h20] = 16'hE101;  // MOV   #1,R1
+        imem['h21] = 16'h4118;  // SHLL8 R1       ; R1 = 0x100 line A (set 0x10)
+        imem['h22] = 16'hE0F0;  // MOV   #0xF0,R0
+        imem['h23] = 16'h4018;  // SHLL8 R0
+        imem['h24] = 16'h4028;  // SHLL16 R0      ; R0 = 0xF0000000
+        imem['h25] = 16'h6703;  // MOV   R0,R7    ; tag window base
+        imem['h26] = 16'hE4F1;  // MOV   #0xF1,R4
+        imem['h27] = 16'h4418;  // SHLL8 R4
+        imem['h28] = 16'h4428;  // SHLL16 R4      ; R4 = 0xF1000000 data window base
+        imem['h29] = 16'hE931;  // MOV   #0x31,R9
+        imem['h2A] = 16'h4918;  // SHLL8 R9       ; R9 = 0x3100 (way 3, set 0x10)
+        imem['h2B] = 16'h6512;  // MOV.L @R1,R5   ; (1) fill A clean
+        imem['h2C] = 16'h6873;  // MOV   R7,R8
+        imem['h2D] = 16'h389C;  // ADD   R9,R8    ; R8 = 0xF0003100 (tag A)
+        imem['h2E] = 16'h6A82;  // MOV.L @R8,R10  ; (1) clean tag read -> R10
+        imem['h2F] = 16'hE633;  // MOV   #0x33,R6
+        imem['h30] = 16'h2162;  // MOV.L R6,@R1   ; (2) store: U=1
+        imem['h31] = 16'h6B82;  // MOV.L @R8,R11  ; (2) dirty tag read -> R11
+        imem['h32] = 16'h6C43;  // MOV   R4,R12
+        imem['h33] = 16'h3C9C;  // ADD   R9,R12   ; R12 = 0xF1003100 (data A word 0)
+        imem['h34] = 16'hE655;  // MOV   #0x55,R6
+        imem['h35] = 16'h2C62;  // MOV.L R6,@R12  ; (3) poke the data array directly
+        imem['h36] = 16'h6D12;  // MOV.L @R1,R13  ; (3) cached load: hit -> 0x55 -> R13
+        imem['h37] = 16'hE801;  // MOV   #1,R8
+        imem['h38] = 16'h4818;  // SHLL8 R8
+        imem['h39] = 16'h7808;  // ADD   #8,R8    ; 0x108
+        imem['h3A] = 16'h387C;  // ADD   R7,R8    ; R8 = 0xF0000108 (A=1, set 0x10)
+        imem['h3B] = 16'hE504;  // MOV   #4,R5
+        imem['h3C] = 16'h4518;  // SHLL8 R5       ; R5 = 0x400: tag field 1, no match
+        imem['h3D] = 16'h2852;  // MOV.L R5,@R8   ; (4) assoc purge MISS: no-op
+        imem['h3E] = 16'h6E12;  // MOV.L @R1,R14  ; (4) still hits -> 0x55 -> R14
+        imem['h3F] = 16'h0009;  // sentinel
+        imem['h40] = 16'hAFFE;  // guard
+        imem['h41] = 16'h0009;
+        do_reset;
+        run_until_retire('h3F, 30000);
+        run_cycles(40);                          //any (wrong) drain would have landed
+        chk("(1) clean tag read: V=1 U=0 tag=0 (LRU masked)", gpr(10) & ~32'h0000_03F0, 32'h0000_0001);
+        chk("(2) dirty tag read: V=1 U=1",                    gpr(11) & ~32'h0000_03F0, 32'h0000_0003);
+        chk("(3) mm data poke visible to a cached load",      gpr(13), 32'h0000_0055);
+        chk("(4) purge miss: line still hits",                gpr(14), 32'h0000_0055);
+        chk("(4) purge miss: no drain",                       dmem['h40], 32'd0);
+        chk_true("phase A: no spurious exception", !exc_seen);
+        //Phase B: assoc purge HIT dirty (drain+invalidate), non-assoc invalidate of a
+        //clean line (no drain), non-assoc tag write on a DIRTY entry (drain first).
+        cacheable_bootstrap(8'h09);
+        imem['h20] = 16'hE101;  // MOV   #1,R1
+        imem['h21] = 16'h4118;  // SHLL8 R1       ; R1 = 0x100 line A (set 0x10)
+        imem['h22] = 16'hE202;  // MOV   #2,R2
+        imem['h23] = 16'h4218;  // SHLL8 R2       ; R2 = 0x200 line B (set 0x20)
+        imem['h24] = 16'hE303;  // MOV   #3,R3
+        imem['h25] = 16'h4318;  // SHLL8 R3       ; R3 = 0x300 line C (set 0x30)
+        imem['h26] = 16'hE0F0;  // MOV   #0xF0,R0
+        imem['h27] = 16'h4018;  // SHLL8 R0
+        imem['h28] = 16'h4028;  // SHLL16 R0      ; R0 = 0xF0000000
+        imem['h29] = 16'h6703;  // MOV   R0,R7
+        imem['h2A] = 16'hE931;  // MOV   #0x31,R9
+        imem['h2B] = 16'h4918;  // SHLL8 R9       ; 0x3100
+        imem['h2C] = 16'hE655;  // MOV   #0x55,R6
+        imem['h2D] = 16'h2162;  // MOV.L R6,@R1   ; dirty A = 0x55 (write-allocate)
+        imem['h2E] = 16'hE801;  // MOV   #1,R8
+        imem['h2F] = 16'h4818;  // SHLL8 R8
+        imem['h30] = 16'h7808;  // ADD   #8,R8
+        imem['h31] = 16'h387C;  // ADD   R7,R8    ; R8 = 0xF0000108
+        imem['h32] = 16'hE500;  // MOV   #0,R5    ; matching tag 0, V=0 U=0
+        imem['h33] = 16'h2852;  // MOV.L R5,@R8   ; (5) purge HIT dirty: drain + invalidate
+        imem['h34] = 16'h6873;  // MOV   R7,R8
+        imem['h35] = 16'h389C;  // ADD   R9,R8    ; tag A address
+        imem['h36] = 16'h6A82;  // MOV.L @R8,R10  ; (5) tag read A: V=0 -> R10
+        imem['h37] = 16'h6B22;  // MOV.L @R2,R11  ; (6) fill B clean (set 0x20, way 3)
+        imem['h38] = 16'hE932;  // MOV   #0x32,R9
+        imem['h39] = 16'h4918;  // SHLL8 R9       ; 0x3200
+        imem['h3A] = 16'h6873;  // MOV   R7,R8
+        imem['h3B] = 16'h389C;  // ADD   R9,R8    ; tag B address (non-assoc, way 3)
+        imem['h3C] = 16'hE500;  // MOV   #0,R5    ; V=0 U=0 tag=0
+        imem['h3D] = 16'h2852;  // MOV.L R5,@R8   ; (6) non-assoc invalidate clean B
+        imem['h3E] = 16'h6C82;  // MOV.L @R8,R12  ; (6) tag read B: V=0 -> R12
+        imem['h3F] = 16'hE644;  // MOV   #0x44,R6
+        imem['h40] = 16'h2362;  // MOV.L R6,@R3   ; dirty C (set 0x30, way 3)
+        imem['h41] = 16'hE933;  // MOV   #0x33,R9
+        imem['h42] = 16'h4918;  // SHLL8 R9       ; 0x3300
+        imem['h43] = 16'h6873;  // MOV   R7,R8
+        imem['h44] = 16'h389C;  // ADD   R9,R8    ; tag C address
+        imem['h45] = 16'hE501;  // MOV   #1,R5    ; V=1 U=0, tag=0 (rewrite clean)
+        imem['h46] = 16'h2852;  // MOV.L R5,@R8   ; (7) non-assoc on DIRTY: drain, then write
+        imem['h47] = 16'h6D82;  // MOV.L @R8,R13  ; (7) tag read C: V=1 U=0 -> R13
+        imem['h48] = 16'h6E32;  // MOV.L @R3,R14  ; (7) line C data intact -> R14
+        imem['h49] = 16'h0009;  // sentinel
+        imem['h4A] = 16'hAFFE;  // guard
+        imem['h4B] = 16'h0009;
+        do_reset;
+        run_until_retire('h49, 30000);
+        run_cycles(40);                          //let the background drains land
+        chk("(5) purge hit dirty: V cleared",           gpr(10) & 32'h0000_0001, 32'd0);
+        chk("(5) purge hit dirty: write-back landed",   dmem['h40], 32'h0000_0055);
+        chk("(6) non-assoc invalidate clean: V=0",      gpr(12) & 32'h0000_0001, 32'd0);
+        chk("(6) non-assoc invalidate clean: no drain", dmem['h80], 32'd0);
+        chk("(7) non-assoc on dirty: drained first",    dmem['hC0], 32'h0000_0044);
+        chk("(7) non-assoc on dirty: tag rewritten V=1 U=0", gpr(13) & ~32'h0000_03F0, 32'h0000_0001);
+        chk("(7) non-assoc on dirty: line data intact", gpr(14), 32'h0000_0044);
+        chk_true("phase B: no spurious exception", !exc_seen);
+        do_reset;
+        end_test;
+    end
+endtask
+
+//GOLDEN Z3 - the capstone: constrained-random programs (ALU / R14-window memory /
+//TAS / PREF / plain+delayed forward branches over live T) run once with NO
+//interrupts as the reference, then again with random INT/NMI waves injected at
+//random offsets (dropped on ack, the INTC protocol). The architectural end state
+//must be IDENTICAL, the handler counter must equal the wave count, and no wave
+//may be lost. Generalizes every hand-built offset sweep in the suite.
+localparam integer TRACE_TRIAL = 5;   //+traceoracle: dump program + retire streams of this trial
+task automatic test_random_int_oracle;
+    integer trial, i, k, cls, dst, srcr, disp, ilat, dlat;
+    integer waves, gap, w, a0, e0, is_nmi;
+    logic [31:0] ref_r [0:14];
+    logic [31:0] ref_m [0:15];
+    logic        ref_t;
+    begin
+        begin_test("Random-program oracle vs random INT/NMI waves: end state identical, none lost");
+        for(trial = 0; trial < 8; trial = trial + 1) begin
+            cacheable_bootstrap((trial & 1) ? 8'h0B : 8'h09);   //alternate WT / WB
+            //R13/R14 init BEFORE the BL-clearing LDC: a wave accepted at the init's
+            //own boundary would otherwise resume INTO the init and erase the handler
+            //counts already taken (found by this oracle's first run). The R1-R12
+            //zeroing sits AFTER (MOV #0 re-execution under a wave is idempotent).
+            //SR cycles RB=1 / RB=0 / USER: the latter two run the program in BANK0
+            //while the handler runs BANK1, exercising the MD/RB bank flip on every
+            //entry and RTE (this flip found the r_bank1 RTE-snoop bug).
+            imem['h20] = (trial % 3 == 0) ? 16'hE860 :
+                         (trial % 3 == 1) ? 16'hE840 : 16'hE800; // MOV #sr_hi,R8
+            imem['h21] = 16'h4818;  // SHLL8  R8
+            imem['h22] = 16'h4828;  // SHLL16 R8
+            imem['h23] = 16'hED00;  // MOV   #0,R13   ; handler wave counter
+            imem['h24] = 16'hEE01;  // MOV   #1,R14
+            imem['h25] = 16'h4E18;  // SHLL8 R14      ; data window base 0x100
+            imem['h26] = 16'h480E;  // LDC   R8,SR    ; interrupts OPEN past here
+            //Zero R1-R12 in the PROGRAM's bank: GPRs persist across do_reset.
+            for(i = 1; i <= 12; i = i + 1) imem['h26 + i] = 16'hE000 | (i << 8);
+            for(i = 0; i < 64; i = i + 1) begin
+                if(imem['h33 + i] != 16'h0009 && i != 0) continue;  //slot already forced
+                cls  = $urandom_range(0, 12);
+                dst  = $urandom_range(1, 12);
+                srcr = $urandom_range(1, 12);
+                disp = $urandom_range(0, 15);
+                if((cls == 9 || cls == 10) && i > 56) cls = 1;  //no late branches
+                case(cls)
+                    0: imem['h33 + i] = 16'hE000 | (dst << 8) | ($urandom_range(0, 255)); // MOV #imm,Rn
+                    1: imem['h33 + i] = 16'h7001 | (dst << 8);                    // ADD #1,Rn
+                    2: imem['h33 + i] = 16'h300C | (dst << 8) | (srcr << 4);      // ADD Rm,Rn
+                    3: imem['h33 + i] = 16'h200A | (dst << 8) | (srcr << 4);      // XOR Rm,Rn
+                    4: imem['h33 + i] = 16'h4000 | (dst << 8);                    // SHLL Rn
+                    5: imem['h33 + i] = 16'h1E00 | (srcr << 4) | disp;            // MOV.L Rm,@(d,R14)
+                    6: imem['h33 + i] = 16'h50E0 | (dst << 8) | disp;             // MOV.L @(d,R14),Rn
+                    7: imem['h33 + i] = 16'h2E00 | (srcr << 4);                   // MOV.B Rm,@R14
+                    8: imem['h33 + i] = ($urandom_range(0, 1)) ? 16'h0008 : 16'h0018; // CLRT/SETT
+                    9: imem['h33 + i] = (($urandom_range(0, 1)) ? 16'h8900 : 16'h8B00)
+                                        | $urandom_range(1, 3);                   // BT/BF fwd 1..3
+                    10: begin                                                     // BT/S / BF/S + forced slot
+                        imem['h33 + i]     = (($urandom_range(0, 1)) ? 16'h8D00 : 16'h8F00)
+                                             | $urandom_range(1, 3);
+                        imem['h34 + i]     = 16'h7001 | (dst << 8);               //   slot: ADD #1,Rn
+                    end
+                    11: imem['h33 + i] = 16'h4E1B;                                // TAS.B @R14 (locked RMW)
+                    default: imem['h33 + i] = 16'h0E83;                           // PREF @R14
+                endcase
+            end
+            imem['h73] = 16'h0009;  // sentinel
+            imem['h74] = 16'hAFFE;  // guard
+            imem['h75] = 16'h0009;
+            imem['h300] = 16'h7D01; // ADD   #1,R13   ; VBR+0x600 handler (INT and NMI)
+            imem['h301] = 16'h002B; // RTE
+            imem['h302] = 16'h0009; //   delay slot
+            ilat = $urandom_range(0, 4);
+            dlat = $urandom_range(0, 4);
+            i_latency = ilat; d_latency = dlat;
+            if($test$plusargs("tracelbus")) begin dbg_trace = 1'b1; dbg_trace_mem = 1'b1; end
+            if($test$plusargs("traceoracle") && trial == TRACE_TRIAL) begin
+                for(i = 0; i < 64; i = i + 1)
+                    $display("      [prog] %02x: %04x", 'h33 + i, imem['h33 + i]);
+                dbg_trace = 1'b1;
+                dbg_trace_mem = 1'b1;
+            end
+            //Reference: no interrupts.
+            do_reset;
+            run_until_retire('h73, 60000);
+            for(k = 0; k <= 14; k = k + 1)
+                ref_r[k] = ((trial % 3 != 0) && k >= 1 && k <= 7)
+                           ? u_dut.u_int_pipe.u_gpr_bram.ram[k] : gpr(k);
+            for(k = 0; k <  16; k = k + 1) ref_m[k] = dmem['h40 + k];
+            ref_t = sr[0];
+            //Trial: same program/latencies with random INT/NMI waves (drop on ack).
+            do_reset;
+            e0 = test_errors;
+            waves = 0;
+            while(!retired_seen['h73] && waves < 40) begin
+                gap = $urandom_range(3, 45);
+                w = 0;
+                while(w < gap && !retired_seen['h73]) begin @(posedge clk); w = w + 1; end
+                if(retired_seen['h73]) break;
+                is_nmi = ($urandom_range(0, 3) == 0);   //1-in-4 waves are NMI
+                if(is_nmi) begin
+                    a0 = nmi_ack_count;
+                    nmi_valid_q = 1'b1;
+                    w = 0;
+                    while(nmi_ack_count == a0 && w < 20000) begin @(posedge clk); w = w + 1; end
+                    @(posedge clk);
+                    nmi_valid_q = 1'b0;
+                end
+                else begin
+                    a0 = int_ack_count;
+                    int_level_q = 4'($urandom_range(1, 15));
+                    int_code_q  = 12'h600;
+                    int_valid_q = 1'b1;
+                    w = 0;
+                    while(int_ack_count == a0 && w < 20000) begin @(posedge clk); w = w + 1; end
+                    @(posedge clk);
+                    int_valid_q = 1'b0;
+                end
+                waves = waves + 1;
+            end
+            run_until_retire('h73, 60000);
+            //A wave ack'd in the guard spin still needs its handler to finish.
+            w = 0;
+            while(gpr(13) != waves[31:0] && w < 20000) begin @(posedge clk); w = w + 1; end
+            run_cycles(30);
+            chk($sformatf("trial %0d (i=%0d,d=%0d): handler ran once per wave (%0d)", trial, ilat, dlat, waves),
+                gpr(13), waves[31:0]);
+            chk($sformatf("trial %0d: every wave entered", trial), entry_count, waves[31:0]);
+            chk_true($sformatf("trial %0d: no spurious exception", trial), !exc_seen);
+            for(k = 1; k <= 12; k = k + 1)
+                chk($sformatf("trial %0d R%0d transparent", trial, k),
+                    ((trial % 3 != 0) && k <= 7) ? u_dut.u_int_pipe.u_gpr_bram.ram[k] : gpr(k),
+                    ref_r[k]);
+            chk($sformatf("trial %0d R14 transparent", trial), gpr(14), ref_r[14]);
+            chk($sformatf("trial %0d T bit transparent", trial), {31'd0, sr[0]}, {31'd0, ref_t});
+            for(k = 0; k < 16; k = k + 1)
+                chk($sformatf("trial %0d dmem[%02h] transparent", trial, 'h40 + k), dmem['h40 + k], ref_m[k]);
+            if(test_errors != e0)
+                $display("      [dbg] waves=%0d entries=%0d R13=%0d intack=%0d nmiack=%0d EXPEVT=%08h addret=%0d rteret=%0d",
+                         waves, entry_count, gpr(13), int_ack_count, nmi_ack_count, expevt_o,
+                         retire_count['h300], retire_count['h301]);
+            dbg_trace = 1'b0;
+            dbg_trace_mem = 1'b0;
+        end
+        i_latency = 0; d_latency = 0;
+        do_reset;
+        end_test;
+    end
+endtask
+
 //Suite-wide property verdicts, evaluated LAST so every test fed the checkers.
 task automatic test_property_summary;
+    integer k;
     begin
         begin_test("Suite-wide properties: LRU divergence, L-bus/MEM-bus contracts, lock pairs, int acks");
         $display("      LRU: %0d update checks, %0d victim checks; L-bus: %0d req-pend, %0d rsp-pend cycles; MEM-bus: %0d pend cycles",
@@ -2578,6 +3666,19 @@ task automatic test_property_summary;
         chk("locked-pair violations",               lock_pair_viol[31:0], 32'd0);
         chk_true("interrupt-ack law exercised",     ack_checks > 100);
         chk("ack-without-entry / INTEVT violations", ack_viol[31:0], 32'd0);
+        //Acceptance coverage: which cache FSM states and restart-PC mux arms the
+        //interrupt sweeps actually reached (histograms printed for the record).
+        $write("      entry-vs-cache-state histogram:");
+        for(k = 0; k < 32; k = k + 1)
+            if(entry_state_cov[k] != 0) $write(" s%0d=%0d", k, entry_state_cov[k]);
+        $write("\n      restart-PC arm histogram:");
+        for(k = 0; k < 7; k = k + 1) $write(" arm%0d=%0d", k, int_arm_cov[k]);
+        $write("\n");
+        chk_true("entries reached the miss/fill states",
+                 (entry_state_cov[CS_IFILL_WAIT] > 0) && (entry_state_cov[CS_DFILL_WAIT] > 0));
+        chk_true("restart-PC arms covered beyond mawb", 
+                 (int_arm_cov[0] > 0) && ((int_arm_cov[1] + int_arm_cov[2] + int_arm_cov[3] +
+                                           int_arm_cov[4] + int_arm_cov[5] + int_arm_cov[6]) > 0));
         end_test;
     end
 endtask
@@ -4654,6 +5755,27 @@ initial begin
 
     $display("######## cpu_core_tb ########");
 
+    //+fnew: run only the new (final-session) collision/law tests while iterating.
+    if($test$plusargs("fnew")) begin
+        group("fnew: SR-race / nested-BL / NMI collision subset");
+        test_int_sr_race;
+        test_int_bl_nested;
+        test_nmi_miss_sweep;
+        test_nmi_int_order;
+        test_nmi_tas_atomic;
+        test_exc_int_collision2;
+        test_int_flush_collision;
+        test_int_mm_collision;
+        test_int_pref_collision;
+        test_wt_flip_dirty;
+        test_mm_array_laws;
+        test_random_int_oracle;
+        $display("");
+        if(errors == 0) $display("cpu_core_tb: PASS (fnew subset, %0d tests)", test_count);
+        else            $display("cpu_core_tb: FAIL (fnew subset, %0d errors over %0d tests)", errors, test_count);
+        $finish;
+    end
+
     //+focus: run only the interrupt/exception collision sweeps (debug subset).
     if($test$plusargs("focus")) begin
         group("focus: interrupt/exception machinery subset");
@@ -4783,6 +5905,8 @@ initial begin
     test_tas_vs_dirty;
     test_bl_exception_reset;
     test_squash_victim_drain;
+    test_wt_flip_dirty;
+    test_mm_array_laws;
 
     //Fetch-pair laws: the sibling of every even fetch issues without a bus request.
     group("11. Fetch-pair laws: request halving, branch kill, idle-edge drain");
@@ -4797,7 +5921,20 @@ initial begin
     test_int_miss_sweep;
     test_int_tas_atomic;
     test_exc_int_collision;
+    test_exc_int_collision2;
+    test_int_sr_race;
+    test_int_bl_nested;
+    test_int_flush_collision;
+    test_int_mm_collision;
+    test_int_pref_collision;
     test_random_latency_oracle;
+
+    //NMI collision twins + the random INT/NMI capstone oracle.
+    group("12b. NMI collisions and the random interrupt oracle");
+    test_nmi_miss_sweep;
+    test_nmi_int_order;
+    test_nmi_tas_atomic;
+    test_random_int_oracle;
 
     //Verdicts of the always-on passive checkers, judged over the WHOLE suite.
     group("13. Suite-wide property checkers");
