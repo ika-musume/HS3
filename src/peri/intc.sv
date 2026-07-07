@@ -19,8 +19,8 @@
     an IPR/ICR/IRR0 write takes bridge + resolver cycles before the CPU-side
     request reflects it - rewrite masks with interrupts blocked.
 
-    Documented deviations: no 20-cycle NMIE-change lockout (p.121); no
-    IRQOUT pin; register writes are not size-checked.
+    Documented deviations: no IRQOUT pin; register writes are not
+    size-checked.
 */
 
 module intc (
@@ -115,12 +115,27 @@ end
 wire            nmi_edge  = icr0_nmie ? (nmi_sync & ~nmi_z) : (~nmi_sync & nmi_z);
 wire            mai_block = icr1_mai & ~nmi_sync;
 
+//20-cycle NMIE-change lockout (p.121): flipping the NMIE edge polarity can
+//look like a live edge if the pin already sits in the new active state, so
+//NMI detection is suppressed for 20 core cycles after ICR0.NMIE is changed.
+//icr0_nmie holds its OLD value on the write edge (non-blocking), so the
+//compare below is a true change-detect.
+logic   [4:0]   nmie_lock;                             //down-counts 20..0; NMI masked while !=0
+always_ff @(posedge i_CLK or negedge i_RST_n) begin
+    if(!i_RST_n) nmie_lock <= 5'd0;
+    else begin if(i_CEN) begin
+        if(REG_HI.stb && REG_HI.we && REG_HI.addr == 8'hE0 && REG_HI.wdata[8] != icr0_nmie)
+                                nmie_lock <= 5'd20;    //ICR0.NMIE changed: arm the lockout
+        else if(nmie_lock != 0) nmie_lock <= nmie_lock - 5'd1;
+    end end
+end
+
 logic           nmi_pend;
 always_ff @(posedge i_CLK or negedge i_RST_n) begin
     if(!i_RST_n) nmi_pend <= 1'b0;
     else begin if(i_CEN) begin
-        if(nmi_edge)       nmi_pend <= 1'b1;           //a new edge outranks a same-cycle ack
-        else if(i_NMI_ACK) nmi_pend <= 1'b0;
+        if(nmi_edge && nmie_lock == 5'd0) nmi_pend <= 1'b1;   //new edge outranks a same-cycle ack
+        else if(i_NMI_ACK)                nmi_pend <= 1'b0;    //(edge ignored during the lockout)
     end end
 end
 
