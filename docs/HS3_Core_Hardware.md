@@ -421,7 +421,7 @@ once presented; locked accesses alternate strictly read→write (one open pair).
 The BSC exposes the **real SH7709S chip pin set** (Table 10.1, PCMCIA-less) at the
 `HS3` top: `A[25:0]`, a split data bus (`o_D_O`/`o_D_OE`/`i_D_I`, `inout` only at
 board level), `BS_n`, `CS0/2–6_n`, `RD_WR`, `RAS3L/U_n`, `CASL/U_n`, `WE_n[3:0]`
-(= DQM), `RD_n`, `i_WAIT_n`, `CKE`, `BREQ_n`/`BACK_n`, plus (Group C) the pad-state
+(= DQM), `RD_n`, `i_WAIT_n`, `CKE`, `BREQ_n`/`BACK_n`, plus the pad-state
 exports `o_A_PU`/`o_D_PU`/`o_RASCAS_OE`, `IRQOUT_n`, and the MCS0–7 selects riding
 the port-C pads. Front-end route classes:
 
@@ -429,8 +429,8 @@ the port-C pads. Front-end route classes:
   bank-active with per-bank open rows, tWR guard, CL read pipe. Timing is driven
   exactly by the `MCR`/`WCR2` registers (CL/RCD/tRP), on the 50 MHz `i_BCEN` enable.
   Reproduces the natural SDRAM latency of the original board (most emulated code runs
-  from SDRAM), §10.3.4 figs 10.14–10.28. **Full table-10.13 address multiplexing**
-  (Group C): every AMX family decodes — row = `addr >> {8,9,10}` on `A16–A1`, the
+  from SDRAM), §10.3.4 figs 10.14–10.28. **Full table-10.13 address multiplexing**:
+  every AMX family decodes — row = `addr >> {8,9,10}` on `A16–A1`, the
   column phase holds the row values on a per-mode `A16–A13` mask (which keeps the
   bank bits standing on the device BA pins), the precharge flag rides the
   device-A10 pin (`A12`/`A11` by bus width), single-rail modes (`1101`/32-bit,
@@ -450,14 +450,14 @@ the port-C pads. Front-end route classes:
   (1–3) gate the **pin launch** on area switches and read→write turnaround —
   the generic-port handshake fast path never pays, which is what keeps the
   IPC-parity law beat-exact.
-  **Strobe shapes are the fig-23.16 AC shapes** (Group B, 2026-07-07): RD/WEn
+  **Strobe shapes follow the fig-23.16 AC shapes:** RD/WEn
   assert at **mid-T1** and negate at **mid-T2** (tRSD/tWED at the CKIO falls),
   CSn negates at mid-T2 (tCSD2), read data is sampled **at the mid-T2 fall** —
   tRDH1 = 0 ns lets the device release data the moment RD rises, so any later
   sample is unbuildable on real parts. A split-16 longword now runs as two full
   bus cycles with WE **rising between the halves** (an async device latches at
   the rise — the old held-WE envelope would have lost the first half on real
-  silicon). **8-bit ports** (Group C) complete the width matrix of tables
+  silicon). **8-bit ports** complete the width matrix of tables
   10.7–10.12: a datum wider than the port walks its byte addresses low-to-high
   on `D7–D0` with WE0 only, one full bus cycle each, endian-mirrored register
   lanes (both endians decoded; bus arbitration never splits the multi-cycle
@@ -492,57 +492,44 @@ while `RD_n` is low and latch per `WE_n` lane, like the async parts in figs
 10.7–10.9; the handshake-mode controller backs off the D bus while the chip
 drives it (posted SDRAM engine writes share the pins).
 
-**CKIO pin phase — datasheet phase (fixed 2026-07-07).** The pin now *rises*
-at the command edges, exactly as figs 10.14/23.16 draw it: every bus pin
-changes at the CKIO rise and the mid-state shapes (RD/WEn edges, WAITSEL=1
-sampling) sit at the fall. A synchronous device clocked straight from the
-pin would sample at the very edge the pins change, so the board must grant
-the device the real chip's tOD margin — on the FPGA an output-delay
-constraint / clock-tree skew on the CKIO net (no PLL block needed). The TB
-models that board adjustment as a half-cycle transport delay on the Micron
-model's clock net, which reproduces the pre-fix electrical relationship
-exactly: every command lands in the same device cycle, and all SDRAM laws
-held bit-exact through the flip.
+**CKIO pin phase.** `o_CKIO` rises at the command edges, exactly as figs
+10.14/23.16 draw it: every bus pin changes at the CKIO rise, and the
+mid-state shapes (RD/WEn edges, WAITSEL=1 sampling) sit at the fall. A
+synchronous device clocked straight from the pin would sample at the very
+edge the pins change, so the board must grant the device the real chip's
+tOD margin — on the FPGA an output-delay constraint / clock-tree skew on
+the CKIO net (no PLL block needed). The TB models that board adjustment as
+a half-cycle transport delay on the Micron model's clock net, so every
+command lands in the same device cycle the real board would see.
 
-**Register file — §10.2-exact (audited 2026-07-07).** POR values (BCR1
-`H'0000`+ENDIAN, BCR2 `H'3FF0`, WCR1 `H'3FF3`, WCR2 `H'FFFF`, MCR/PCR/
-MCSCR/refresh group `0`), reserved-bit masks (BCR2 `3FF0`, WCR1 `BFF3`,
-MCR `FFFE`, PCR `CFFF`, MCSCR `007F`), `BCR1.ENDIAN` read-only reflecting
-the MD5 strap (**0 = big-endian** — the audit found and fixed an inverted
-polarity), fig-10.5 write keys on the refresh group (word-only, `A5` /
-`101001`), RFCR clearing when it exceeds the LMTS limit, and CMF's clear
-bound to the *next performed CBR refresh* after the keyed write-0 (p.253) —
-no longer the simplified immediate clear. Test 22 locks all of it.
+**Register file.** POR values (BCR1 `H'0000`+ENDIAN, BCR2 `H'3FF0`, WCR1
+`H'3FF3`, WCR2 `H'FFFF`, MCR/PCR/MCSCR/refresh group `0`), reserved-bit
+masks (BCR2 `3FF0`, WCR1 `BFF3`, MCR `FFFE`, PCR `CFFF`, MCSCR `007F`),
+`BCR1.ENDIAN` read-only reflecting the MD5 strap (**0 = big-endian**),
+fig-10.5 write keys on the refresh group (word-only, `A5` / `101001`), RFCR
+clearing when it exceeds the LMTS limit, and CMF's clear bound to the *next
+performed CBR refresh* after the keyed write-0 (p.253). Locked by a
+dedicated law suite (§7).
 
-**Group C — breadth (landed 2026-07-07).** Everything the earlier passes had
-catalogued as missing, minus PCMCIA and standby: full AMX decode, 16-bit
-SDRAM bus width, 8-bit ordinary ports, BS-on-Td, per-byte read DQM (all
-above); **MCS0–7 mask-ROM selects** per MCSCR0–7 / table 10.15 (CS0-or-CS2
-select, CAP-sized `A25:22` block compare, CS-shaped assertion) riding the
-**port-C pads** through the PFC "other function" mode — and, per p.323, MCS0
-claims the CS0 pad itself when MCSCR0 decodes area 0; **bus-release pad
-behavior** — PULA pulls A25–A0 up for exactly 4 CKIO after BACK asserts
-(fig 10.41), PULD marks the D pins whenever the data bus is idle
-(figs 10.42/10.43), HIZCNT keeps the RAS/CAS pads driven through a release
-(`o_RASCAS_OE`); and the **IRQOUT pin** (pp.320–321): asserted on a
-pending-not-yet-run refresh (BSC `o_REF_PEND`) or an unmasked interrupt
-(`int_level > SR.I3–I0`, BL-independent, NMI always), so a foreign master
-returns the bus. The TB gained an SDRAM command monitor (`negedge ckio`
-sampling — one sample per 20 ns command window), an 8-bit strobe-honest raw
-device, and a `sdram_en` depopulation knob so the AMX/16-bit shape probes
-don't feed the 0111-wired Micron model ill-formed sequences; tests 58–63
-lock MCS decode + the pad switch, the 8-bit walk (data + WE0 count), the
-AMX row/column pin patterns (transcribed from table 10.13 as constants),
-16-bit beats/DQM/AP-at-A11 + the 8-beat fill, BS-on-Td + lane-masked reads
-against the live device, and the release-pad/IRQOUT laws. Remaining known
-deviations: PCMCIA, and standby-mode pad states (the SoC has no standby
-mode; HIZMEM is stored but unreachable).
+**MCS mask-ROM selects and pad behavior.** MCS0–7 mask-ROM selects (per
+MCSCR0–7 / table 10.15: CS0-or-CS2 select, CAP-sized `A25:22` block
+compare, CS-shaped assertion) ride the **port-C pads** through the PFC
+"other function" mode — and, per p.323, MCS0 claims the CS0 pad itself when
+MCSCR0 decodes area 0. **Bus-release pad behavior:** PULA pulls `A25–A0` up
+for exactly 4 CKIO after `BACK` asserts (fig 10.41), PULD marks the D pins
+whenever the data bus is idle (figs 10.42/10.43), and HIZCNT keeps the
+RAS/CAS pads driven through a release (`o_RASCAS_OE`). The **IRQOUT pin**
+(pp.320–321) asserts on a pending-not-yet-run refresh (BSC `o_REF_PEND`) or
+an unmasked interrupt (`int_level > SR.I3–I0`, BL-independent, NMI always),
+so a foreign master returns the bus. Known deviations from the full chip:
+PCMCIA, and standby-mode pad states (the SoC has no standby mode; HIZMEM is
+stored but unreachable).
 
-### Cache↔BSC interaction latency — measured, with the adjustment list
+### Cache↔BSC interaction latency
 
-Measured 2026-07-07 with a scratch probe rig (a two-pass warmed loop in cached
-SDRAM code: pass 2 runs with every I-fetch hitting and the bus otherwise idle;
-auto-precharge mode, CL2/RCD2, 50 MHz bus). All numbers are core cycles at
+Core-cycle timing for a cache miss and the two non-cacheable (P2) accesses,
+traced with a warmed loop running from cached SDRAM (auto-precharge mode,
+CL2/RCD2, 50 MHz bus, bus otherwise idle). All numbers are core cycles at
 100 MHz; `t` = the edge the D-lookup resolves (the tag read is `t−1` — "it first
 takes a cycle to find the cache", SH7604 §7.11.2, and HS3 matches).
 
@@ -554,46 +541,42 @@ takes a cycle to find the cache", SH7604 §7.11.2, and HS3 matches).
 | the load **retires** (fill-forward) | **`t+13`, any word offset** | `t+14` | `t+2` |
 | cache returns to `S_IDLE` (fill tail in background) | `t+17` | `t+12` | (WRIT lands `~t+7`) |
 
-*(Re-measured twice on 2026-07-07: Group A's dispatch-NOP removal moved ACTV
-`t+3`→`t+1`; the wrap fill-forward then moved the miss retire `t+19`→`t+13`.
-The original trace was ACTV `t+3`, beats `t+12+2n`, retire `t+21` — a cold
-D-miss now restarts the pipe 8 core cycles earlier, offset-independent.)*
+This holds against SH7709S §5.3.2 (p.110), SH7604 §7.11.2/§8.4.3, and the
+`attic/SH-master` SH7604 implementation:
 
-What the trace establishes, held against SH7709S §5.3.2 (p.110), SH7604
-§7.11.2/§8.4.3, and the `attic/SH-master` SH7604 implementation:
-
-1. **~~No early restart~~ — DONE (wrap fill-forward, 2026-07-07).** Fills now
-   wrap from the missed word (BSC engine issues READ columns in wrap order,
-   READA on the 4th command, fig 10.16) and the cache forwards the first beat
-   to the pipe "in parallel with being loaded to the cache" (p.110). Measured:
-   miss retire `t+21`→`t+13`, offset-independent; the fill tail runs in
-   background behind the resumed pipe. Contract change: a fault on a LATER
-   beat no longer faults the forwarded access — it silently kills the line
-   validation, and the exception binds to whichever access later requests the
-   faulting word itself (suite recoded to this more-precise contract; the
-   victim-invalidate law is unchanged). The background drain also gained a
-   launch slot on hit-resolve edges — early-restarted hit streams have no
-   request-free edges, which starved it.
-2. **~~Accept→ACTV dispatch NOP~~ — DONE (Group A4, 2026-07-07).** The first
-   command now issues at the `E_IDLE` dispatch edge from the live op fields;
-   accept→ACTV measured 1 cycle, every SDRAM op 2 core cycles faster.
-3. **The front half is already optimal — do not touch.** Miss determination,
-   cache request, splitter, and BSC accept all land on **one edge** (the
-   SH-master reference registers its request one cycle later). Latency law of
-   §4 applies: no new beats here.
-4. **Cache-off is NOT one cycle faster, and that is correct.** SH7604 §7.11.2:
-   cache-through reads still pay "an extra cycle … to determine the cycle"
-   before the internal-bus read starts. Measured HS3: identical dispatch cost
-   for miss and bypass (both fire at `t`); the bypass is faster end-to-end only
-   because it moves one beat instead of four. No adjustment warranted.
-5. **The posted bypass store already matches the SH7604 "one-level write
-   buffer" model** (ack at `t+1`, retire `t+2`, WRIT on pins ~`t+9`,
+1. **Fills wrap and forward from the missed word.** The BSC engine issues
+   READ columns in wrap order (READA on the 4th command, fig 10.16), and the
+   cache forwards the first beat to the pipe "in parallel with being loaded
+   to the cache" (p.110) — miss retirement is offset-independent, and the
+   fill tail drains in the background behind the resumed pipe. A fault on a
+   later beat does not fault the forwarded access: it silently kills the
+   line's validation, and the exception binds to whichever access later
+   requests the faulting word itself (the victim-invalidate law is
+   unaffected). The background drain takes a launch slot on hit-resolve
+   edges, since an early-restarted hit stream otherwise has no request-free
+   edge to use.
+2. **Dispatch is one edge.** The first SDRAM command issues at the `E_IDLE`
+   dispatch edge directly from the live op fields — accept→ACTV is one cycle
+   for every SDRAM op.
+3. **The front half is already optimal.** Miss determination, cache request,
+   splitter, and BSC accept all land on **one edge** (the SH-master reference
+   registers its request one cycle later). The latency law of §4 applies: no
+   new beats here.
+4. **Cache-off is not one cycle faster than a hit dispatch, and that is
+   correct.** SH7604 §7.11.2: cache-through reads still pay "an extra cycle …
+   to determine the cycle" before the internal-bus read starts. HS3's
+   dispatch cost is identical for miss and bypass (both fire at `t`); the
+   bypass is faster end-to-end only because it moves one beat instead of
+   four.
+5. **The posted bypass store matches the SH7604 "one-level write buffer"
+   model** (ack at `t+1`, retire `t+2`, WRIT on pins ~`t+9`,
    fire-and-forget). The BSC is one-outstanding, so a *following* external
    access stalls until the posted write completes — same as the manual's
    "during reads, the CPU always has to wait."
 
-Self-modifying-code note: fill-forward tightened the I-side visibility window
-— `SELFMOD_K` relocked 4→2 (only IF/ID + the pair slot hold stale opcodes).
+Self-modifying-code note: the fill-forward window is tight enough that
+`SELFMOD_K` only needs to cover IF/ID and the pair slot holding stale opcodes
+(`SELFMOD_K = 2`).
 
 ---
 
