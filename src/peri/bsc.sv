@@ -11,7 +11,9 @@
          synchronous DRAM (p.234). Command timing is register-programmed
          (MCR/WCR2) and runs on the 50 MHz bus enable i_BCEN, reproducing the
          real chip's natural latency (figs 10.14-10.28). Burst-read/single-
-         write, BL=1: a cache line moves as 4 pipelined READ/WRIT commands.
+         write, BL=1: a cache line moves as 4 pipelined READ/WRIT commands
+         (8 half-word beats on a 16-bit BCR2 bus width). Address multiplexing
+         follows MCR.AMX per table 10.13; BS marks the Td data cycles.
       3. the ORDINARY MEMORY / BURST ROM controller for every other area
          (p.268, p.304): the access is held on the SHARED physical bus (and
          mirrored on the generic port) for a full register-programmed bus
@@ -39,25 +41,27 @@
     reset flavor so a dying transaction cannot wedge the bus.
 
     DEVIATIONS (vs real silicon):
-      - no PCMCIA (A5PCM/A6PCM/PCR are bookkeeping); no MCS pins (MCSCR0-7
-        bookkeeping); no standby coupling. BREQ/BACK ARE implemented: grant
-        drains the bus, PALLs open bank-active rows, releases the shared
-        control/address pads via o_BUS_OE (CKE stays driven; a self-refresh
-        park keeps its CKE-low state through a release).
-      - BS_n on SDRAM reads aligns with the READ commands, not the Td data
-        cycles of fig 10.14 (cosmetic; ordinary cycles assert it at T1).
-      - AMX = 0111 only (512K x 32-bit x 4-bank, table 10.13) - the target
-        device (MT48LC2M32B2). Other AMX values are not decoded.
-      - reads drive DQM all-low (whole longword fetched; CPU extracts bytes).
-      - fill beats leave in sequential word order (the cache requests word 0
-        first); the real chip wraps from the missed word. Latency identical.
-      - one dispatch NOP between an op leaving E_IDLE and its first command
-        (the real chip overlaps dispatch with the previous Tpc tail).
-      - WCR1 inter-access idles are NOT enforced: they exist to avoid data
-        bus turnaround conflicts, and the generic port has split read/write
-        data - no shared bus to protect. WCR2 waits ARE enforced (below).
-      - 8-bit port widths are unsupported (served as 16-bit); the SDRAM path
-        stays 32-bit regardless of BCR2 (AMX 0111 device).
+      - no PCMCIA (A5PCM/A6PCM/PCR are bookkeeping); no standby coupling -
+        the SoC has no standby mode, so HIZMEM (a standby-only pad rule) is
+        stored but never observable. BREQ/BACK ARE implemented: grant drains
+        the bus, PALLs open bank-active rows, releases the shared pads via
+        o_BUS_OE / o_RASCAS_OE (HIZCNT); PULA/PULD export pull-up states and
+        o_REF_PEND feeds the chip-level IRQOUT (pp.320-322).
+      - WCR1 idles gate only PIN bus cycles (launch/dispatch): an access the
+        generic-port handshake completes early never drove the D pins, so it
+        pays no idle - this keeps the IPC-parity fast path beat-exact.
+      - WAITSEL=0 with WAIT asserted is "operation not guaranteed" (p.241);
+        HS3's defined behavior for it is the boundary-edge sample. WAITSEL=1
+        is the compliant mid-state (CKIO-fall) sample point.
+      - strobe shapes follow fig 23.16: RD/WEn mid-T1 -> mid-T2, CSn T1 ->
+        mid-T2, per width-split sub-cycle, read data sampled at the mid-T2
+        fall (tRDH1 = 0 ns). Pitch beats strobe launch -> close instead of
+        silicon's continuous burst envelope: HS3 runs each beat as its own
+        request, so CSn/RD re-pulse per beat where fig 23.19 holds CSn low
+        across the burst (a page ROM re-selects fine - conservative shape).
+      - a generic-port hsk EARLY completion releases the pins at its core
+        edge (off the bus grid) - extension-path behavior; the timed/raw
+        path always releases at the T2-close boundary edge.
       - i_MEM_READY and i_MEM_RSP_VALID are equivalent external completions
         (both ORed with the timed path); accept pacing is always internal.
         The generic port carries no data - the physical D pins do.
@@ -66,12 +70,19 @@
       - the generic port mirrors ALL external areas: BSC-owned accesses
         (SDRAM areas, dummy 1/7) appear as one-cycle accept strobes for
         shadowing; the external controller masks them by its own memory map.
-      - CMF/OVF clear on a keyed write-0 (real CMF clears at the next refresh
-        after write-0 - simplified).
+
+    The CKIO pin is DATASHEET phase (rises at the command edges - cpg_wdt);
+    a board clocking a synchronous device straight from it must grant the
+    device the real chip's tOD margin (clock-tree skew / PLL phase or an
+    output-delay constraint; the TB models it as a transport delay on the
+    device clock net). The register file matches section 10.2 exactly:
+    POR values, reserved-bit masks, ENDIAN(BCR1[11]) read-only = !MD5,
+    fig-10.5 write keys, RFCR clear at the LMTS limit, CMF clear bound to
+    the next performed CBR refresh.
 */
 
 module bsc #(
-    parameter       BIG_ENDIAN = 1'b1   //reflected in BCR1.ENDIAN (MD5 pin on silicon)
+    parameter       BIG_ENDIAN = 1'b1   //BCR1.ENDIAN reads !BIG_ENDIAN (= MD5 pin, p.236)
 ) (
     /* CLOCK AND RESET */
     input   wire            i_POR_n,    //registers + SDRAM engine + refresh (survives manual reset)
@@ -92,8 +103,7 @@ module bsc #(
        exactly as on silicon: RD/WR doubles as the SDRAM WE command bit and
        WE3-WE0 double as DQMUU-DQMLL. The data bus is split unidirectional
        (o_D_O/o_D_OE/i_D_I); the true inout lives at the board level.
-       PCMCIA pins (CE2A/B, ICIORD/ICIOWR, IOIS16) and the MCS0-7 mask-ROM
-       selects are omitted; BREQ/BACK are present but inert. */
+       PCMCIA pins (CE2A/B, ICIORD/ICIOWR, IOIS16) are omitted. */
     output  wire    [25:0]  o_A,            //shared: static ordinary / muxed SDRAM row-col
     output  wire    [31:0]  o_D_O,
     output  wire            o_D_OE,
@@ -121,6 +131,19 @@ module bsc #(
     output  wire            o_BUS_OE,       //board-level pad enable for the shared
                                             //control/address group (D uses o_D_OE;
                                             //CKE stays driven through a release)
+    output  wire            o_RASCAS_OE,    //RAS/CAS pad enable: HIZCNT keeps them
+                                            //driven through a release (p.236)
+    output  wire            o_A_PU,         //PULA: A25-A0 pull-up state (fig 10.41)
+    output  wire            o_D_PU,         //PULD: D31-D0 pull-up state (figs 10.42-43)
+
+    /* MCS0-7 MASK-ROM SELECTS (MCSCR0-7, table 10.15) - on silicon these
+       ride the PTC pads (and MCS0 the CS0 pad) when the PFC grants them;
+       the chip top does that merge */
+    output  wire    [7:0]   o_MCS_n,
+    output  wire            o_MCS0_CS0,     //MCSCR0.CS2/0 = 0: CS0 pad may switch
+
+    /* IRQOUT contribution (p.321): refresh request pending, cycle not run */
+    output  wire            o_REF_PEND,
 
     /* GENERIC MEMORY PORT - address/control view only: ALL data rides the
        physical D pins (user rule). Every external access is mirrored here;
@@ -153,7 +176,7 @@ module bsc #(
 
 logic   [15:0]  bcr1;               //memory type select; init 0x0000 (p.233)
 logic   [15:0]  bcr2;               //area bus width, bookkeeping; init 0x3FF0 (p.239)
-logic   [15:0]  wcr1;               //inter-access idles, exported only; init 0x3FF3 (p.240)
+logic   [15:0]  wcr1;               //WAITSEL + inter-access idles (enforced); init 0x3FF3 (p.240)
 logic   [15:0]  wcr2;               //waits + SDRAM CAS latency; init 0xFFFF (p.241)
 logic   [15:0]  mcr;                //SDRAM timing; init 0x0000 (p.245)
 logic   [15:0]  pcr;                //PCMCIA, bookkeeping only; init 0x0000 (p.248)
@@ -166,6 +189,11 @@ logic   [15:0]  mcscr [0:7];        //MCS0-7 pin control, bookkeeping (pp.258-25
 //decoded engine timing knobs (the natural-latency law, MCR pp.245-247)
 wire            a2_sdram  = (bcr1[4:2] == 3'b011);      //DRAMTP=011: both areas SDRAM
 wire            a3_sdram  = !bcr1[4] && bcr1[3];        //DRAMTP=010 or 011
+//per-area SDRAM data bus width from BCR2 (p.276: 16 or 32 bits; both areas
+//must match when both are SDRAM, so global commands may use either decode)
+wire            sd16_a2   = (bcr2[5:4] == 2'b10);
+wire            sd16_a3   = (bcr2[7:6] == 2'b10);
+wire            sd16_gl   = a2_sdram ? sd16_a2 : sd16_a3;
 wire    [2:0]   t_tpc     = {1'b0, mcr[15:14]} + 3'd1;              //precharge spacing 1-4
 wire    [3:0]   t_tpc_slf = {2'b00, mcr[15:14]} * 3 + 4'd2;         //self-refresh exit 2/5/8/11
 wire    [2:0]   t_rcd     = {1'b0, mcr[13:12]} + 3'd1;              //RAS-CAS spacing 1-4
@@ -223,10 +251,13 @@ logic   [1:0]   owner_q;
 //SDRAM burst bookkeeping: a fill/drain arrives as 4 line-aligned beats; the
 //head starts the engine, continuations ride the running op (line buffers)
 logic           b_rd_act;           //burst read in flight (engine fetches the line)
+logic   [1:0]   b_rd_cnt;           //fill beats consumed (fills WRAP: heads are not word 0)
 logic           b_wr_act;           //burst write in flight (line buffer drains to pins)
-wire            fe_b_head = I_BUS.req_burst && (fa[3:2] == 2'b00);
+//head = first beat of a line transfer (no matching burst open). Fill bursts
+//wrap from the MISSED word (p.110); drains stay word-ordered 0..3.
+wire            fe_b_head = I_BUS.req_write ? !b_wr_act : !b_rd_act;
 wire            fe_b_cont = fe_sdram && ((b_rd_act && !I_BUS.req_write) ||
-                                         (b_wr_act &&  I_BUS.req_write)) && (fa[3:2] != 2'b00);
+                                         (b_wr_act &&  I_BUS.req_write));
 
 //engine request slot (single outstanding; consumed by the engine at a BCEN edge)
 logic           eng_go;
@@ -352,13 +383,17 @@ wire            fe_rsp_done = I_BUS.rsp_valid && I_BUS.rsp_ready;
 ////
 
 /*
-    Bus cycles tick on i_BCEN (the 50 MHz CKIO view). An access completes
-    after 1 + WCR2-first-wait cycles, then stalls while i_WAIT_n is low if
-    the pin is enabled for that area (any nonzero wait setting; a 0-wait
-    area ignores the pin, pp.241-244). Burst-ROM continuation beats (line
-    fill beats 1-3 of a BCR1-enabled area, p.304) use the shorter burst
-    pitch instead of the first-access waits. Read data samples i_MEM_RDATA
-    live at the completing bus edge, like pins of a real asynchronous bus.
+    Bus cycles tick on i_BCEN (the 50 MHz CKIO view). A first access runs
+    T1 + n Tw + T2 = 2 + WCR2-first-wait states, read data sampled at the
+    END of T2 (figs 10.6/10.10). The WAIT pin stretches the Tw region when
+    enabled for the area (nonzero wait setting; a 0-wait area ignores the
+    pin, pp.241-244) - the Tw->T2 decision uses the WAITSEL-selected sample
+    (mid-state when WCR1[15]=1, fig 10.11). Burst-ROM continuation beats
+    (line fill beats 1-3 of a BCR1-enabled area, p.304) instead total the
+    burst-pitch states exactly (their last state is the data state), and
+    sample WAIT for every wait code (p.242); a write-back burst ignores the
+    pin entirely (p.274). Read data samples i_MEM_RDATA live at the
+    completing bus edge, like pins of a real asynchronous bus.
 */
 
 //WCR2 3-bit encodings: first-access waits and burst pitch (states-1), p.241
@@ -399,13 +434,108 @@ always_comb begin
     ord_pin_en = (ord_w3 != 3'd0);
 end
 
-//a burst-ROM continuation beat rides the open line: pitch timing (p.304)
-wire            ord_cont = I_BUS.req_burst && ord_bst_en && (fa[3:2] != 2'b00);
+//a burst-ROM continuation beat rides the open line: pitch timing (p.304).
+//Fill bursts WRAP from the missed word (p.110), so the head is not word 0:
+//an ordinary-bus read line fill is tracked in flight (head opens, the 4th
+//beat's response - or a fault, the cache abandons the fill - closes)
+logic           ordb_act;           //ordinary read line fill in flight
+logic   [1:0]   ordb_cnt;           //its consumed-beat count
+wire            ord_cont = I_BUS.req_burst && ord_bst_en && ordb_act;
 
-//per-area bus width: BCR2 AnSZ for areas 2-6, MD pins for area 0 (p.231).
-//11 = 32-bit; anything narrower is served as 16-bit on D15-D0 (8-bit ports
-//are unsupported); a longword then takes TWO full bus cycles, MS half first
-logic           ord_w16_c;
+///////////////////////////////////////////////////////////
+//////  WCR1 Inter-Access Idles (p.240)
+////
+
+/*
+    "For some memories, data bus drive may not be turned off quickly...
+    conflicts when consecutive memory accesses are to different memories or
+    when a write immediately follows a memory read" (10.2.3). AnIW idles
+    (00/01=1, 10=2, 11=3) are inserted before a PIN bus cycle that (a)
+    switches area, or (b) writes after a read in the same area. Only the
+    shared physical bus is protected: the launch grid-align (ord_run) and
+    the SDRAM engine dispatch are held - the accept and the generic-port
+    handshake fast path never pay (they do not drive the D pins). One idle
+    is structurally guaranteed by the single-outstanding front end, so only
+    codes 10/11 ever add cycles.
+*/
+
+function automatic logic [1:0] iw_idles(input logic [1:0] c);
+    iw_idles = c[1] ? (c[0] ? 2'd3 : 2'd2) : 2'd1;      //p.240 idle table
+endfunction
+
+//AnIW field of the addressed area (bits 2n+1:2n; areas 1/7 never reach the pins)
+function automatic logic [1:0] iw_field(input logic [2:0] area);
+    case(area)
+        3'd0:    iw_field = wcr1[1:0];
+        3'd2:    iw_field = wcr1[5:4];
+        3'd3:    iw_field = wcr1[7:6];
+        3'd4:    iw_field = wcr1[9:8];
+        3'd5:    iw_field = wcr1[11:10];
+        default: iw_field = wcr1[13:12];
+    endcase
+endfunction
+
+//last PIN data cycle: area, direction, and bus cycles elapsed since its end
+logic   [2:0]   turn_area;
+logic           turn_read;
+logic           turn_v;
+logic   [1:0]   turn_gap;           //saturates at 3 (max programmable need - 1)
+
+//launch allowed when the elapsed gap covers the idles (gap counts from the
+//end edge, so a launch k bus cycles later reads gap = k-1 -> need-1 compare)
+function automatic logic idle_ok(input logic [2:0] area, input logic wr);
+    logic turn;
+    turn = turn_v && ((area != turn_area) || (turn_read && wr));
+    idle_ok = !turn || (turn_gap >= (iw_idles(iw_field(area)) - 2'd1));
+endfunction
+
+wire            ord_idle_ok_nx = idle_ok(fe_area, I_BUS.req_write);   //at the accept edge
+wire            ord_idle_ok_q  = idle_ok(ord_area, ord_write);        //at a held launch
+
+//pin data-cycle end events (BCEN edges): ord close of the LAST sub-cycle,
+//engine last CL landing, engine last write beat. Refresh/MRS move no data.
+//A handshake-completed (generic port) access never drove the D pins: skipped.
+wire            ord_end_tk = ord_busy && ord_run && !ord_done && ord_subs == 2'd0 &&
+                             (ord_t2 || (!ord_ft2 && ord_cnt == 4'd0 &&
+                                         (!ord_pin_q || wait_ok_now)));
+wire            eng_rd_end;         //E_RD_DRAIN exit: the last CL landing edge
+
+always_ff @(posedge i_CLK or negedge i_POR_n) begin
+    if(!i_POR_n) begin
+        turn_v    <= 1'b0;
+        turn_area <= 3'd0;
+        turn_read <= 1'b0;
+        turn_gap  <= 2'd3;
+    end
+    else begin if(i_BCEN) begin
+        if(ord_end_tk) begin
+            turn_area <= ord_area;
+            turn_read <= !ord_write;
+            turn_v    <= 1'b1;
+            turn_gap  <= 2'd0;
+        end
+        else if(eng_rd_end) begin
+            turn_area <= e_cs3 ? 3'd3 : 3'd2;
+            turn_read <= 1'b1;
+            turn_v    <= 1'b1;
+            turn_gap  <= 2'd0;
+        end
+        else if(eng_wr_done) begin
+            turn_area <= e_cs3 ? 3'd3 : 3'd2;
+            turn_read <= 1'b0;
+            turn_v    <= 1'b1;
+            turn_gap  <= 2'd0;
+        end
+        else if(bus_rel) turn_v <= 1'b0;        //a foreign master owned the pins
+        else if(turn_gap != 2'd3) turn_gap <= turn_gap + 2'd1;
+    end end
+end
+
+//per-area bus width: BCR2 AnSZ for areas 2-6, MD pins for area 0 (table
+//10.4 / p.239): 11 = 32-bit, 10 = 16-bit on D15-D0, 01 = 8-bit on D7-D0.
+//A datum wider than the port walks its byte addresses low-to-high, one
+//full bus cycle each (tables 10.7-10.12); reserved 00 decodes as 32-bit
+logic           ord_w16_c, ord_w8_c;
 always_comb begin
     logic [1:0] a_sz;
     case(fe_area)
@@ -416,17 +546,43 @@ always_comb begin
         3'd5:    a_sz = bcr2[11:10];
         default: a_sz = bcr2[13:12];
     endcase
-    ord_w16_c = (a_sz != 2'b11);
+    ord_w16_c = (a_sz == 2'b10);
+    ord_w8_c  = (a_sz == 2'b01);
 end
 
 logic   [3:0]   ord_cnt;            //remaining wait states of this bus cycle
 logic   [3:0]   ord_cnt2;           //wait count of the second 16-bit sub-cycle
-logic           ord_pin_q;
+logic           ord_pin_q;          //WAIT pin sampled for the current sub-cycle
+logic           ord_pin2;           //WAIT pin enable of the second sub-cycle
 logic           ord_bs_n;           //BS strobe: low for the first cycle of each sub
 logic           ord_w16;            //this access runs on a 16-bit port (D15-D0)
-logic           ord_a1;             //current half: 0 = MS (lanes 31:16), 1 = LS
-logic           ord_second;         //a second sub-cycle is still owed
+logic           ord_w8;             //... or an 8-bit port (D7-D0, WE0 only)
+logic   [1:0]   ord_ba;             //sub-cycle byte address (walks the A1:A0 pins)
+logic   [1:0]   ord_subs;           //sub-cycles still owed after the current one
+logic           ord_t2;             //in the final T2 state (data at its end, fig 10.6)
+logic           ord_ft2;            //current sub-cycle is first-access timed (has a T2);
+logic           ord_ft2_2;          //  burst-pitch beats total the table states directly
 logic           ord_run;            //pins asserted: bus cycle is ON the bus-clock grid
+logic           ord_stb;            //RD/WEn data strobe: mid-T1 -> mid-T2 on first-access
+                                    //timing (tRSD/tWED at the CKIO falls, fig 23.16);
+                                    //pitch beats strobe from the launch instead (silicon
+                                    //holds RD low through a mid-burst sample, fig 23.19)
+logic           ord_cs;             //CSn view: asserts with the launch, negates mid-T2
+                                    //(tCSD2) - a split pair shows the half-CKIO gap
+
+//width-split lane views (tables 10.7-10.12): the register lane of a byte
+//address is endian-mirrored, and the core already laid the datum there
+wire    [1:0]   ord_lane8 = BIG_ENDIAN ? ~ord_ba : ord_ba;      //D7-D0 sub-cycle lane
+wire            ord_hi16  = ord_ba[1] ^ BIG_ENDIAN;             //1: word lanes 31:16
+
+//WAITSEL (WCR1[15], p.241): 1 = WAIT sampled at the mid-state edge (the fall
+//of CKIO), deciding the Tw->T2 transition; 0 = "operation not guaranteed" on
+//silicon - HS3 keeps the legacy boundary-edge sample as its defined behavior
+logic           wait_smp;
+always_ff @(posedge i_CLK) begin
+    if(i_CEN && !i_BCEN) wait_smp <= i_WAIT_n;
+end
+wire            wait_ok_now = wcr1[15] ? wait_smp : i_WAIT_n;
 
 always_ff @(posedge i_CLK or negedge i_RST_n) begin
     if(!i_RST_n) begin
@@ -435,26 +591,47 @@ always_ff @(posedge i_CLK or negedge i_RST_n) begin
         ord_cnt  <= 4'd0;
         ord_cnt2 <= 4'd0;
         ord_pin_q<= 1'b0;
+        ord_pin2 <= 1'b0;
         ord_bs_n <= 1'b1;
         ord_w16  <= 1'b0;
-        ord_a1   <= 1'b0;
-        ord_second <= 1'b0;
+        ord_w8   <= 1'b0;
+        ord_ba   <= 2'd0;
+        ord_subs <= 2'd0;
+        ord_t2   <= 1'b0;
+        ord_ft2  <= 1'b0;
+        ord_ft2_2<= 1'b0;
         ord_run  <= 1'b0;
+        ord_stb  <= 1'b0;
+        ord_cs   <= 1'b0;
     end
     else begin
         if(i_CEN && fe_acc && fe_gen) begin             //request latched at the accept edge;
             ord_busy  <= 1'b1;                          //pins assert on the bus-clock grid
             ord_done  <= 1'b0;                          //(an off-grid accept waits <=1 core
-            ord_run   <= i_BCEN;                        //cycle - real CKIO cycles are aligned)
+            ord_run   <= i_BCEN && ord_idle_ok_nx;      //cycle; WCR1 idles hold the launch)
             ord_cnt   <= ord_cont ? w3_pitch(ord_w3) : ord_first;
             ord_cnt2  <= ord_bst_en ? w3_pitch(ord_w3) : ord_first;
-            ord_pin_q <= ord_pin_en;
+            //WAIT pin: enabled per WCR2 for first-access timing, ALWAYS for
+            //burst-pitch beats (p.242 tables), never on a write-back burst (p.274)
+            ord_pin_q <= (I_BUS.req_burst && I_BUS.req_write) ? 1'b0 :
+                         ord_cont ? 1'b1 : ord_pin_en;
+            ord_pin2  <= (I_BUS.req_burst && I_BUS.req_write) ? 1'b0 :
+                         ord_bst_en ? 1'b1 : ord_pin_en;
             ord_bs_n  <= 1'b0;
+            ord_t2    <= 1'b0;
+            ord_ft2   <= !ord_cont;                     //first-access cycles get a T2;
+            ord_ft2_2 <= !ord_bst_en;                   //pitch beats total the table states
+            ord_stb   <= ord_cont;                      //pitch strobes from the launch;
+            ord_cs    <= 1'b1;                          //  (pins masked until ord_run)
             ord_w16   <= ord_w16_c;
-            //a longword on a 16-bit port splits into two bus cycles (MS first);
-            //narrower accesses run one cycle on the half their address selects
-            ord_a1    <= (ord_w16_c && I_BUS.req_size == 2'd2) ? 1'b0 : fa[1];
-            ord_second<= ord_w16_c && (I_BUS.req_size == 2'd2);
+            ord_w8    <= ord_w8_c;
+            //sub-cycle plan (tables 10.7-10.12): a datum wider than the port
+            //walks its byte addresses low-to-high, one full bus cycle each
+            ord_ba    <= ((ord_w16_c || ord_w8_c) && I_BUS.req_size == 2'd2) ?
+                         2'b00 : fa[1:0];
+            ord_subs  <= ord_w8_c  ? ((I_BUS.req_size == 2'd2) ? 2'd3 :
+                                      (I_BUS.req_size == 2'd1) ? 2'd1 : 2'd0) :
+                         ord_w16_c ? ((I_BUS.req_size == 2'd2) ? 2'd1 : 2'd0) : 2'd0;
             ord_addr  <= fa;
             ord_write <= I_BUS.req_write;
             ord_burst <= I_BUS.req_burst;
@@ -467,26 +644,73 @@ always_ff @(posedge i_CLK or negedge i_RST_n) begin
             ord_busy <= 1'b0;                           //either completion path closes it
             ord_done <= 1'b0;
             ord_run  <= 1'b0;
+            ord_stb  <= 1'b0;                           //hsk fast path may end mid-cycle
+            ord_cs   <= 1'b0;
         end
         else if(i_BCEN && ord_busy && !ord_run) begin
-            ord_run  <= 1'b1;                           //grid-align an off-grid accept
+            if(ord_idle_ok_q) ord_run <= 1'b1;          //grid-align + WCR1 idle gap
         end
         else if(i_BCEN && ord_busy && !ord_done) begin
             ord_bs_n <= 1'b1;                           //BS covers each sub's first cycle
-            if(ord_cnt != 4'd0)                  ord_cnt  <= ord_cnt - 4'd1;
-            else if(!ord_pin_q || i_WAIT_n) begin       //WAIT stretches enabled areas
-                if(ord_w16) begin                       //16-bit port: D15-D0 per half
-                    if(!ord_a1) ord_data[31:16] <= i_D_I[15:0];
-                    else        ord_data[15:0]  <= i_D_I[15:0];
-                end
-                else ord_data <= i_D_I;                 //32-bit port: one live sample
-                if(ord_second) begin                    //advance to the LS half
-                    ord_second <= 1'b0;
-                    ord_a1     <= 1'b1;
+            if(ord_t2) begin                            //T2 closes (data sampled at mid-T2)
+                ord_t2 <= 1'b0;
+                if(ord_subs != 2'd0) begin              //advance to the next byte address
+                    ord_subs   <= ord_subs - 2'd1;
+                    ord_ba     <= ord_ba + (ord_w8 ? 2'd1 : 2'd2);
                     ord_cnt    <= ord_cnt2;             //a fresh bus cycle, fresh waits
+                    ord_ft2    <= ord_ft2_2;
+                    ord_pin_q  <= ord_pin2;
                     ord_bs_n   <= 1'b0;
+                    ord_stb    <= !ord_ft2_2;           //a pitch-timed sub strobes now
+                    ord_cs     <= 1'b1;                 //CSn re-asserts: fresh bus cycle
                 end
                 else ord_done <= 1'b1;
+            end
+            else if(ord_cnt != 4'd0)             ord_cnt  <= ord_cnt - 4'd1;
+            else if(!ord_pin_q || wait_ok_now) begin    //WAIT stretches enabled areas
+                if(ord_ft2) ord_t2 <= 1'b1;             //Tw -> T2 transition (fig 10.10/10.11)
+                else begin                              //pitch beat: last state IS the data state
+                    if(ord_w8)       ord_data[{ord_lane8, 3'd0} +: 8] <= i_D_I[7:0];
+                    else if(ord_w16) begin
+                        if(ord_hi16) ord_data[31:16] <= i_D_I[15:0];
+                        else         ord_data[15:0]  <= i_D_I[15:0];
+                    end
+                    else ord_data <= i_D_I;
+                    if(ord_subs != 2'd0) begin
+                        ord_subs   <= ord_subs - 2'd1;
+                        ord_ba     <= ord_ba + (ord_w8 ? 2'd1 : 2'd2);
+                        ord_cnt    <= ord_cnt2;
+                        ord_ft2    <= ord_ft2_2;
+                        ord_pin_q  <= ord_pin2;
+                        ord_bs_n   <= 1'b0;
+                        ord_stb    <= !ord_ft2_2;       //(pitch stays strobed; ft2 waits
+                        ord_cs     <= 1'b1;             //  for its own mid-T1)
+                    end
+                    else begin
+                        ord_done <= 1'b1;
+                        ord_stb  <= 1'b0;               //envelope drops at this edge too
+                        ord_cs   <= 1'b0;
+                    end
+                end
+            end
+        end
+        //mid-state edge (the CKIO fall): strobes assert at mid-T1 (tRSD/tWED)
+        //and negate at mid-T2 together with CSn (tCSD2); the read sample is
+        //bound to the SAME fall - tRDH1 = 0 ns (p.671) lets the device release
+        //data the moment RD rises, so sampling any later is unbuildable.
+        //Pitch beats keep boundary sampling: their strobe spans the beat and
+        //silicon holds RD low through a mid-burst sample (fig 23.19/23.20)
+        else if(i_CEN && !i_BCEN && ord_busy && ord_run && !ord_done) begin
+            if(!ord_bs_n && ord_ft2) ord_stb <= 1'b1;   //mid-T1 (BS marks the first state)
+            if(ord_t2) begin                            //mid-T2: sample, then negate
+                ord_stb <= 1'b0;
+                ord_cs  <= 1'b0;
+                if(ord_w8)       ord_data[{ord_lane8, 3'd0} +: 8] <= i_D_I[7:0];  //8-bit: D7-D0
+                else if(ord_w16) begin                  //16-bit port: D15-D0 per half
+                    if(ord_hi16) ord_data[31:16] <= i_D_I[15:0];
+                    else         ord_data[15:0]  <= i_D_I[15:0];
+                end
+                else ord_data <= i_D_I;                 //32-bit port: one live sample
             end
         end
     end
@@ -526,7 +750,10 @@ always_ff @(posedge i_CLK or negedge i_RST_n) begin
         sd_rd_beat <= 2'd0;
         sd_wr_ack  <= 1'b0;
         b_rd_act   <= 1'b0;
+        b_rd_cnt   <= 2'd0;
         b_wr_act   <= 1'b0;
+        ordb_act   <= 1'b0;
+        ordb_cnt   <= 2'd0;
     end
     else begin if(i_CEN) begin
         if(fe_acc) begin
@@ -535,6 +762,12 @@ always_ff @(posedge i_CLK or negedge i_RST_n) begin
             if(fe_local) begin                  //register/dummy: one-beat response
                 loc_rsp_v <= 1'b1;
                 loc_rsp_d <= fe_reg ? {2{reg_rd_w}} : 32'd0;
+            end
+
+            //ordinary-bus read line fill: the head beat opens the in-flight track
+            if(fe_gen && I_BUS.req_burst && !I_BUS.req_write && !ordb_act) begin
+                ordb_act <= 1'b1;
+                ordb_cnt <= 2'd0;
             end
 
             if(fe_eng) begin
@@ -546,6 +779,7 @@ always_ff @(posedge i_CLK or negedge i_RST_n) begin
                 if(fe_sdram && !fe_sdmr && I_BUS.req_burst && fe_b_head) begin
                     b_rd_act <= !I_BUS.req_write;
                     b_wr_act <=  I_BUS.req_write;
+                    b_rd_cnt <= 2'd0;
                 end
                 //last drain beat closes the write burst
                 if(b_wr_act && fa[3:2] == 2'b11) b_wr_act <= 1'b0;
@@ -557,8 +791,15 @@ always_ff @(posedge i_CLK or negedge i_RST_n) begin
             sd_wr_ack <= 1'b0;
             if(sd_rd_wait) begin
                 sd_rd_wait <= 1'b0;
-                //last fill beat closes the read burst
-                if(b_rd_act && sd_rd_beat == 2'd3) b_rd_act <= 1'b0;
+                //the 4th consumed beat closes the read burst (count, not position)
+                b_rd_cnt <= b_rd_cnt + 2'd1;
+                if(b_rd_act && b_rd_cnt == 2'd3) b_rd_act <= 1'b0;
+            end
+            //ordinary fill: 4th beat - or a fault (the cache abandons the fill,
+            //no further beats will come) - closes the in-flight track
+            if(owner_q == OWN_GEN && ordb_act) begin
+                if(I_BUS.rsp_fault || ordb_cnt == 2'd3) ordb_act <= 1'b0;
+                else ordb_cnt <= ordb_cnt + 2'd1;
             end
         end
     end end
@@ -567,6 +808,7 @@ end
 //engine op slot: set at the accept edge of a head/single op, cleared when the
 //engine leaves E_IDLE with it. Continuation write beats only top up the buffer.
 logic           eng_op_write, eng_op_burst, eng_op_mrs, eng_op_lock, eng_cs3;
+logic   [1:0]   eng_op_size;
 logic   [31:0]  eng_addr;
 
 //the cache's drain is interruptible (it revisits S_IDLE between beats): a
@@ -593,6 +835,7 @@ always_ff @(posedge i_CLK) begin if(i_CEN) begin
         eng_op_burst <= I_BUS.req_burst && !fe_sdmr;
         eng_op_mrs   <= fe_sdmr;
         eng_op_lock  <= I_BUS.req_lock;
+        eng_op_size  <= I_BUS.req_size;
         eng_cs3      <= fe_sdmr ? (fa[13:12] == 2'b10) : (fe_area == 3'd3);  //0xFFFFExxx = area 3
         eng_addr     <= fa;
     end
@@ -759,6 +1002,91 @@ typedef enum logic [4:0] {
     E_SLF_PALL, E_SLF_WAIT, E_SLF_CMD,  E_SLF,  E_SLF_EXIT  //fig 10.27
 } eng_state_t;
 
+/*
+    Address multiplexing (MCR.AMX + bus width, table 10.13 pp.279-280).
+    ROW phase: pins A16-A1 output addr >> shift ("the row address begins
+    with A(shift+1)", p.247); A25-A17 and A0 keep the original value.
+    COLUMN phase: the original address, except (a) the auto-precharge flag
+    replaces the device-A10 pin - chip A12 on a 32-bit bus, A11 on 16-bit -
+    and (b) a per-mode set of the pins A16-A13 HOLDS its row-phase value,
+    which keeps the bank bits standing on the device BA pins through the
+    whole access (the *4 columns of table 10.13). Reserved and still-0000
+    AMX codes decode as the shift-8 family; the manual forbids access
+    before AMX is programmed.
+*/
+
+//row shift by AMX family (identical for both bus widths)
+function automatic logic [3:0] amx_shift(input logic [3:0] amx);
+    case(amx)
+        4'b1110: amx_shift = 4'd10;         //8Mx16 (16-bit bus only)
+        4'b1101: amx_shift = 4'd9;          //4Mx16
+        4'b0101: amx_shift = 4'd9;          //2Mx16 / 2Mx8
+        default: amx_shift = 4'd8;          //0100 1Mx16, 0111 512kx32, reserved
+    endcase
+endfunction
+
+//column-phase hold mask over pins {A16,A15,A14,A13} (row values kept)
+function automatic logic [3:0] amx_hold(input logic w16, input logic [3:0] amx);
+    if(w16) amx_hold = (amx == 4'b0101 || amx == 4'b1101 || amx == 4'b1110) ?
+                       4'b0111 : 4'b0011;
+    else    amx_hold = (amx == 4'b1101) ? 4'b1110 :
+                       (amx == 4'b0111) ? 4'b0011 : 4'b0110;
+endfunction
+
+//bank address LSB position within the physical address
+function automatic logic [4:0] amx_blsb(input logic w16, input logic [3:0] amx);
+    case(amx)
+        4'b1110: amx_blsb = 5'd24;
+        4'b1101: amx_blsb = w16 ? 5'd23 : 5'd24;
+        4'b0101: amx_blsb = w16 ? 5'd22 : 5'd23;
+        4'b0111: amx_blsb = 5'd21;
+        default: amx_blsb = w16 ? 5'd21 : 5'd22;
+    endcase
+endfunction
+
+//ROW-phase pin pattern of an address
+function automatic logic [25:0] amx_row(input logic [3:0] amx, input logic [31:0] a);
+    logic [4:0] sh;
+    sh = {1'b0, amx_shift(amx)};
+    amx_row = {a[25:17], a[(5'd16 + sh) -: 16], a[0]};
+endfunction
+
+//COLUMN-phase pin pattern (ap = auto-precharge flag on the device A10 pin)
+function automatic logic [25:0] amx_col(input logic w16, input logic [3:0] amx,
+                                        input logic [31:0] a, input logic ap);
+    logic [4:0]  sh;
+    logic [3:0]  hm;
+    logic [25:0] c;
+    sh = {1'b0, amx_shift(amx)};
+    hm = amx_hold(w16, amx);
+    c  = a[25:0];
+    if(hm[0]) c[13] = a[5'd13 + sh];
+    if(hm[1]) c[14] = a[5'd14 + sh];
+    if(hm[2]) c[15] = a[5'd15 + sh];
+    if(hm[3]) c[16] = a[5'd16 + sh];
+    if(w16) c[11] = ap;
+    else    c[12] = ap;
+    amx_col = c;
+endfunction
+
+//bank bits of an address
+function automatic logic [1:0] amx_bank(input logic w16, input logic [3:0] amx,
+                                        input logic [31:0] a);
+    amx_bank = a[amx_blsb(w16, amx) +: 2];
+endfunction
+
+//device row bits of an address, right-justified (11-13 bits; 0-padded so the
+//open-row table compares only DEVICE-meaningful bits - a pin-pattern compare
+//would fake row conflicts on the sub-row address bits)
+function automatic logic [12:0] amx_rowv(input logic w16, input logic [3:0] amx,
+                                         input logic [31:0] a);
+    logic [4:0] rl;
+    logic [4:0] w;
+    rl = {1'b0, amx_shift(amx)} + (w16 ? 5'd1 : 5'd2);  //device A0 pin: A1 / A2
+    w  = amx_blsb(w16, amx) - rl;                       //row width 11-13
+    amx_rowv = 13'(a >> rl) & ~(13'h1FFF << w);
+endfunction
+
 //shared-bus pin registers of the SDRAM engine (merged with the ordinary
 //controller's drive at the physical pin mux below)
 logic           sd_cs2_n, sd_cs3_n;
@@ -772,28 +1100,81 @@ logic           sd_dq_oe;
 
 eng_state_t     est;
 logic   [3:0]   ecnt;               //shared wait counter
-logic   [1:0]   ebeat;              //command beat within a burst
-logic   [2:0]   rd_need;            //data landings still expected
+logic   [2:0]   ebeat;              //command beat within a burst: word index (32-bit bus,
+                                    //wraps mod 4) or half-word index A3:A1 (16-bit, mod 8)
+logic   [2:0]   ebcnt;              //command beats issued so far (fills wrap round the line)
+logic   [2:0]   e_bm1;              //command beats of this op, minus 1 (0/1/3/7)
+logic   [3:0]   rd_need;            //data landings still expected
 logic   [2:0]   wr_recov;           //bank-active write recovery (tWR) before a precharge
 logic           e_write, e_burst, e_cs3, e_lock_hold;
+logic           e_sd16;             //op runs on a 16-bit SDRAM data bus (BCR2)
+logic   [1:0]   e_size;             //single-access size (drives the read DQM byte lanes)
 logic   [31:0]  e_addr;
 logic           rst_z;              //front-end reset, sampled for the write-abort escape
 
+//32-bit-lane byte enables of an access (strobe maps of tables 10.7/10.10):
+//"a read/write is performed for the byte for which the corresponding DQM is
+//low" (p.276) - single reads drive only their own lanes
+function automatic logic [3:0] sz_lanes(input logic [1:0] a, input logic [1:0] sz);
+    case(sz)
+        2'd0:    sz_lanes = BIG_ENDIAN ? (4'b1000 >> a) : (4'b0001 << a);
+        2'd1:    sz_lanes = (a[1] ^ BIG_ENDIAN) ? 4'b1100 : 4'b0011;
+        default: sz_lanes = 4'b1111;
+    endcase
+endfunction
+
 //read-latency pipeline: slot n = a READ issued n+1 bus cycles ago; the slot
-//at CL-1 leaving the pipe means DQ carries that beat's data at this edge
+//at CL-1 leaving the pipe means DQ carries that beat's data at this edge.
+//rdp_f marks landings that COMPLETE their 32-bit word (16-bit bus: the odd
+//half of a word pair, or a lone word/byte beat)
 logic   [2:0]   rdp_v;
-logic   [1:0]   rdp_b [0:2];
+logic   [2:0]   rdp_b [0:2];
+logic   [2:0]   rdp_f;
 wire    [1:0]   e_cl    = e_cs3 ? cl_a3 : cl_a2;
 wire            rd_lat  = rdp_v[e_cl - 2'd1];
-wire    [1:0]   rd_latb = rdp_b[e_cl - 2'd1];
+wire    [2:0]   rd_latb = rdp_b[e_cl - 2'd1];
+wire            rd_latf = rdp_f[e_cl - 2'd1];
+wire    [1:0]   rd_latw = e_sd16 ? rd_latb[2:1] : rd_latb[1:0];     //word slot
+wire            rd_lath = rd_latb[0] ^ BIG_ENDIAN;  //16-bit half: 1 = word lanes 31:16
+assign  eng_rd_end = (est == E_RD_DRAIN) && (rd_need == 4'd1) && rd_lat;
 
-//bank-active open-row table (device: 4 banks)
+//BS marks the Td DATA cycles of a read, not the commands ("asserted in each
+//of cycles Td1-Td4 in a synchronous DRAM cycle", p.283): predict next-cycle
+//landings one slot earlier in the CL pipe (a write's command IS its data
+//cycle, so E_WR keeps its own BS)
+logic           rd_td_nx;
+always_comb begin
+    case(e_cl)
+        2'd1:    rd_td_nx = (est == E_RD);      //CL=1: data rides the cycle after issue
+        2'd2:    rd_td_nx = rdp_v[0];
+        default: rd_td_nx = rdp_v[1];
+    endcase
+end
+
+//bank-active open-row table (device: 4 banks); bank/row per the AMX decode
 logic   [3:0]   ba_v;
-logic   [10:0]  ba_row [0:3];
-wire    [1:0]   e_bank   = e_addr[22:21];
-wire    [10:0]  e_row    = e_addr[20:10];
+logic   [12:0]  ba_row [0:3];
+wire    [1:0]   e_bank   = amx_bank(e_sd16, mcr[6:3], e_addr);
+wire    [12:0]  e_row    = amx_rowv(e_sd16, mcr[6:3], e_addr);
 wire            row_hit  = ba_v[e_bank] && (ba_row[e_bank] == e_row);
 wire            row_conf = ba_v[e_bank] && (ba_row[e_bank] != e_row);
+
+//live twins on the un-dispatched op (the E_IDLE fold decides from these)
+wire            eng_sd16    = eng_cs3 ? sd16_a3 : sd16_a2;
+wire    [1:0]   eng_bank    = amx_bank(eng_sd16, mcr[6:3], eng_addr);
+wire    [12:0]  eng_rowv    = amx_rowv(eng_sd16, mcr[6:3], eng_addr);
+wire            row_hit_nx  = ba_v[eng_bank] && (ba_row[eng_bank] == eng_rowv);
+wire            row_conf_nx = ba_v[eng_bank] && (ba_row[eng_bank] != eng_rowv);
+wire    [1:0]   e_cl_nx     = eng_cs3 ? cl_a3 : cl_a2;
+
+//single-rail AMX modes (table 10.13 note 1: A25 is a bank bit, one device
+//set spans the whole 64MB) never drive RAS3U/CASU; otherwise A25 picks the
+//upper/lower 32MB rail (note 2)
+wire            amx_nou    = (mcr[6:3] == (e_sd16   ? 4'b1110 : 4'b1101));
+wire            amx_nou_nx = (mcr[6:3] == (eng_sd16 ? 4'b1110 : 4'b1101));
+wire            amx_nou_gl = (mcr[6:3] == (sd16_gl  ? 4'b1110 : 4'b1101));
+wire            e_up       = e_addr[25]   && !amx_nou;
+wire            eng_up     = eng_addr[25] && !amx_nou_nx;
 
 //bus arbitration (p.320): BREQ is granted only with the bus drained (engine
 //idle or parked in self-refresh, no ordinary cycle, no queued op) and all
@@ -835,30 +1216,56 @@ logic           ref_req;
 wire            ref_ok = ref_req && rfsh && !rmode && !e_lock_hold;
 wire            self_req = rfsh && rmode;               //MCR.RMODE level (p.300)
 
-assign  eng_start_tk = (est == E_IDLE) && i_BCEN && eng_go && !ref_ok && !self_req;
+//dispatch qualifier: EXACTLY the E_IDLE case's arm order (ord bus ownership,
+//BREQ row-close, refresh, self-refresh all outrank an op) + the WCR1 idle gap.
+//eng_start_tk previously ignored the higher arms - an op could be consumed by
+//a BRQ_PALL edge (lost op wedge) or double-dispatched under BREQ+refresh.
+wire            eng_idle_ok    = idle_ok(eng_cs3 ? 3'd3 : 3'd2, eng_op_write);
+wire            eng_dispatch_ok = !ord_busy && !(brq && ba_v != 4'd0) &&
+                                  !(ref_ok && !bus_held) && !(self_req && !bus_held) &&
+                                  eng_idle_ok;
+assign  eng_start_tk = (est == E_IDLE) && i_BCEN && eng_go && eng_dispatch_ok;
 //E_SLF is a PARKED state: the SDRAM sits in self-refresh on CKE alone and
 //the shared bus is free for ordinary cycles (a new SDRAM op is still held
 //off by self_active). Everything else counts as bus ownership.
 assign  eng_busy     = (est != E_IDLE) && (est != E_SLF);
 
-wire    [1:0]   wr_slot   = e_burst ? ebeat : e_addr[3:2];
-assign  eng_wr_done = (est == E_WR) && i_BCEN && wr_v[wr_slot] &&
-                      (!e_burst || ebeat == 2'd3);
+//per-beat views: the beat index rides A3:A2 of the column (A3:A1 on a 16-bit
+//bus, p.283); drains are position-ordered so their last beat tests ebeat
+wire    [31:0]  e_beat_addr = e_sd16 ? {e_addr[31:4], ebeat, e_addr[0]}
+                                     : {e_addr[31:4], ebeat[1:0], e_addr[1:0]};
+wire            rd_cmd_fin  = !e_sd16 ||
+                              ((e_burst || e_size == 2'd2) ? ebeat[0] : 1'b1);
+wire            wr_last     = e_sd16 ? (e_burst ? (ebeat == 3'd7) :
+                                        (e_size == 2'd2 ? ebeat[0] : 1'b1))
+                                     : (!e_burst || ebeat[1:0] == 2'd3);
+wire            wr_hi       = ebeat[0] ^ BIG_ENDIAN;    //16-bit half: word lanes 31:16
+wire    [1:0]   wr_slot     = e_burst ? (e_sd16 ? ebeat[2:1] : ebeat[1:0]) : e_addr[3:2];
+assign  eng_wr_done = (est == E_WR) && i_BCEN && wr_v[wr_slot] && wr_last;
+
+//16-bit-bus read DQM pair (DQMLU/DQMLL rails; tables 10.8/10.11 strobe map)
+wire    [1:0]   rd16_dqml   = (e_burst || e_size != 2'd0) ? 2'b00 :
+                              ((e_addr[0] ^ BIG_ENDIAN) ? 2'b01 : 2'b10);
 
 always_ff @(posedge i_CLK or negedge i_POR_n) begin
     if(!i_POR_n) begin
         est   <= E_IDLE;
         ecnt  <= 4'd0;
-        ebeat <= 2'd0;
-        rd_need <= 3'd0;
+        ebeat <= 3'd0;
+        ebcnt <= 3'd0;
+        e_bm1 <= 3'd0;
+        rd_need <= 4'd0;
         wr_recov <= 3'd0;
         e_write <= 1'b0; e_burst <= 1'b0; e_cs3 <= 1'b0; e_lock_hold <= 1'b0;
+        e_sd16  <= 1'b0;
+        e_size  <= 2'd0;
         e_addr  <= 32'd0;
         rst_z   <= 1'b0;
         rdp_v <= 3'd0;
-        rdp_b[0] <= 2'd0; rdp_b[1] <= 2'd0; rdp_b[2] <= 2'd0;
+        rdp_f <= 3'd0;
+        rdp_b[0] <= 3'd0; rdp_b[1] <= 3'd0; rdp_b[2] <= 3'd0;
         ba_v  <= 4'd0;
-        ba_row[0] <= 11'd0; ba_row[1] <= 11'd0; ba_row[2] <= 11'd0; ba_row[3] <= 11'd0;
+        ba_row[0] <= 13'd0; ba_row[1] <= 13'd0; ba_row[2] <= 13'd0; ba_row[3] <= 13'd0;
         sd_cs2_n  <= 1'b1; sd_cs3_n  <= 1'b1;
         sd_rasl_n <= 1'b1; sd_rasu_n <= 1'b1;
         sd_casl_n <= 1'b1; sd_casu_n <= 1'b1;
@@ -874,18 +1281,22 @@ always_ff @(posedge i_CLK or negedge i_POR_n) begin
 
         //every cycle defaults to NOP/deselect; op arms below override.
         //WE/DQM idles HIGH (shared with the ordinary write strobes); a read
-        //op holds all lanes low from the row open (2-cycle DQM lead, p.290)
+        //op holds its LANES low from the row open (2-cycle DQM lead, p.290;
+        //single reads enable only the addressed bytes - p.276, tables 10.7+)
         sd_cs2_n  <= 1'b1; sd_cs3_n  <= 1'b1;
         sd_rasl_n <= 1'b1; sd_rasu_n <= 1'b1;
         sd_casl_n <= 1'b1; sd_casu_n <= 1'b1;
         sd_cmdwe_n <= 1'b1;
         sd_dqm    <= (!e_write && (est == E_ACTV || est == E_RCD ||
-                                   est == E_RD   || est == E_RD_DRAIN)) ? 4'b0000 : 4'b1111;
+                                   est == E_RD   || est == E_RD_DRAIN)) ?
+                     (e_sd16  ? {2'b11, rd16_dqml} :
+                      e_burst ? 4'b0000 : ~sz_lanes(e_addr[1:0], e_size)) : 4'b1111;
         sd_bs_n   <= 1'b1;
         sd_dq_oe  <= 1'b0;
 
         //read-latency pipeline always shifts; E_RD refills slot 0
         rdp_v    <= {rdp_v[1:0], 1'b0};
+        rdp_f    <= {rdp_f[1:0], 1'b0};
         rdp_b[1] <= rdp_b[0];
         rdp_b[2] <= rdp_b[1];
 
@@ -898,18 +1309,80 @@ always_ff @(posedge i_CLK or negedge i_POR_n) begin
             else if(brq && ba_v != 4'd0) est <= E_BRQ_PALL; //close rows, then grant
             else if(ref_ok && !bus_held)   est <= E_REF_PALL;
             else if(self_req && !bus_held) est <= E_SLF_PALL;
-            else if(eng_go) begin
+            else if(eng_go && eng_idle_ok) begin
                 e_write <= eng_op_write;
                 e_burst <= eng_op_burst;
                 e_cs3   <= eng_cs3;
+                e_sd16  <= eng_sd16;
+                e_size  <= eng_op_size;
                 e_addr  <= eng_addr;
                 //a locked read opens the refresh-deferral window (TAS pair)
                 if(eng_op_lock && !eng_op_write) e_lock_hold <= 1'b1;
-                ebeat   <= eng_addr[3:2];           //bursts resume from their own beat
-                rd_need <= eng_op_burst ? 3'd4 : 3'd1;
-                if(eng_op_mrs)  est <= E_MRS_PALL;
-                else if(rasd)   est <= E_BA_DISP;
-                else            est <= E_ACTV;
+                //bursts start at their own beat (fill reads wrap round the
+                //line); a 16-bit bus runs half-word beats off A3:A1
+                ebeat   <= eng_sd16 ? eng_addr[3:1] : {1'b0, eng_addr[3:2]};
+                ebcnt   <= 3'd0;
+                e_bm1   <= eng_sd16 ? (eng_op_burst ? 3'd7 :
+                                       (eng_op_size == 2'd2 ? 3'd1 : 3'd0))
+                                    : (eng_op_burst ? 3'd3 : 3'd0);
+                rd_need <= eng_sd16 ? (eng_op_burst ? 4'd8 :
+                                       (eng_op_size == 2'd2 ? 4'd2 : 4'd1))
+                                    : (eng_op_burst ? 4'd4 : 4'd1);
+                //the first command issues AT this dispatch edge from the live
+                //op fields - the real chip overlaps dispatch with the previous
+                //op's tail, no NOP between ops (figs 10.14-10.24)
+                if(eng_op_mrs) begin
+                    if(wr_recov == 3'd0) begin      //tWR guard (bank-active writes)
+                        sd_cs2_n <= ~a2_sdram; sd_cs3_n <= ~a3_sdram;   //PALL, all devices
+                        sd_rasl_n <= 1'b0; sd_rasu_n <= amx_nou_gl;
+                        sd_cmdwe_n <= 1'b0;
+                        sd_a[12] <= 1'b1; sd_a[11] <= 1'b1;     //device A10, either width
+                        ba_v <= 4'd0;
+                        if(t_tpc == 3'd1) est <= E_MRS_SET;
+                        else begin ecnt <= {1'b0, t_tpc} - 4'd1; est <= E_MRS_WAIT; end
+                    end
+                    else est <= E_MRS_PALL;         //guard draining: park and retry
+                end
+                else if(rasd) begin                 //bank-active row decision, live fields
+                    if(row_hit_nx) begin
+                        if(!eng_op_write && e_cl_nx == 2'd1) begin  //Tnop: DQM 2-cycle lead
+                            ecnt <= 4'd1;
+                            est  <= E_RCD;
+                        end
+                        else est <= eng_op_write ? E_WR : E_RD;
+                    end
+                    else if(row_conf_nx) begin
+                        if(wr_recov == 3'd0) begin  //tWR guard before the precharge
+                            sd_cs2_n <= eng_cs3; sd_cs3_n <= ~eng_cs3;
+                            if(eng_up) sd_rasu_n <= 1'b0;           //PRE this bank
+                            else       sd_rasl_n <= 1'b0;
+                            sd_cmdwe_n <= 1'b0;
+                            sd_a <= amx_col(eng_sd16, mcr[6:3], eng_addr, 1'b0);
+                            ba_v[eng_bank] <= 1'b0;
+                            if(t_tpc == 3'd1) est <= E_ACTV;
+                            else begin ecnt <= {1'b0, t_tpc} - 4'd1; est <= E_PRE_WAIT; end
+                        end
+                        else est <= E_BA_DISP;      //guard draining: park and retry
+                    end
+                    else begin                      //bank idle: ACTV at this edge
+                        sd_cs2_n <= eng_cs3; sd_cs3_n <= ~eng_cs3;
+                        if(eng_up) sd_rasu_n <= 1'b0;
+                        else       sd_rasl_n <= 1'b0;
+                        sd_a <= amx_row(mcr[6:3], eng_addr);
+                        ba_v[eng_bank]   <= 1'b1;
+                        ba_row[eng_bank] <= eng_rowv;
+                        if(t_rcd == 3'd1) est <= eng_op_write ? E_WR : E_RD;
+                        else begin ecnt <= {1'b0, t_rcd} - 4'd1; est <= E_RCD; end
+                    end
+                end
+                else begin                          //auto-precharge: ACTV at this edge
+                    sd_cs2_n <= eng_cs3; sd_cs3_n <= ~eng_cs3;
+                    if(eng_up) sd_rasu_n <= 1'b0;
+                    else       sd_rasl_n <= 1'b0;
+                    sd_a <= amx_row(mcr[6:3], eng_addr);
+                    if(t_rcd == 3'd1) est <= eng_op_write ? E_WR : E_RD;
+                    else begin ecnt <= {1'b0, t_rcd} - 4'd1; est <= E_RCD; end
+                end
             end
         end
 
@@ -917,9 +1390,9 @@ always_ff @(posedge i_CLK or negedge i_POR_n) begin
         E_MRS_PALL: begin
             if(wr_recov == 3'd0) begin                  //tWR guard (bank-active writes)
                 sd_cs2_n <= ~a2_sdram; sd_cs3_n <= ~a3_sdram;   //PALL, all devices
-                sd_rasl_n <= 1'b0; sd_rasu_n <= 1'b0;           //U+L together (p.276)
+                sd_rasl_n <= 1'b0; sd_rasu_n <= amx_nou_gl;     //U+L together (p.276)
                 sd_cmdwe_n <= 1'b0;
-                sd_a[12] <= 1'b1;                               //chip A12 = device A10
+                sd_a[12] <= 1'b1; sd_a[11] <= 1'b1;             //device A10, either width
                 ba_v <= 4'd0;
                 if(t_tpc == 3'd1) est <= E_MRS_SET;
                 else begin ecnt <= {1'b0, t_tpc} - 4'd1; est <= E_MRS_WAIT; end
@@ -931,10 +1404,10 @@ always_ff @(posedge i_CLK or negedge i_POR_n) begin
         end
         E_MRS_SET: begin
             sd_cs2_n <= e_cs3; sd_cs3_n <= ~e_cs3;
-            sd_rasl_n <= 1'b0; sd_rasu_n <= 1'b0;       //MRS drives U+L (p.276)
-            sd_casl_n <= 1'b0; sd_casu_n <= 1'b0;
+            sd_rasl_n <= 1'b0; sd_rasu_n <= amx_nou;    //MRS drives U+L (p.276)
+            sd_casl_n <= 1'b0; sd_casu_n <= amx_nou;
             sd_cmdwe_n <= 1'b0;
-            sd_a     <= e_addr[25:0];                   //mode value rides A12:A2 (p.252)
+            sd_a     <= e_addr[25:0];                   //mode value rides A12:A2 / A11:A1
             ecnt <= 4'd4;                               //TMw1-4 covers tMRD (fig 10.28)
             est  <= E_MRS_MRD;
         end
@@ -956,11 +1429,10 @@ always_ff @(posedge i_CLK or negedge i_POR_n) begin
             else if(row_conf) begin
                 if(wr_recov == 3'd0) begin              //tWR guard before the precharge
                     sd_cs2_n <= e_cs3; sd_cs3_n <= ~e_cs3;
-                    if(e_addr[25]) sd_rasu_n <= 1'b0;       //PRE this bank
-                    else           sd_rasl_n <= 1'b0;
-                    sd_cmdwe_n  <= 1'b0;
-                    sd_a[12]    <= 1'b0;
-                    sd_a[14:13] <= e_bank;
+                    if(e_up) sd_rasu_n <= 1'b0;             //PRE this bank
+                    else     sd_rasl_n <= 1'b0;
+                    sd_cmdwe_n <= 1'b0;
+                    sd_a <= amx_col(e_sd16, mcr[6:3], e_addr, 1'b0);
                     ba_v[e_bank] <= 1'b0;
                     if(t_tpc == 3'd1) est <= E_ACTV;
                     else begin ecnt <= {1'b0, t_tpc} - 4'd1; est <= E_PRE_WAIT; end
@@ -976,9 +1448,9 @@ always_ff @(posedge i_CLK or negedge i_POR_n) begin
         /* row activate + RAS-CAS gap (Tr, Trw; p.281) */
         E_ACTV: begin
             sd_cs2_n <= e_cs3; sd_cs3_n <= ~e_cs3;
-            if(e_addr[25]) sd_rasu_n <= 1'b0;           //ACTV (RAS3L/U by 32MB half)
-            else           sd_rasl_n <= 1'b0;
-            sd_a     <= {e_addr[25:15], e_bank, e_row, e_addr[1:0]};    //row on A12:A2
+            if(e_up) sd_rasu_n <= 1'b0;                 //ACTV (RAS3L/U by 32MB half)
+            else     sd_rasl_n <= 1'b0;
+            sd_a     <= amx_row(mcr[6:3], e_addr);      //row = addr >> shift on A16-A1
             if(rasd) begin
                 ba_v[e_bank]   <= 1'b1;
                 ba_row[e_bank] <= e_row;
@@ -991,22 +1463,27 @@ always_ff @(posedge i_CLK or negedge i_POR_n) begin
             else             ecnt <= ecnt - 4'd1;
         end
 
-        /* READ/READA beats, one per cycle (Tc1-Tc4; READA unless bank-active) */
+        /* READ/READA beats, one per cycle, WRAPPING round the line from the
+           missed word (fig 10.16 column order; READA on the 4th/last beat) */
         E_RD: begin
             sd_cs2_n <= e_cs3; sd_cs3_n <= ~e_cs3;
-            if(e_addr[25]) sd_casu_n <= 1'b0;           //READ / READA
-            else           sd_casl_n <= 1'b0;
-            //column phase: chip A12 = auto-precharge flag, A9:A2 = column
-            sd_a     <= {e_addr[25:15], e_bank, (!rasd && (!e_burst || ebeat == 2'd3)),
-                         e_addr[11:10], e_addr[9:4], ebeat, e_addr[1:0]};
-            sd_bs_n  <= 1'b0;
+            if(e_up) sd_casu_n <= 1'b0;                 //READ / READA
+            else     sd_casl_n <= 1'b0;
+            //column phase: beat index replaces A3:A2 (A3:A1 on 16-bit),
+            //READA flag on the last command
+            sd_a     <= amx_col(e_sd16, mcr[6:3], e_beat_addr,
+                                !rasd && (ebcnt == e_bm1));
             rdp_v[0]   <= 1'b1;
             rdp_b[0]   <= ebeat;
-            if(!e_burst || ebeat == 2'd3) est <= E_RD_DRAIN;
-            else                          ebeat <= ebeat + 2'd1;
+            rdp_f[0]   <= rd_cmd_fin;
+            if(ebcnt == e_bm1) est <= E_RD_DRAIN;
+            else begin                                  //wraps round the line
+                ebeat <= e_sd16 ? (ebeat + 3'd1) : {1'b0, ebeat[1:0] + 2'd1};
+                ebcnt <= ebcnt + 3'd1;
+            end
         end
         E_RD_DRAIN: begin                               //exit at the last CL landing edge
-            if(rd_need == 3'd1 && rd_lat) begin
+            if(eng_rd_end) begin
                 if(rasd) est <= E_IDLE;                 //no precharge tail in bank-active
                 else begin ecnt <= {1'b0, t_tpc}; est <= E_RD_TPC; end
             end
@@ -1036,16 +1513,19 @@ always_ff @(posedge i_CLK or negedge i_POR_n) begin
             end
             else if(wr_v[wr_slot]) begin
                 sd_cs2_n <= e_cs3; sd_cs3_n <= ~e_cs3;
-                if(e_addr[25]) sd_casu_n <= 1'b0;       //WRIT / WRITA
-                else           sd_casl_n <= 1'b0;
+                if(e_up) sd_casu_n <= 1'b0;             //WRIT / WRITA
+                else     sd_casl_n <= 1'b0;
                 sd_cmdwe_n <= 1'b0;
-                sd_a     <= {e_addr[25:15], e_bank, (!rasd && (!e_burst || ebeat == 2'd3)),
-                             e_addr[11:10], e_addr[9:4], ebeat, e_addr[1:0]};
-                sd_dq_o  <= wr_buf [wr_slot];
-                sd_dqm   <= ~wr_strb[wr_slot];
+                sd_a     <= amx_col(e_sd16, mcr[6:3], e_beat_addr, !rasd && wr_last);
+                //a 16-bit bus drains half a word per beat on D15-D0
+                sd_dq_o  <= !e_sd16 ? wr_buf[wr_slot] :
+                            {2{wr_hi ? wr_buf[wr_slot][31:16] : wr_buf[wr_slot][15:0]}};
+                sd_dqm   <= !e_sd16 ? ~wr_strb[wr_slot] :
+                            {2'b11, ~(wr_hi ? wr_strb[wr_slot][3:2]
+                                            : wr_strb[wr_slot][1:0])};
                 sd_dq_oe <= 1'b1;
                 sd_bs_n  <= 1'b0;
-                if(!e_burst || ebeat == 2'd3) begin
+                if(wr_last) begin
                     e_lock_hold <= 1'b0;                //locked pair completed
                     //bank-active: no Trwl/Tpc tail (p.289), but the bus stays
                     //owned for the WRIT command's own cycle (one E_WR_TRWL
@@ -1055,7 +1535,7 @@ always_ff @(posedge i_CLK or negedge i_POR_n) begin
                     ecnt <= rasd ? 4'd1 : {1'b0, t_trwl};
                     est  <= E_WR_TRWL;
                 end
-                else ebeat <= ebeat + 2'd1;
+                else ebeat <= e_sd16 ? (ebeat + 3'd1) : {1'b0, ebeat[1:0] + 2'd1};
             end
         end
         E_WR_TRWL: begin
@@ -1075,11 +1555,10 @@ always_ff @(posedge i_CLK or negedge i_POR_n) begin
         E_WR_YIELD: begin                               //close an interrupted AP burst
             if(ecnt <= 4'd1) begin
                 sd_cs2_n <= e_cs3; sd_cs3_n <= ~e_cs3;
-                if(e_addr[25]) sd_rasu_n <= 1'b0;       //PRE the bank the WRITs opened
-                else           sd_rasl_n <= 1'b0;
-                sd_cmdwe_n  <= 1'b0;
-                sd_a[12]    <= 1'b0;
-                sd_a[14:13] <= e_bank;
+                if(e_up) sd_rasu_n <= 1'b0;             //PRE the bank the WRITs opened
+                else     sd_rasl_n <= 1'b0;
+                sd_cmdwe_n <= 1'b0;
+                sd_a <= amx_col(e_sd16, mcr[6:3], e_addr, 1'b0);
                 ecnt <= {1'b0, t_tpc};
                 est  <= E_WR_TPC;
             end
@@ -1091,9 +1570,9 @@ always_ff @(posedge i_CLK or negedge i_POR_n) begin
         E_BRQ_PALL: begin
             if(wr_recov == 3'd0) begin                  //tWR guard as everywhere
                 sd_cs2_n <= ~a2_sdram; sd_cs3_n <= ~a3_sdram;
-                sd_rasl_n <= 1'b0; sd_rasu_n <= 1'b0;   //PALL, all devices
+                sd_rasl_n <= 1'b0; sd_rasu_n <= amx_nou_gl;     //PALL, all devices
                 sd_cmdwe_n <= 1'b0;
-                sd_a[12] <= 1'b1;
+                sd_a[12] <= 1'b1; sd_a[11] <= 1'b1;             //device A10, either width
                 ba_v <= 4'd0;
                 if(t_tpc == 3'd1) est <= E_IDLE;
                 else begin ecnt <= {1'b0, t_tpc} - 4'd1; est <= E_BRQ_WAIT; end
@@ -1108,9 +1587,9 @@ always_ff @(posedge i_CLK or negedge i_POR_n) begin
         E_REF_PALL: begin
             if(wr_recov == 3'd0) begin                  //tWR guard (bank-active writes)
                 sd_cs2_n <= ~a2_sdram; sd_cs3_n <= ~a3_sdram;
-                sd_rasl_n <= 1'b0; sd_rasu_n <= 1'b0;
+                sd_rasl_n <= 1'b0; sd_rasu_n <= amx_nou_gl;
                 sd_cmdwe_n <= 1'b0;
-                sd_a[12] <= 1'b1;
+                sd_a[12] <= 1'b1; sd_a[11] <= 1'b1;     //device A10, either width
                 ba_v <= 4'd0;                           //refresh closes all banks (p.290)
                 if(t_tpc == 3'd1) est <= E_REF_CMD;
                 else begin ecnt <= {1'b0, t_tpc} - 4'd1; est <= E_REF_WAIT; end
@@ -1122,8 +1601,8 @@ always_ff @(posedge i_CLK or negedge i_POR_n) begin
         end
         E_REF_CMD: begin
             sd_cs2_n <= ~a2_sdram; sd_cs3_n <= ~a3_sdram;
-            sd_rasl_n <= 1'b0; sd_rasu_n <= 1'b0;       //REF drives U+L (p.276)
-            sd_casl_n <= 1'b0; sd_casu_n <= 1'b0;
+            sd_rasl_n <= 1'b0; sd_rasu_n <= amx_nou_gl; //REF drives U+L (p.276)
+            sd_casl_n <= 1'b0; sd_casu_n <= amx_nou_gl;
             ecnt <= {1'b0, t_tras} + {1'b0, t_tpc} - 4'd1;
             est  <= E_REF_LOCK;
         end
@@ -1136,9 +1615,9 @@ always_ff @(posedge i_CLK or negedge i_POR_n) begin
         E_SLF_PALL: begin
             if(wr_recov == 3'd0) begin                  //tWR guard (bank-active writes)
                 sd_cs2_n <= ~a2_sdram; sd_cs3_n <= ~a3_sdram;
-                sd_rasl_n <= 1'b0; sd_rasu_n <= 1'b0;
+                sd_rasl_n <= 1'b0; sd_rasu_n <= amx_nou_gl;
                 sd_cmdwe_n <= 1'b0;
-                sd_a[12] <= 1'b1;
+                sd_a[12] <= 1'b1; sd_a[11] <= 1'b1;     //device A10, either width
                 ba_v <= 4'd0;
                 if(t_tpc == 3'd1) est <= E_SLF_CMD;
                 else begin ecnt <= {1'b0, t_tpc} - 4'd1; est <= E_SLF_WAIT; end
@@ -1150,8 +1629,8 @@ always_ff @(posedge i_CLK or negedge i_POR_n) begin
         end
         E_SLF_CMD: begin
             sd_cs2_n <= ~a2_sdram; sd_cs3_n <= ~a3_sdram;
-            sd_rasl_n <= 1'b0; sd_rasu_n <= 1'b0;       //SELF = REF with CKE low
-            sd_casl_n <= 1'b0; sd_casu_n <= 1'b0;
+            sd_rasl_n <= 1'b0; sd_rasu_n <= amx_nou_gl; //SELF = REF with CKE low
+            sd_casl_n <= 1'b0; sd_casu_n <= amx_nou_gl;
             sd_cke   <= 1'b0;
             est <= E_SLF;
         end
@@ -1171,6 +1650,9 @@ always_ff @(posedge i_CLK or negedge i_POR_n) begin
         default: est <= E_IDLE;
         endcase
 
+        //read Td cycles carry BS (p.283) - override the default/arm value
+        if(rd_td_nx) sd_bs_n <= 1'b0;
+
         //read-data landing: the slot leaving the CL pipeline carries this edge's DQ
         if(rd_lat) rd_need <= rd_need - 3'd1;
 
@@ -1178,17 +1660,23 @@ always_ff @(posedge i_CLK or negedge i_POR_n) begin
     end end
 end
 
+//landing capture: whole words on a 32-bit bus; a 16-bit bus assembles each
+//word from two D15-D0 halves (lane placement per tables 10.8/10.11)
 always_ff @(posedge i_CLK) begin
-    if(i_BCEN && rd_lat) rd_buf[rd_latb] <= i_D_I;
+    if(i_BCEN && rd_lat) begin
+        if(!e_sd16)      rd_buf[rd_latw]        <= i_D_I;
+        else if(rd_lath) rd_buf[rd_latw][31:16] <= i_D_I[15:0];
+        else             rd_buf[rd_latw][15:0]  <= i_D_I[15:0];
+    end
 end
 
-//word-valid handoff: engine sets per landed beat; the head accept of the next
-//read clears (the engine cannot land words before its first command)
+//word-valid handoff: engine sets per word-COMPLETING landing; the head accept
+//of the next read clears (the engine cannot land words before its first command)
 always_ff @(posedge i_CLK or negedge i_RST_n) begin
     if(!i_RST_n) wv <= 4'd0;
     else begin
         if(i_CEN && fe_acc_eng && !I_BUS.req_write && !fe_sdmr && !fe_b_cont) wv <= 4'd0;
-        else if(i_BCEN && rd_lat) wv[rd_latb] <= 1'b1;
+        else if(i_BCEN && rd_lat && rd_latf) wv[rd_latw] <= 1'b1;
     end
 end
 
@@ -1250,7 +1738,8 @@ wire            wr_rfcr  = wr_reg && (fa[7:1] == 7'h3A) && key_rfcr;
 
 always_ff @(posedge i_CLK or negedge i_POR_n) begin
     if(!i_POR_n) begin
-        bcr1  <= {4'd0, BIG_ENDIAN, 11'd0};     //H'0000 + the ENDIAN pin reflection (p.233)
+        bcr1  <= {4'd0, !BIG_ENDIAN, 11'd0};    //H'0000; ENDIAN=0 means BIG endian
+                                                //(MD5 pin low, p.236)
         bcr2  <= 16'h3FF0;
         wcr1  <= 16'h3FF3;
         wcr2  <= 16'hFFFF;
@@ -1262,14 +1751,14 @@ always_ff @(posedge i_CLK or negedge i_POR_n) begin
     end
     else begin if(i_CEN) begin
         if(wr_reg) begin
-            if(fa[7:4] == 4'h5) mcscr[fa[3:1]] <= wr_w;
+            if(fa[7:4] == 4'h5) mcscr[fa[3:1]] <= wr_w & 16'h007F;      //bits 15-7 reserved (p.258)
             else case(fa[7:1])
-                7'h30: bcr1 <= {wr_w[15:12], BIG_ENDIAN, wr_w[10:0]};   //ENDIAN read-only
+                7'h30: bcr1 <= {wr_w[15:12], !BIG_ENDIAN, wr_w[10:0]};  //ENDIAN read-only
                 7'h31: bcr2 <= wr_w & 16'h3FF0;         //bits 15,14,3-0 reserved (p.239)
-                7'h32: wcr1 <= wr_w;
+                7'h32: wcr1 <= wr_w & 16'hBFF3;         //bits 14,3,2 reserved (p.240)
                 7'h33: wcr2 <= wr_w;
-                7'h34: mcr  <= wr_w & 16'hFFFE;
-                7'h36: pcr  <= wr_w;
+                7'h34: mcr  <= wr_w & 16'hFFFE;         //bit 0 reserved (p.244)
+                7'h36: pcr  <= wr_w & 16'hCFFF;         //bits 13,12 reserved (p.248)
                 default: ;                              //keyed group handled below
             endcase
         end
@@ -1289,29 +1778,42 @@ always_ff @(posedge i_CLK or negedge i_POR_n) begin
     end
 end
 
-//RTCSR: CMF/OVF set by hardware, cleared only by a keyed write-0 (p.253)
+//RTCSR: CMF/OVF set by hardware. OVF clears on a keyed write-0; CMF instead
+//ARMS on the write-0 and clears when the next CBR refresh is PERFORMED
+//(p.253 clearing condition: "when a refresh is performed after 0 has been
+//written to CMF and RFSH=1 and RMODE=0"). A match landing on the consuming
+//refresh edge wins - it is a new compare event
+logic           cmf_clr_arm;        //write-0 seen, waiting for the refresh
 always_ff @(posedge i_CLK or negedge i_POR_n) begin
-    if(!i_POR_n) rtcsr <= 8'd0;
+    if(!i_POR_n) begin
+        rtcsr       <= 8'd0;
+        cmf_clr_arm <= 1'b0;
+    end
     else begin
         if(i_CEN && wr_rtcsr) begin
-            rtcsr[6:3] <= wr_w[6:3];
-            rtcsr[1:0] <= wr_w[1:0];
-            rtcsr[7]   <= rtcsr[7] & wr_w[7];           //write-1 holds, write-0 clears
-            rtcsr[2]   <= rtcsr[2] & wr_w[2];
+            rtcsr[6:3]  <= wr_w[6:3];
+            rtcsr[1:0]  <= wr_w[1:0];
+            cmf_clr_arm <= !wr_w[7];                    //write-1 never changes CMF
+            rtcsr[2]    <= rtcsr[2] & wr_w[2];          //OVF: write-0 clears now
         end
         else if(i_BCEN) begin
-            if(rt_match)                     rtcsr[7] <= 1'b1;      //CMF
+            if(ref_done && cmf_clr_arm) begin           //the armed clear is consumed
+                rtcsr[7]    <= rt_match;
+                cmf_clr_arm <= 1'b0;
+            end
+            else if(rt_match) rtcsr[7] <= 1'b1;         //CMF
             if(ref_done && rfcr == rfcr_lim) rtcsr[2] <= 1'b1;      //OVF
         end
     end
 end
 
-//RFCR counts refresh cycles (cleared by a keyed write)
+//RFCR counts refresh cycles; exceeding the LMTS limit sets OVF and CLEARS
+//the counter (p.256); a keyed write loads it directly
 always_ff @(posedge i_CLK or negedge i_POR_n) begin
     if(!i_POR_n) rfcr <= 10'd0;
     else begin
         if(i_CEN && wr_rfcr)        rfcr <= wr_w[9:0];
-        else if(i_BCEN && ref_done) rfcr <= rfcr + 10'd1;
+        else if(i_BCEN && ref_done) rfcr <= (rfcr == rfcr_lim) ? 10'd0 : rfcr + 10'd1;
     end
 end
 
@@ -1339,6 +1841,67 @@ assign  o_ROVI_REQ = rtcsr[2] & rtcsr[1];       //OVF & OVIE
 
 
 ///////////////////////////////////////////////////////////
+//////  Pad States: Pull-Ups, Release Drive, IRQOUT (pp.236, 320-322)
+////
+
+//PULA: A25-A0 pulled up for 4 CKIO after BACK asserts, then Hi-Z (fig 10.41)
+logic   [2:0]   apu_cnt;
+always_ff @(posedge i_CLK or negedge i_POR_n) begin
+    if(!i_POR_n) apu_cnt <= 3'd0;
+    else begin if(i_BCEN) begin
+        if(!bus_rel)             apu_cnt <= 3'd0;
+        else if(apu_cnt != 3'd4) apu_cnt <= apu_cnt + 3'd1;
+    end end
+end
+assign  o_A_PU = bcr1[15] && bus_rel && (apu_cnt != 3'd4);
+
+//PULD: D31-D0 pulled up whenever the data bus is not in use - dropped for
+//the BSC's own drive, an ordinary read strobe window, or an SDRAM read op
+//(figs 10.42/10.43 show the pull-up around the data phases)
+wire            d_ord_rd = ord_pins && !ord_write && ord_stb;
+wire            d_sd_rd  = !e_write && (est == E_ACTV || est == E_RCD ||
+                                        est == E_RD   || est == E_RD_DRAIN);
+assign  o_D_PU = bcr1[14] && !o_D_OE && !d_ord_rd && !d_sd_rd;
+
+//HIZCNT: RAS/CAS pads stay driven through a bus release when set (p.236;
+//HIZMEM concerns standby mode only, which this SoC does not enter)
+assign  o_RASCAS_OE = ~bus_rel | bcr1[12];
+
+//IRQOUT contribution: a latched refresh request whose cycle has not run yet
+//(p.321) - a foreign master sees it and returns the bus
+assign  o_REF_PEND = ref_req;
+
+
+
+///////////////////////////////////////////////////////////
+//////  MCS0-7 Mask-ROM Selects (MCSCR0-7; table 10.15 p.324)
+////
+
+//MCS[x] asserts - with the CS shape of the ordinary bus cycle - when the
+//cycle's area matches CS2/0 and A25:22 falls in the CAP-sized block
+function automatic logic mcs_hit(input logic [15:0] r, input logic [2:0] area,
+                                 input logic [3:0] blk);
+    logic am;
+    case(r[5:4])                                //CAP: connected memory size
+        2'b11:   am = (blk[3]   == r[3]);       //256 Mbit: A25 only
+        2'b10:   am = (blk[3:2] == r[3:2]);     //128 Mbit: A25-A24
+        2'b01:   am = (blk[3:1] == r[3:1]);     //64 Mbit:  A25-A23
+        default: am = (blk      == r[3:0]);     //32 Mbit:  A25-A22
+    endcase
+    mcs_hit = am && (area == (r[6] ? 3'd2 : 3'd0));
+endfunction
+
+genvar gm;
+generate for(gm = 0; gm < 8; gm = gm + 1) begin : g_mcs
+    assign o_MCS_n[gm] = ~(ord_pins && ord_cs &&
+                           mcs_hit(mcscr[gm], ord_area, ord_addr[25:22]));
+end endgenerate
+
+assign  o_MCS0_CS0 = ~mcscr[0][6];      //area-0 decode: CS0 pad may switch (p.323)
+
+
+
+///////////////////////////////////////////////////////////
 //////  Physical Pin Merge (the shared external bus, table 10.1)
 ////
 
@@ -1350,32 +1913,38 @@ assign  o_ROVI_REQ = rtcsr[2] & rtcsr[1];       //OVF & OVIE
 */
 
 //pins flip to the ordinary fields only from the grid-aligned launch edge
-//(ord_run); the accept-time ord_busy keeps all ownership interlocks
-wire    ord_pins  = ord_busy && ord_run;
+//(ord_run) and release at the T2-close boundary edge (!ord_done) - never at
+//a core handshake edge, so every pin change sits ON the bus-clock grid.
+//(The generic-port hsk fast path can still end a cycle early: documented)
+wire    ord_pins  = ord_busy && ord_run && !ord_done;
 
-assign  o_A       = ord_pins ? {ord_addr[25:2], ord_a1, ord_addr[0]} : sd_a;
-//16-bit ports live on D15-D0 (fig 10.13): the selected half is driven there
+assign  o_A       = ord_pins ? {ord_addr[25:2], ord_ba} : sd_a;
+//narrow ports live on the low D lanes (tables 10.8/10.9): the register lane
+//of the current byte address is driven there, endian-mirrored
 assign  o_D_O     = !ord_pins ? sd_dq_o :
-                    !ord_w16  ? ord_wdata :
-                    {2{ord_a1 ? ord_wdata[15:0] : ord_wdata[31:16]}};
-assign  o_D_OE    = ord_pins ? ord_write      : sd_dq_oe;   //write data held all cycle
+                    ord_w8    ? {4{ord_wdata[{ord_lane8, 3'd0} +: 8]}} :
+                    ord_w16   ? {2{ord_hi16 ? ord_wdata[31:16] : ord_wdata[15:0]}} :
+                    ord_wdata;
+assign  o_D_OE    = ord_pins ? ord_write      : sd_dq_oe;   //write data T1..T2 end (tWDH1)
 assign  o_BS_n    = ord_pins ? ord_bs_n       : sd_bs_n;
-assign  o_CS0_n   = ~(ord_pins && ord_area == 3'd0);
-assign  o_CS2_n   = ord_pins ? (ord_area != 3'd2) : sd_cs2_n;
-assign  o_CS3_n   = ord_pins ? (ord_area != 3'd3) : sd_cs3_n;
-assign  o_CS4_n   = ~(ord_pins && ord_area == 3'd4);
-assign  o_CS5_n   = ~(ord_pins && ord_area == 3'd5);
-assign  o_CS6_n   = ~(ord_pins && ord_area == 3'd6);
+assign  o_CS0_n   = ~(ord_pins && ord_cs && ord_area == 3'd0);
+assign  o_CS2_n   = ord_pins ? !(ord_cs && ord_area == 3'd2) : sd_cs2_n;
+assign  o_CS3_n   = ord_pins ? !(ord_cs && ord_area == 3'd3) : sd_cs3_n;
+assign  o_CS4_n   = ~(ord_pins && ord_cs && ord_area == 3'd4);
+assign  o_CS5_n   = ~(ord_pins && ord_cs && ord_area == 3'd5);
+assign  o_CS6_n   = ~(ord_pins && ord_cs && ord_area == 3'd6);
 assign  o_RD_WR   = ord_pins ? ~ord_write     : sd_cmdwe_n; //low = write cycle
 assign  o_RAS3L_n = ord_pins ? 1'b1           : sd_rasl_n;
 assign  o_RAS3U_n = ord_pins ? 1'b1           : sd_rasu_n;
 assign  o_CASL_n  = ord_pins ? 1'b1           : sd_casl_n;
 assign  o_CASU_n  = ord_pins ? 1'b1           : sd_casu_n;
 assign  o_WE_n    = !ord_pins ? sd_dqm :
-                    !ord_write ? 4'b1111 :
-                    !ord_w16   ? ~ord_wstrb :
-                    {2'b11, ord_a1 ? ~ord_wstrb[1:0] : ~ord_wstrb[3:2]};    //WE1/WE0 lanes
-assign  o_RD_n    = ~(ord_pins && !ord_write);              //ordinary read strobe
+                    !(ord_write && ord_stb) ? 4'b1111 :     //strobed mid-T1 -> mid-T2
+                    ord_w8    ? {3'b111, ~ord_wstrb[ord_lane8]} :           //WE0 only
+                    ord_w16   ? {2'b11, ord_hi16 ? ~ord_wstrb[3:2]
+                                                 : ~ord_wstrb[1:0]} :       //WE1/WE0 lanes
+                    ~ord_wstrb;
+assign  o_RD_n    = ~(ord_pins && !ord_write && ord_stb);   //ordinary read strobe
 assign  o_CKE     = sd_cke;
 
 endmodule

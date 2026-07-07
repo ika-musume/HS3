@@ -196,3 +196,23 @@ Levers that COULD move the plateau (all bigger / need a decision):
   duplication congested the cache region and the FSM cone (untouched logic) lost far more
   than byp_q gained. byp_q's 0.3 ns headroom over FSM made it a low-value target anyway.
   Net learning: attack the FSM next-state (Round 2), and never ADD area in the cache region.
+
+### Re-baseline after BSC Group C (2026-07-07, seeds 3/4/5) — NEUTRAL
+- RTL delta since the last re-measure: the whole BSC compliance campaign tail
+  (Group B pin shapes, CKIO datasheet phase, §10.2 register audit, Group C:
+  full AMX decode, 16-bit SDRAM bus, 8-bit ports, MCS-on-PTC pads, release
+  pads + IRQOUT) — ~1,700 inserted lines, all BCEN-domain engine/pad logic.
+  `HS3_ooc_top` gained the four new pad-state pins (o_RASCAS_OE/o_A_PU/
+  o_D_PU/o_IRQOUT_n) so their cones register at the boundary.
+- Worst slack (i_CLK): seed3 −2.92→−2.92 (±0.00), seed4 −2.86→−3.22 (−0.36),
+  seed5 −2.61→−2.78 (−0.17). Mean −2.80→−2.97; every delta inside the ±0.4 ns
+  fit-noise band. Restricted Fmax 78.32 / 75.62 / 78.22 MHz (best 78.3 vs
+  baseline best 79.3 — coarse-Fmax cluster noise, judge by slack/cones).
+- Cones: **zero BSC/peripheral logic in any seed's top-20** — every path is
+  the known int_pipe forwarding/pair plateau (fwd_lane/fwd_dep/fwd_wbsel,
+  mawb.gpr→pair_inst, ma_seq second_access/req_sent) + cache bram_addr.
+  The Group C logic is timing-invisible; the frozen cache-wall verdict and
+  the one unspent lever (nx_read0 tail late-select) stand unchanged.
+- Resources: 8,363/8,340/8,346 ALMs (20%), registers 6,516/6,520/6,509
+  (baseline 6,531/6,608/6,567 — fitter duplication noise swallows the ~60
+  new flops), block memory bits identical (158,208).

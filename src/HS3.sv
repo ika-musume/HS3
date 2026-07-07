@@ -16,8 +16,9 @@
     register tier (TMU, RTC, PFC/ports) hangs behind the BSC on IBus_2 legs
     (Appendix B placement); port pads are dedicated split i/o/oe vectors,
     and the table-18.1 pin shares implemented here are the INTC inputs
-    (PINT = PTC/PTF, IRQ = PTH/SCPT7, IRLS = PTF3-0) and the TMU's TCLK on
-    PTH7. NMI stays a dedicated pin, as on silicon.
+    (PINT = PTC/PTF, IRQ = PTH/SCPT7, IRLS = PTF3-0), the TMU's TCLK on
+    PTH7, and the BSC's MCS0-7 outputs on port C in "other function" mode
+    (MCS0 also claims the CS0 pad, p.323). NMI stays a dedicated pin.
 
     The CPG owns the clock pins: o_CKIO is the bus clock output that paces
     the board (SDRAM device clock, p.207); i_EXTAL2 is the RTC's 32.768 kHz
@@ -41,8 +42,10 @@ module HS3 #(
        ordinary memory / burst ROM and SDRAM ride the same pins, RD/WR is the
        SDRAM WE command bit, WE3-WE0 double as DQMUU-DQMLL. Data bus split
        (o_D_O/o_D_OE/i_D_I); the true inout lives at the board level. PCMCIA
-       and MCS pins omitted; BREQ/BACK inert. The SDRAM clock comes from the
-       SoC PLL (180 degrees vs the bus-enable edges); CKE is the chip pin. */
+       pins omitted; MCS0-7 ride the PTC pads (and MCS0 the CS0 pad) per the
+       PFC grants, as on silicon. Pull-up states (PULA/PULD) and the release
+       drive split (HIZCNT) are exported for the pad ring; IRQOUT asks a
+       foreign master for the bus back (pp.320-322). */
     output  wire    [25:0]  o_A,
     output  wire    [31:0]  o_D_O,
     output  wire            o_D_OE,
@@ -68,6 +71,10 @@ module HS3 #(
     input   wire            i_BREQ_n,
     output  wire            o_BACK_n,
     output  wire            o_BUS_OE,
+    output  wire            o_RASCAS_OE,    //HIZCNT: RAS/CAS drive through a release
+    output  wire            o_A_PU,         //PULA: A25-A0 pull-up state (fig 10.41)
+    output  wire            o_D_PU,         //PULD: D31-D0 pull-up state (figs 10.42-43)
+    output  wire            o_IRQOUT_n,     //bus retrieval request (p.321)
 
     /* GENERIC MEMORY PORT - mirrors EVERY external access. Generic-class
        accesses may be completed early by i_MEM_RSP_VALID (ORed with the
@@ -203,6 +210,10 @@ ibus_bridge u_bridge (
 ////
 
 wire            rcmi_req, rovi_req;
+wire            ref_pend;           //refresh request pending (IRQOUT, p.321)
+wire    [7:0]   mcs_n;              //MCS0-7 selects, merged onto the PTC/CS0 pads
+wire            mcs0_cs0;           //MCSCR0 decodes area 0: CS0 pad may switch
+wire            cs0_bsc;            //BSC's own CS0 view (pre-MCS0 pad merge)
 
 bsc #(
     .BIG_ENDIAN             (BIG_ENDIAN                             )
@@ -235,7 +246,7 @@ bsc #(
     .o_D_OE                 (o_D_OE                                 ),
     .i_D_I                  (i_D_I                                  ),
     .o_BS_n                 (o_BS_n                                 ),
-    .o_CS0_n                (o_CS0_n                                ),
+    .o_CS0_n                (cs0_bsc                                ),
     .o_CS2_n                (o_CS2_n                                ),
     .o_CS3_n                (o_CS3_n                                ),
     .o_CS4_n                (o_CS4_n                                ),
@@ -255,10 +266,29 @@ bsc #(
     .i_BREQ_n               (i_BREQ_n                               ),
     .o_BACK_n               (o_BACK_n                               ),
     .o_BUS_OE               (o_BUS_OE                               ),
+    .o_RASCAS_OE            (o_RASCAS_OE                            ),
+    .o_A_PU                 (o_A_PU                                 ),
+    .o_D_PU                 (o_D_PU                                 ),
+
+    .o_MCS_n                (mcs_n                                  ),
+    .o_MCS0_CS0             (mcs0_cs0                               ),
+    .o_REF_PEND             (ref_pend                               ),
 
     .o_RCMI_REQ             (rcmi_req                               ),
     .o_ROVI_REQ             (rovi_req                               )
 );
+
+//CS0 pad merge: with PTC0 granted to its function and MCSCR0 decoding
+//area 0, the CS0 pad follows MCS[0] (p.323)
+wire    [7:0]   pc_fn;              //PTC pins in "other function" mode (PFC)
+assign  o_CS0_n = (pc_fn[0] && mcs0_cs0) ? mcs_n[0] : cs0_bsc;
+
+//IRQOUT (pp.320-321): asserted on a pending-not-run refresh, or on an
+//interrupt above the SR.I3-I0 mask (BL-independent; NMI always qualifies) -
+//a foreign bus master negates BREQ so the chip can retrieve the bus
+wire    [31:0]  core_sr;
+assign  o_IRQOUT_n = ~(ref_pend | nmi_valid |
+                       (int_valid && (int_level > core_sr[7:4])));
 
 
 
@@ -292,7 +322,7 @@ cpu_core #(
 
     .dbg_o_RETIRE_VALID     (), .dbg_o_RETIRE_PC        (), .dbg_o_RETIRE_INST  (),
     .dbg_o_RETIRE_GPR_WE    (), .dbg_o_RETIRE_GPR       (), .dbg_o_RETIRE_GPR_DATA(),
-    .dbg_o_FETCH_PC         (), .dbg_o_SR               (), .dbg_o_GBR          (),
+    .dbg_o_FETCH_PC         (), .dbg_o_SR               (core_sr), .dbg_o_GBR   (),
     .dbg_o_SSR              (), .dbg_o_SPC              (), .dbg_o_VBR          (),
     .dbg_o_MACH             (), .dbg_o_MACL             (), .dbg_o_PR           (),
     .dbg_o_TRA              (), .dbg_o_EXPEVT           (), .dbg_o_INTEVT       (),
@@ -390,6 +420,12 @@ wire    [7:0]   pth_o_port, pth_oe_port;
 assign  o_PTH_O  = {ph7_fn ? tclk_o : pth_o_port[7], pth_o_port[6:0]};
 assign  o_PTH_OE = {ph7_fn ? tclk_oe : pth_oe_port[7], pth_oe_port[6:0]};
 
+//PTC pad merge: mode 00 hands each pad to its MCS[n] output (p.323); the
+//port's own OE is 0 in that mode, so the OR only ever adds the MCS drive
+wire    [7:0]   ptc_o_port, ptc_oe_port;
+assign  o_PTC_O  = (pc_fn & mcs_n) | (~pc_fn & ptc_o_port);
+assign  o_PTC_OE = pc_fn | ptc_oe_port;
+
 ioport u_ioport (
     .i_POR_n                (rst_por_n                              ),  //regs hold through manual reset (p.570)
     .i_CLK                  (i_CLK                                  ),
@@ -406,8 +442,8 @@ ioport u_ioport (
     .o_PTB_OE               (o_PTB_OE                               ),
     .o_PTB_PU               (o_PTB_PU                               ),
     .i_PTC_I                (i_PTC_I                                ),
-    .o_PTC_O                (o_PTC_O                                ),
-    .o_PTC_OE               (o_PTC_OE                               ),
+    .o_PTC_O                (ptc_o_port                             ),
+    .o_PTC_OE               (ptc_oe_port                            ),
     .o_PTC_PU               (o_PTC_PU                               ),
     .i_PTD_I                (i_PTD_I                                ),
     .o_PTD_O                (o_PTD_O                                ),
@@ -439,7 +475,8 @@ ioport u_ioport (
     .o_SCPT_OE              (o_SCPT_OE                              ),
     .o_SCPT_PU              (o_SCPT_PU                              ),
 
-    .o_PH7_FN               (ph7_fn                                 )
+    .o_PH7_FN               (ph7_fn                                 ),
+    .o_PC_FN                (pc_fn                                  )
 );
 
 

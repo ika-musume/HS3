@@ -58,6 +58,10 @@ module HS3_ooc_top (
     input   wire            i_BREQ_n,
     output  wire            o_BACK_n,
     output  wire            o_BUS_OE,
+    output  wire            o_RASCAS_OE,
+    output  wire            o_A_PU,
+    output  wire            o_D_PU,
+    output  wire            o_IRQOUT_n,
 
     /* INTERRUPT PIN (IRQ/IRLS/PINT ride the port pads since session 3) */
     input   wire            i_NMI,
@@ -154,6 +158,10 @@ module HS3_ooc_top (
         .i_BREQ_n               (i_BREQ_n                   ),
         .o_BACK_n               (o_BACK_n                   ),
         .o_BUS_OE               (o_BUS_OE                   ),
+        .o_RASCAS_OE            (o_RASCAS_OE                ),
+        .o_A_PU                 (o_A_PU                     ),
+        .o_D_PU                 (o_D_PU                     ),
+        .o_IRQOUT_n             (o_IRQOUT_n                 ),
 
         .i_NMI                  (i_NMI                      ),
 

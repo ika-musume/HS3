@@ -78,6 +78,8 @@ wire    [31:0]  d_o;
 wire            d_oe;
 wire            bs_n, cs0_n, cs2_n, cs3_n, cs4_n, cs5_n, cs6_n;
 wire            rd_wr, rasl_n, rasu_n, casl_n, casu_n, rd_n, cke, back_n, bus_oe;
+wire            rascas_oe, a_pu, d_pu, irqout_n;    //release pads + IRQOUT (Group C)
+wire    [7:0]   ptc_o, ptc_oe;                      //PTC pad ring view (MCS merge)
 logic           breq_n = 1'b1;
 logic           md4_pin = 1'b1;  //area-0 width straps (knobs; 11=32-bit boot,
 logic           md3_pin = 1'b1;  //10=16-bit for the NOR flash tests)
@@ -137,8 +139,10 @@ HS3 #(
     .i_BREQ_n                  (breq_n),
     .o_BACK_n                  (back_n),
     .o_BUS_OE                  (bus_oe),
-
-
+    .o_RASCAS_OE               (rascas_oe),
+    .o_A_PU                    (a_pu),
+    .o_D_PU                    (d_pu),
+    .o_IRQOUT_n                (irqout_n),
 
     .i_NMI                     (nmi_pin),
 
@@ -151,8 +155,8 @@ HS3 #(
     .o_PTB_OE                  (),
     .o_PTB_PU                  (),
     .i_PTC_I                   (pint_pin),
-    .o_PTC_O                   (),
-    .o_PTC_OE                  (),
+    .o_PTC_O                   (ptc_o),
+    .o_PTC_OE                  (ptc_oe),
     .o_PTC_PU                  (),
     .i_PTD_I                   (8'h00),
     .o_PTD_O                   (ptd_o),
@@ -223,10 +227,20 @@ always @(posedge clk) begin
 end
 
 //Micron MT48LC2M32B2 on the SDRAM pins (area 3 in the tests -> CS3). The
-//device clock is the chip's CKIO pin (session 4: the CPG drives it), 180
-//degrees from the pin-change edges: CKIO rises exactly mid bus-cycle,
-//10 ns setup + 10 ns hold.
-wire            sd_clk = ckio;
+//chip's CKIO pin is DATASHEET phase (rises at the command edges), so the
+//board must delay/phase-shift the device clock to grant the tOD margin -
+//the user's board does it with an FPGA output-delay/PLL adjustment; here
+//it is a half-cycle transport delay on the clock net: the device samples
+//10 ns after the pins change, 10 ns setup + 10 ns hold, and every command
+//lands in the same device cycle as before the phase fix.
+logic           sd_clk = 1'b0;
+always @(ckio) sd_clk <= #10 ckio;      //transport (NBA) - never swallows pulses
+
+//population knob (Group C): the AMX / 16-bit-bus shape probes reprogram the
+//address mux away from this device's 0111 wiring - deselect it so the model
+//neither drives D nor complains about the (to IT) ill-formed sequences
+logic           sdram_en = 1'b1;
+wire            sdram_cs_n = cs3_n | ~sdram_en;
 
 mt48lc2m32b2 u_sdram (
     .Dq                        (d_bus),
@@ -235,7 +249,7 @@ mt48lc2m32b2 u_sdram (
     .Ba                        (a_pin[14:13]),
     .Clk                       (sd_clk),
     .Cke                       (cke),
-    .Cs_n                      (cs3_n),
+    .Cs_n                      (sdram_cs_n),
     .Ras_n                     (rasl_n),
     .Cas_n                     (casl_n),
     .We_n                      (rd_wr),
@@ -372,21 +386,25 @@ integer         raw_mode;
 wire    [31:0]  raw_rdata = req_is_data ? dmem[mem_addr_p[9:2]]
                                         : {imem[{mem_addr_p[11:2], 1'b0}],
                                            imem[{mem_addr_p[11:2], 1'b1}]};
-//board-level behavior: the raw memory drives the shared D bus during an
-//ordinary read cycle; the BSC samples i_D_I at its timed bus-cycle end
-wire            raw_drv = (raw_mode == 1) && mem_req && !mem_write && mem_owned &&
-                          (mem_area != 3'd4);
+//board-level behavior: the raw memory drives the shared D bus like an async
+//SRAM output stage - only while the read strobe is asserted (Group B: RD is
+//mid-state shaped, fig 23.16); the BSC samples i_D_I at the mid-T2 fall
+wire            raw_drv = (raw_mode == 1) && !rd_n && mem_req && !mem_write &&
+                          mem_owned && (mem_area != 3'd4) &&
+                          !(raw8_en && mem_area == 3'd6);
 assign  d_bus = raw_drv ? raw_rdata : 32'hzzzz_zzzz;
 
 //handshake mode: read responses also travel the physical D bus (rsp_valid
-//marks the drive window; the BSC samples i_D_I on the completion)
-wire            hsk_drv = (raw_mode == 0) && MEM_BUS.rsp_valid && !mem_is_write;
+//marks the drive window; the BSC samples i_D_I on the completion). The
+//controller BACKS OFF while the chip drives D (posted SDRAM engine writes
+//share the pins): a real bus device gates its output enable on direction
+wire            hsk_drv = (raw_mode == 0) && MEM_BUS.rsp_valid && !mem_is_write && !d_oe;
 assign  d_bus = hsk_drv ? MEM_BUS.rsp_rdata : 32'hzzzz_zzzz;
 
 //a 16-bit raw device wired to D15-D0 on area 4 (board wiring for test 37):
 //reads serve the half a_pin[1] selects; writes commit per WE1/WE0
 wire            raw16     = (raw_mode == 1) && (mem_area == 3'd4);
-wire            raw16_drv = raw16 && mem_req && !mem_write;
+wire            raw16_drv = raw16 && !rd_n && mem_req && !mem_write;
 wire    [31:0]  raw16_w   = dmem[mem_addr_p[9:2]];
 assign  d_bus = raw16_drv ? {2{a_pin[1] ? raw16_w[15:0] : raw16_w[31:16]}}
                           : 32'hzzzz_zzzz;
@@ -402,12 +420,171 @@ always_ff @(posedge clk) begin
         end
     end
 end
+//writes commit per WE lane while the strobe is low (async SRAM level-latch;
+//address/data are held over the WE window by the shape contract, fig 23.16)
 always_ff @(posedge clk) begin
-    if(raw_mode == 1 && mem_req && mem_write && mem_owned && mem_area != 3'd4) begin
-        if(mem_wstrb[0]) dmem[mem_addr_p[9:2]][7:0]   <= d_o[7:0];
-        if(mem_wstrb[1]) dmem[mem_addr_p[9:2]][15:8]  <= d_o[15:8];
-        if(mem_wstrb[2]) dmem[mem_addr_p[9:2]][23:16] <= d_o[23:16];
-        if(mem_wstrb[3]) dmem[mem_addr_p[9:2]][31:24] <= d_o[31:24];
+    if(raw_mode == 1 && mem_req && mem_write && mem_owned && mem_area != 3'd4 &&
+       !(raw8_en && mem_area == 3'd6)) begin
+        if(!we_n[0]) dmem[mem_addr_p[9:2]][7:0]   <= d_o[7:0];
+        if(!we_n[1]) dmem[mem_addr_p[9:2]][15:8]  <= d_o[15:8];
+        if(!we_n[2]) dmem[mem_addr_p[9:2]][23:16] <= d_o[23:16];
+        if(!we_n[3]) dmem[mem_addr_p[9:2]][31:24] <= d_o[31:24];
+    end
+end
+
+//an 8-bit raw device wired to D7-D0 on area 6 (Group C board wiring): reads
+//serve the byte a_pin[1:0] selects (big-endian register lane, table 10.9),
+//writes latch per WE0 - the only strobe an 8-bit port uses
+logic           raw8_en = 1'b0;
+wire            raw8     = (raw_mode == 1) && raw8_en && (mem_area == 3'd6);
+wire            raw8_drv = raw8 && !rd_n && mem_req && !mem_write;
+wire    [31:0]  raw8_w   = dmem[mem_addr_p[9:2]];
+logic   [7:0]   raw8_q;
+always_comb begin
+    case(a_pin[1:0])
+        2'd0:    raw8_q = raw8_w[31:24];
+        2'd1:    raw8_q = raw8_w[23:16];
+        2'd2:    raw8_q = raw8_w[15:8];
+        default: raw8_q = raw8_w[7:0];
+    endcase
+end
+assign  d_bus[7:0] = raw8_drv ? raw8_q : 8'hzz;
+always_ff @(posedge clk) begin
+    if(raw8 && mem_req && mem_write && !we_n[0]) begin
+        case(a_pin[1:0])
+            2'd0:    dmem[mem_addr_p[9:2]][31:24] <= d_o[7:0];
+            2'd1:    dmem[mem_addr_p[9:2]][23:16] <= d_o[7:0];
+            2'd2:    dmem[mem_addr_p[9:2]][15:8]  <= d_o[7:0];
+            default: dmem[mem_addr_p[9:2]][7:0]   <= d_o[7:0];
+        endcase
+    end
+end
+
+///////////////////////////////////////////////////////////
+//////  Board-Bus Shape Monitors (Group B)
+////
+
+//D-bus contention: the strobe shapes + WCR1 idles must keep at most one
+//driver on the shared D bus at any sample edge; sticky, checked at the end
+wire            flash_drv = u_flash.Q_oe_i;
+wire            sdram_drv = u_sdram.Dq_oe_i;
+wire            tbmem_drv = raw_drv || raw16_drv || raw8_drv || hsk_drv;
+wire    [2:0]   dbus_drvs = {2'd0, d_oe} + {2'd0, tbmem_drv} +
+                            {2'd0, flash_drv} + {2'd0, sdram_drv};
+logic           dbus_viol = 1'b0;
+always @(posedge clk) begin
+    if(dbus_drvs > 3'd1) begin
+        if(!dbus_viol)
+            $display("[DBUS] contention at %0t: dut=%b tbmem=%b flash=%b sdram=%b",
+                     $time, d_oe, tbmem_drv, flash_drv, sdram_drv);
+        dbus_viol <= 1'b1;
+    end
+end
+
+//WE write-strobe shape: while an ordinary write owns the pins, address and
+//data must hold from WE fall to WE rise (async devices latch at the rise -
+//catches the held-WE split-16 bug class; tAH/tWDH1 of fig 23.16)
+logic           we_low_z      = 1'b0;
+logic   [25:0]  we_a_z        = '0;
+logic   [31:0]  we_d_z        = '0;
+logic           we_shape_viol = 1'b0;
+wire            we_low_now    = u_dut.u_bsc.ord_pins && (we_n != 4'b1111);
+always @(posedge clk) begin
+    if(we_low_now && we_low_z && (a_pin !== we_a_z || d_o !== we_d_z)) begin
+        if(!we_shape_viol) $display("[WESHAPE] addr/data moved under WE at %0t", $time);
+        we_shape_viol <= 1'b1;
+    end
+    we_low_z <= we_low_now;
+    we_a_z   <= a_pin;
+    we_d_z   <= d_o;
+end
+
+//SDRAM command/shape monitor (Group C): sampled at the CKIO fall - every
+//20 ns command window holds exactly one negedge, so back-to-back beats count
+//correctly. Latches the ACTV row pins, the LAST CAS column pins + DQM, and
+//counts CAS commands; BS low with EVERY CS idle is an SDRAM Td data cycle
+//(p.283 - ordinary cycles assert BS only with their CS). Clear knob per test.
+logic           sdm_clr      = 1'b0;
+logic   [25:0]  sdm_row_a    = '0;
+logic   [25:0]  sdm_col_a    = '0;
+logic   [3:0]   sdm_cas_dqm  = '1;
+integer         sdm_actv_cnt = 0;
+integer         sdm_cas_cnt  = 0;
+integer         sdm_td_cnt   = 0;
+integer         sdm_cas_t    = 0;   //time of the last READ command sample
+integer         sdm_td_t     = 0;   //time of the first Td sample after clear
+wire            sdm_sel  = !(cs2_n && cs3_n);
+wire            sdm_actv = sdm_sel && !rasl_n &&  casl_n &&  rd_wr;
+wire            sdm_cas  = sdm_sel &&  rasl_n && !casl_n;           //READ or WRIT
+//read Td cycles: BS is low ONLY for data there (READ commands no longer
+//carry it), so a coincident later READ command (fig 10.14 overlap) still
+//counts; write data rides its command (rd_wr low) and ordinary cycles are
+//excluded by their own CS
+wire            sdm_td   = !bs_n && rd_wr && cs0_n && cs4_n && cs5_n && cs6_n;
+always @(negedge ckio) begin
+    if(sdm_clr) begin
+        sdm_row_a <= '0; sdm_col_a <= '0; sdm_cas_dqm <= '1;
+        sdm_actv_cnt <= 0; sdm_cas_cnt <= 0; sdm_td_cnt <= 0;
+        sdm_cas_t <= 0; sdm_td_t <= 0;
+    end
+    else begin
+        if(sdm_actv) begin
+            sdm_row_a    <= a_pin;
+            sdm_actv_cnt <= sdm_actv_cnt + 1;
+        end
+        if(sdm_cas) begin
+            sdm_col_a   <= a_pin;
+            sdm_cas_dqm <= we_n;
+            sdm_cas_cnt <= sdm_cas_cnt + 1;
+            if(rd_wr) sdm_cas_t <= $time;
+        end
+        if(sdm_td) begin
+            sdm_td_cnt <= sdm_td_cnt + 1;
+            if(sdm_td_t == 0) sdm_td_t <= $time;
+        end
+    end
+end
+
+//MCS pad monitor (Group C): MCS1 rides the PTC1 pad; a low drive outside its
+//programmed block is a decode violation, as is a low CS0 pad (= MCS0 after
+//the PFC switch) on an out-of-block (A25 = 1) address
+logic           mcs_mon_clr  = 1'b0;
+logic           mcs1_seen    = 1'b0;
+logic           mcs1_viol    = 1'b0;
+logic           cs0_mcs_viol = 1'b0;
+always @(posedge clk) begin
+    if(mcs_mon_clr) begin
+        mcs1_seen <= 1'b0; mcs1_viol <= 1'b0; cs0_mcs_viol <= 1'b0;
+    end
+    else begin
+        if(ptc_oe[1] && !ptc_o[1]) begin
+            if(a_pin[25:22] == 4'b0001) mcs1_seen <= 1'b1;
+            else                        mcs1_viol <= 1'b1;
+        end
+        if(!cs0_n && a_pin[25]) cs0_mcs_viol <= 1'b1;
+    end
+end
+
+//PULA window counter (Group C): CKIO cycles with the A pull-up on
+logic           apu_clr    = 1'b0;
+integer         apu_hi_cnt = 0;
+always @(negedge ckio) begin
+    if(apu_clr)   apu_hi_cnt <= 0;
+    else if(a_pu) apu_hi_cnt <= apu_hi_cnt + 1;
+end
+
+//WE0 falling-edge counter (Group C): one strobe per write sub-cycle on a
+//narrow port (tables 10.8/10.9 - the strobe RISES between sub-cycles)
+logic           we0_clr = 1'b0;
+integer         we0_cnt = 0;
+logic           we0_z   = 1'b1;
+always @(posedge clk) begin
+    if(we0_clr) begin
+        we0_cnt <= 0; we0_z <= 1'b1;
+    end
+    else begin
+        if(we_n[0] === 1'b0 && we0_z === 1'b1) we0_cnt <= we0_cnt + 1;
+        we0_z <= we_n[0];
     end
 end
 
@@ -703,6 +880,8 @@ task automatic init_knobs;
         raw_mode       = 0;
         wait_stretch   = 0;
         flash_en       = 1'b0;
+        raw8_en        = 1'b0;      //area 6 back to the 32-bit raw device
+        sdram_en       = 1'b1;      //Micron model populated
         md4_pin        = 1'b1;      //area 0 back to the 32-bit boot straps
         md3_pin        = 1'b1;
     end
@@ -1941,39 +2120,86 @@ endtask
 task automatic test_bsc_reg_rw;
     integer idx, sent;
     begin
-        begin_test("BSC regs: BCR1/BCR2/WCR2/MCSCR word R/W, ENDIAN bit, byte write ignored");
+        begin_test("BSC regs vs section 10.2: POR values, reserved-bit masks, ENDIAN RO, byte write ignored");
         eidx = 0;
+        emit_ldrn(8, 32'h0000_0100);                 //mailbox base (MOV.L @(disp,R8))
+        //BCR1: POR value, all-ones mask probe (ENDIAN stays 0 = big), DRAMTP write
         emit_ldrn(1, 32'hFFFF_FF60);
-        imem[eidx] = 16'h6311; eidx = eidx + 1;              // MOV.W @R1,R3      ; BCR1 init
+        imem[eidx] = 16'h6311; eidx = eidx + 1;              // MOV.W @R1,R3      ; POR = 0x0000
+        emit_ldr0(32'h0000_FFFF);
+        imem[eidx] = 16'h2101; eidx = eidx + 1;              // MOV.W R0,@R1      ; mask probe
+        imem[eidx] = 16'h6211; eidx = eidx + 1;              // MOV.W @R1,R2
+        imem[eidx] = 16'h1822; eidx = eidx + 1;              // MOV.L R2,@(8,R8)  ; mb2 = 0xF7FF
         emit_ldr0(32'h0000_0008);
         imem[eidx] = 16'h2101; eidx = eidx + 1;              // MOV.W R0,@R1      ; DRAMTP=010
         imem[eidx] = 16'h6411; eidx = eidx + 1;              // MOV.W @R1,R4
+        //BCR2 POR value
         emit_ldrn(1, 32'hFFFF_FF62);
-        imem[eidx] = 16'h6511; eidx = eidx + 1;              // MOV.W @R1,R5      ; BCR2 default
+        imem[eidx] = 16'h6511; eidx = eidx + 1;              // MOV.W @R1,R5      ; POR = 0x3FF0
+        //WCR1: POR value, mask probe, restore
+        emit_ldrn(1, 32'hFFFF_FF64);
+        imem[eidx] = 16'h6211; eidx = eidx + 1;              // MOV.W @R1,R2
+        imem[eidx] = 16'h1823; eidx = eidx + 1;              // MOV.L R2,@(12,R8) ; mb3 = 0x3FF3
+        emit_ldr0(32'h0000_FFFF);
+        imem[eidx] = 16'h2101; eidx = eidx + 1;
+        imem[eidx] = 16'h6211; eidx = eidx + 1;
+        imem[eidx] = 16'h1824; eidx = eidx + 1;              // MOV.L R2,@(16,R8) ; mb4 = 0xBFF3
+        emit_ldr0(32'h0000_3FF3);
+        imem[eidx] = 16'h2101; eidx = eidx + 1;              // restore POR value
+        //WCR2: POR value first, then the CL2 write + byte-write-ignored law
         emit_ldrn(1, 32'hFFFF_FF66);
+        imem[eidx] = 16'h6211; eidx = eidx + 1;
+        imem[eidx] = 16'h1825; eidx = eidx + 1;              // MOV.L R2,@(20,R8) ; mb5 = 0xFFFF
         emit_ldr0(32'h0000_FFDF);
         imem[eidx] = 16'h2101; eidx = eidx + 1;              // MOV.W R0,@R1      ; WCR2 = CL2
         imem[eidx] = 16'h6711; eidx = eidx + 1;              // MOV.W @R1,R7
         emit_ldr0(32'h0000_0000);
         imem[eidx] = 16'h2100; eidx = eidx + 1;              // MOV.B R0,@R1      ; byte: ignored
         imem[eidx] = 16'h6211; eidx = eidx + 1;              // MOV.W @R1,R2
-        emit_ldrn(1, 32'h0000_0100);
-        imem[eidx] = 16'h2122; eidx = eidx + 1;              // MOV.L R2,@R1      ; mb0
-        emit_ldrn(1, 32'hFFFF_FF56);                 // MCSCR3
-        emit_ldr0(32'h0000_1234);
-        imem[eidx] = 16'h2101; eidx = eidx + 1;              // MOV.W R0,@R1
-        imem[eidx] = 16'h6211; eidx = eidx + 1;              // MOV.W @R1,R2
-        emit_ldrn(1, 32'h0000_0104);
-        imem[eidx] = 16'h2122; eidx = eidx + 1;              // MOV.L R2,@R1      ; mb1
+        imem[eidx] = 16'h1820; eidx = eidx + 1;              // MOV.L R2,@(0,R8)  ; mb0 = 0xFFDF
+        //MCR: POR value, mask probe (RFSH/RMODE kept 0), restore
+        emit_ldrn(1, 32'hFFFF_FF68);
+        imem[eidx] = 16'h6211; eidx = eidx + 1;
+        imem[eidx] = 16'h1826; eidx = eidx + 1;              // MOV.L R2,@(24,R8) ; mb6 = 0x0000
+        emit_ldr0(32'h0000_FFF9);
+        imem[eidx] = 16'h2101; eidx = eidx + 1;
+        imem[eidx] = 16'h6211; eidx = eidx + 1;
+        imem[eidx] = 16'h1827; eidx = eidx + 1;              // MOV.L R2,@(28,R8) ; mb7 = 0xFFF8
+        emit_ldr0(32'h0000_0000);
+        imem[eidx] = 16'h2101; eidx = eidx + 1;              // restore
+        //PCR: POR value, mask probe, restore
+        emit_ldrn(1, 32'hFFFF_FF6C);
+        imem[eidx] = 16'h6211; eidx = eidx + 1;
+        imem[eidx] = 16'h1828; eidx = eidx + 1;              // MOV.L R2,@(32,R8) ; mb8 = 0x0000
+        emit_ldr0(32'h0000_FFFF);
+        imem[eidx] = 16'h2101; eidx = eidx + 1;
+        imem[eidx] = 16'h6211; eidx = eidx + 1;
+        imem[eidx] = 16'h1829; eidx = eidx + 1;              // MOV.L R2,@(36,R8) ; mb9 = 0xCFFF
+        emit_ldr0(32'h0000_0000);
+        imem[eidx] = 16'h2101; eidx = eidx + 1;
+        //MCSCR3 mask probe (bits 15-7 reserved)
+        emit_ldrn(1, 32'hFFFF_FF56);
+        emit_ldr0(32'h0000_FFFF);
+        imem[eidx] = 16'h2101; eidx = eidx + 1;
+        imem[eidx] = 16'h6211; eidx = eidx + 1;
+        imem[eidx] = 16'h1821; eidx = eidx + 1;              // MOV.L R2,@(4,R8)  ; mb1 = 0x007F
         emit_sentinel_loop(eidx, sent);
         do_reset;
         run_until_retire(sent, 20000);
-        chk("BCR1 reset value (ENDIAN=1)",  gpr(3), 32'h0000_0800);
-        chk("BCR1 after write",             gpr(4), 32'h0000_0808);
-        chk("BCR2 reset value",             gpr(5), 32'h0000_3FF0);
-        chk("WCR2 after write (sign-ext)",  gpr(7), 32'hFFFF_FFDF);
-        chk("WCR2 after byte write (kept)", dmem[8'h40], 32'hFFFF_FFDF);
-        chk("MCSCR3 write/read",            dmem[8'h41], 32'h0000_1234);
+        chk("BCR1 POR value (ENDIAN=0: big)",  gpr(3), 32'h0000_0000);
+        chk("BCR1 mask (ENDIAN read-only)",    dmem[8'h42], 32'hFFFF_F7FF);
+        chk("BCR1 after DRAMTP write",         gpr(4), 32'h0000_0008);
+        chk("BCR2 POR value",                  gpr(5), 32'h0000_3FF0);
+        chk("WCR1 POR value",                  dmem[8'h43], 32'h0000_3FF3);
+        chk("WCR1 mask (14,3,2 reserved)",     dmem[8'h44], 32'hFFFF_BFF3);
+        chk("WCR2 POR value",                  dmem[8'h45], 32'hFFFF_FFFF);
+        chk("WCR2 after write (sign-ext)",     gpr(7), 32'hFFFF_FFDF);
+        chk("WCR2 after byte write (kept)",    dmem[8'h40], 32'hFFFF_FFDF);
+        chk("MCR POR value",                   dmem[8'h46], 32'h0000_0000);
+        chk("MCR mask (bit 0 reserved)",       dmem[8'h47], 32'hFFFF_FFF8);
+        chk("PCR POR value",                   dmem[8'h48], 32'h0000_0000);
+        chk("PCR mask (13,12 reserved)",       dmem[8'h49], 32'hFFFF_CFFF);
+        chk("MCSCR mask (15-7 reserved)",      dmem[8'h41], 32'h0000_007F);
         end_test;
     end
 endtask
@@ -2317,7 +2543,7 @@ task automatic test_sdram_rst_survival;
         run_cycles(40);
         run_until_retire(sent, 40000);
         chk("EXPEVT after manual reset",   expevt_o, 32'h0000_0020);
-        chk("BCR1 retained",               gpr(3), 32'h0000_0808);
+        chk("BCR1 retained",               gpr(3), 32'h0000_0008);
         chk("MCR retained",                gpr(4), 32'h0000_503C);
         chk_true("refresh continued through reset", gpr(5) > rfcr_pre);
         chk("SDRAM marker survived",       gpr(7), 32'hCAFE_BABE);
@@ -2389,7 +2615,7 @@ task automatic test_sdram_latency;
         @(posedge clk);
         $display("      [LAT] auto-precharge: %0d retires / %0d cycles", bench_retires, bench_arch_cycles);
         chk("read data (AP phase)", gpr(3), 32'h1A7E_2C00);
-        chk("AP 16-load cycles", bench_arch_cycles, 32'd491);  //relocked 2026-07-05 (fetch pair)
+        chk("AP 16-load cycles", bench_arch_cycles, 32'd455);  //relocked 2026-07-07 (BSC Group A)
         //phase 2: bank-active, same row - 16 row-hit loads
         eidx = 0;
         emit_sdram_init(16'h50B8, 16'hFFDF, 32'hFFFF_E880);
@@ -2406,7 +2632,7 @@ task automatic test_sdram_latency;
         @(posedge clk);
         $display("      [LAT] bank-active row-hit: %0d retires / %0d cycles", bench_retires, bench_arch_cycles);
         chk("read data (BA phase)", gpr(3), 32'h1A7E_2C00);
-        chk("BA 16-load cycles", bench_arch_cycles, 32'd461);  //relocked 2026-07-05 (fetch pair)
+        chk("BA 16-load cycles", bench_arch_cycles, 32'd423);  //relocked 2026-07-07 (BSC Group A)
         end_test;
     end
 endtask
@@ -2437,7 +2663,7 @@ task automatic bench_ipc_sdram;
                      ((bench_retires * 1000) / bench_arch_cycles) / 1000,
                      ((bench_retires * 1000) / bench_arch_cycles) % 1000);
         chk("SDRAM uncached retires (incl. boot)",     bench_retires,     32'd131);
-        chk("SDRAM uncached arch-cycles (incl. boot)", bench_arch_cycles, 32'd723);  //relocked 2026-07-05 (fetch pair)
+        chk("SDRAM uncached arch-cycles (incl. boot)", bench_arch_cycles, 32'd655);  //relocked 2026-07-07 (BSC Group A)
         //cached phase: add-loop (body 100, iters 12) at P1 0x8C000800, CCR on
         eidx = 'h400;
         emit_sd(16'hE50C);                          // MOV #12,R5
@@ -2471,7 +2697,7 @@ task automatic bench_ipc_sdram;
                      ((bench_retires * 1000) / bench_arch_cycles) % 1000);
         chk("SDRAM cached loop R3", gpr(3), 32'd100);
         chk("SDRAM cached retires (incl. boot)",     bench_retires,     32'd1311); //relocked 2026-07-05 (fetch-leak fix)
-        chk("SDRAM cached arch-cycles (incl. boot)", bench_arch_cycles, 32'd1998);  //relocked 2026-07-05 (fetch pair)
+        chk("SDRAM cached arch-cycles (incl. boot)", bench_arch_cycles, 32'd1969);  //relocked 2026-07-07 (Group A + fill-forward)
         end_test;
     end
 endtask
@@ -2479,7 +2705,8 @@ endtask
 
 //shared program for the ordinary-bus WAIT phases: store + 4 loads, benched
 task automatic ord_wait_bench(input logic [15:0] wcr2_v, input integer stretch,
-                              output integer cycles);
+                              output integer cycles,
+                              input logic [15:0] wcr1_v = 16'h3FF3);
     integer sent;
     begin
         init_knobs;
@@ -2489,6 +2716,7 @@ task automatic ord_wait_bench(input logic [15:0] wcr2_v, input integer stretch,
         wait_stretch = stretch;
         eidx = 0;
         emit_wreg_w(32'hFFFF_FF66, wcr2_v);               //program area-0 timing
+        emit_wreg_w(32'hFFFF_FF64, wcr1_v);               //WAITSEL + inter-access idles
         emit_ldrn(1, 32'h0000_0180);
         emit_ldr0(32'h5EED_0001);
         imem[eidx] = 16'h2102; eidx = eidx + 1;           // MOV.L R0,@R1 (raw write)
@@ -2508,19 +2736,24 @@ task automatic ord_wait_bench(input logic [15:0] wcr2_v, input integer stretch,
 endtask
 
 task automatic test_ordinary_wait;
-    integer c_1, c_2, c_3, c_4;
+    integer c_1, c_2, c_3, c_4, c_5, c_6;
     begin
-        begin_test("Ordinary bus: WCR2 waits enforced, i_WAIT_n stretches, 0-wait ignores the pin");
+        begin_test("Ordinary bus: WCR2 waits, i_WAIT_n + WAITSEL, 0-wait pin ignore, WCR1 idles");
         ord_wait_bench(16'hFFF9, 0, c_1);                 //A0W=001: 1 wait, pin sampled
         ord_wait_bench(16'hFFF9, 6, c_2);                 //i_WAIT_n held low 6 bus cycles
         ord_wait_bench(16'hFFF8, 6, c_3);                 //A0W=000: 0 waits, pin IGNORED
         ord_wait_bench(16'hFFF8, 0, c_4);
-        $display("      [ORD] 1w/ws0: %0d   1w/ws6: %0d   0w/ws6: %0d   0w/ws0: %0d", c_1, c_2, c_3, c_4);
-        chk("1-wait baseline cycles",  c_1, 32'd334);  //relocked 2026-07-05 (fetch pair)
-        chk("WAIT-stretched cycles",   c_2, 32'd476);
-        chk("0-wait cycles",           c_4, 32'd304);
+        ord_wait_bench(16'hFFF9, 6, c_5, 16'hBFF3);       //WAITSEL=1: mid-state sample (fig 10.11)
+        ord_wait_bench(16'hFFF9, 0, c_6, 16'h8000);       //AnIW=00 everywhere: 1-idle minimum
+        $display("      [ORD] 1w/ws0: %0d   1w/ws6: %0d   0w/ws6: %0d   0w/ws0: %0d   wsel/ws6: %0d   1-idle: %0d",
+                 c_1, c_2, c_3, c_4, c_5, c_6);
+        chk("1-wait baseline cycles",  c_1, 32'd464);  //relocked 2026-07-07 (BSC Group A)
+        chk("WAIT-stretched cycles",   c_2, 32'd684);
+        chk("0-wait cycles",           c_4, 32'd418);
         chk_true("i_WAIT_n stretched the bus",    c_2 > c_1);
         chk_true("0-wait area ignores i_WAIT_n",  c_3 === c_4);
+        chk_true("WAITSEL=1 stretches too",       c_5 > c_1);
+        chk_true("1-idle WCR1 is not slower",     c_6 <= c_1);
         end_test;
     end
 endtask
@@ -2571,8 +2804,8 @@ task automatic test_burst_rom;
             chk("loop count consumed", gpr(5), 32'd0);
         end
         $display("      [ROM] no-burst: %0d   burst pitch: %0d", c_nb, c_bst);
-        chk("no-burst fill cycles", c_nb,  32'd938);  //relocked 2026-07-05 (fetch pair)
-        chk("burst-ROM fill cycles", c_bst, 32'd920);
+        chk("no-burst fill cycles", c_nb,  32'd1005); //relocked 2026-07-07 (Group A + fill-forward)
+        chk("burst-ROM fill cycles", c_bst, 32'd969);
         chk_true("burst pitch is faster", c_bst < c_nb);
         end_test;
     end
@@ -2763,7 +2996,7 @@ task automatic test_flash_boot;
         //slow-flash BRANCH loop pays ~16 cyc/iteration more - the redirect's wrong-path
         //drop-wait and the refresh cadence interleave differently against 15-cycle
         //fetches. Correctness intact; candidate for a later fetch-path DSE.
-        chk("flash boot cycle law", bench_arch_cycles, 32'd5656);   //16-bit boot + 3-wait
+        chk("flash boot cycle law", bench_arch_cycles, 32'd6668);   //16-bit boot + 3-wait, T1..T2+idles
                                                         //flash reads + refresh interleave
         end_test;
     end
@@ -2835,6 +3068,323 @@ task automatic test_flash_autoselect;
         chk("mailbox manufacturer", sdram_peek(32'h0C00_0000), 32'h0000_00C2);
         chk("mailbox device ID",    sdram_peek(32'h0C00_0004), 32'h0000_22A7);
         chk("mailbox array",        sdram_peek(32'h0C00_0008), 32'h0000_5AC3);
+        end_test;
+    end
+endtask
+
+task automatic test_bus_monitors;
+    begin
+        begin_test("Board-bus shape monitors: D-bus contention, addr/data hold under WE (whole run)");
+        chk_true("no D-bus driver overlap",         !dbus_viol);
+        chk_true("no addr/data movement under WE",  !we_shape_viol);
+        end_test;
+    end
+endtask
+
+
+
+///////////////////////////////////////////////////////////
+//////  Tests - BSC Group C (datasheet breadth)
+////
+
+task automatic test_mcs_pins;
+    integer sent;
+    begin
+        begin_test("MCS0-7: MCSCR block decode on the PTC pads + the CS0 pad switch (table 10.15)");
+        raw_mode = 1;
+        dmem[0]  = 32'h4D43_5331;
+        eidx = 0;
+        //MCSCR1: area 0, 32-Mbit block 0x0400000-0x07FFFFF (A25:22 = 0001);
+        //MCSCR0: area 0, 256-Mbit block at 0 - covers the boot fetches, so
+        //the CS0 pad keeps selecting the raw device after the PFC switch
+        emit_wreg_w(32'hFFFF_FF52, 16'h0001);
+        emit_wreg_w(32'hFFFF_FF50, 16'h0030);
+        emit_wreg_w(32'hA400_0104, 16'hAAA0);            //PCCR: PTC1/PTC0 -> MCS
+        emit_ldrn(1, 32'hA040_0000);
+        imem[eidx] = 16'h6312; eidx = eidx + 1;          // MOV.L @R1,R3 (in-block)
+        emit_ldrn(1, 32'hA200_0000);
+        imem[eidx] = 16'h6412; eidx = eidx + 1;          // MOV.L @R1,R4 (A25=1: out)
+        emit_wreg_w(32'hA400_0104, 16'hAAAA);            //restore PCCR + MCSCRs
+        emit_wreg_w(32'hFFFF_FF50, 16'h0000);
+        emit_wreg_w(32'hFFFF_FF52, 16'h0000);
+        emit_sentinel_loop(eidx, sent);
+        mcs_mon_clr = 1'b1; @(posedge clk); mcs_mon_clr = 1'b0;
+        do_reset;
+        run_until_retire(sent, 60000);
+        chk("in-block read data (MCS0 kept CS0 alive)", gpr(3), 32'h4D43_5331);
+        chk_true("MCS1 asserted on the PTC1 pad in-block",  mcs1_seen    === 1'b1);
+        chk_true("MCS1 never asserted out-of-block",        mcs1_viol    === 1'b0);
+        chk_true("CS0 pad (= MCS0) high on A25=1 accesses", cs0_mcs_viol === 1'b0);
+        end_test;
+    end
+endtask
+
+task automatic test_width8;
+    integer sent;
+    begin
+        begin_test("8-bit port (BCR2): longword = four D7-D0/WE0 sub-cycles, data round-trip");
+        raw_mode = 1;
+        raw8_en  = 1'b1;
+        eidx = 0;
+        emit_wreg_w(32'hFFFF_FF62, 16'h1FF0);            // BCR2: A6SZ=01 (area 6 = 8-bit)
+        emit_ldrn(1, 32'hB800_0200);
+        emit_ldr0(32'hCAFE_F00D);
+        imem[eidx] = 16'h2102; eidx = eidx + 1;          // MOV.L R0,@R1 (4 sub-cycles)
+        emit_ldrn(1, 32'hB800_0202);
+        emit_ldr0(32'h0000_BEEF);
+        imem[eidx] = 16'h2101; eidx = eidx + 1;          // MOV.W R0,@R1 (2 sub-cycles)
+        emit_ldrn(1, 32'hB800_0201);
+        emit_ldr0(32'h0000_0077);
+        imem[eidx] = 16'h2100; eidx = eidx + 1;          // MOV.B R0,@R1 (1 sub-cycle)
+        emit_ldrn(1, 32'hB800_0200);
+        imem[eidx] = 16'h6312; eidx = eidx + 1;          // MOV.L @R1,R3 (4 sub-cycles)
+        emit_ldrn(1, 32'hB800_0202);
+        imem[eidx] = 16'h6411; eidx = eidx + 1;          // MOV.W @R1,R4
+        emit_ldrn(1, 32'hB800_0203);
+        imem[eidx] = 16'h6510; eidx = eidx + 1;          // MOV.B @R1,R5
+        emit_sentinel_loop(eidx, sent);
+        we0_clr = 1'b1; @(posedge clk); we0_clr = 1'b0;
+        do_reset;
+        run_until_retire(sent, 60000);
+        chk("byte-walked longword readback", gpr(3), 32'hCA77_BEEF);
+        chk("word read (sign-extended)",     gpr(4), 32'hFFFF_BEEF);
+        chk("byte read (sign-extended)",     gpr(5), 32'hFFFF_FFEF);
+        chk("device content",                dmem[8'h80], 32'hCA77_BEEF);
+        chk("WE0 strobes: 4 + 2 + 1 write sub-cycles", we0_cnt, 32'd7);
+        end_test;
+    end
+endtask
+
+//table-10.13 pin expectations are transcribed as tb constants: row = the
+//A(shift+1)-first pattern on A16-A1, column = original address with the
+//held/bank pins and the A12 precharge flag substituted
+task automatic test_amx_shapes;
+    integer sent, m1, m2;
+    logic [25:0] A;
+    begin
+        begin_test("AMX address multiplex: row shift + column bank/hold pins (table 10.13, 32-bit)");
+        sdram_en = 1'b0;                    //shape probe: the 0111-wired device is depopulated
+        A = 26'h0AB_A984;                   //probe address (area 3 offset, A25 = 0)
+        eidx = 0;
+        emit_sdram_init(16'h5028, 16'hFFDF, 32'hFFFF_E880);   //AMX = 0101 (2Mx16x4)
+        emit_ldrn(1, {6'b1010_11, A});                        //P2 + area 3 + offset
+        emit_ldr0(32'hA5A5_0101);
+        imem[eidx] = 16'h2102; eidx = eidx + 1;               // MOV.L R0,@R1 (WRITA)
+        m1 = eidx;
+        imem[eidx] = 16'hE701; eidx = eidx + 1;               // marker 1
+        emit_ldr0(32'd200);
+        imem[eidx] = 16'h6203; eidx = eidx + 1;               // MOV  R0,R2
+        imem[eidx] = 16'h4210; eidx = eidx + 1;               // DT   R2
+        imem[eidx] = 16'h8BFD; eidx = eidx + 1;               // BF   (delay: probe window)
+        emit_wreg_w(32'hFFFF_FF68, 16'h5020);                 //AMX = 0100 (1Mx16x4)
+        emit_ldrn(1, {6'b1010_11, A});
+        emit_ldr0(32'hA5A5_0100);
+        imem[eidx] = 16'h2102; eidx = eidx + 1;               // MOV.L R0,@R1 (WRITA)
+        m2 = eidx;
+        imem[eidx] = 16'hE702; eidx = eidx + 1;               // marker 2
+        emit_sentinel_loop(eidx, sent);
+        do_reset;
+        sdm_clr = 1'b1; run_cycles(4); sdm_clr = 1'b0;
+        run_until_retire(m1, 60000);
+        run_cycles(120);
+        chk("0101: one ACTV, one WRIT", sdm_actv_cnt * 16 + sdm_cas_cnt, 32'd17);
+        chk("0101 row pins: A10-first shift, banks A15/A14",
+            {6'd0, sdm_row_a}, {6'd0, A[25:17], A[25:10], A[0]});
+        chk("0101 col pins: banks held, AP at A12",
+            {6'd0, sdm_col_a}, {6'd0, A[25:17], A[16], A[24], A[23], A[13], 1'b1, A[11:1], A[0]});
+        chk("0101 write DQM all lanes", {28'd0, sdm_cas_dqm}, 32'd0);
+        sdm_clr = 1'b1; run_cycles(4); sdm_clr = 1'b0;
+        run_until_retire(m2, 60000);
+        run_cycles(120);
+        chk("0100: one ACTV, one WRIT", sdm_actv_cnt * 16 + sdm_cas_cnt, 32'd17);
+        chk("0100 row pins: A9-first shift, banks A15/A14",
+            {6'd0, sdm_row_a}, {6'd0, A[25:17], A[24:9], A[0]});
+        chk("0100 col pins: banks held, AP at A12",
+            {6'd0, sdm_col_a}, {6'd0, A[25:17], A[16], A[23], A[22], A[13], 1'b1, A[11:1], A[0]});
+        run_until_retire(sent, 60000);
+        end_test;
+    end
+endtask
+
+task automatic test_sdram16_shapes;
+    integer sent, m1, m2, m3, m4;
+    begin
+        begin_test("16-bit SDRAM bus: half-word beats on A3:A1, DQM rails, AP at A11, 8-beat fill");
+        sdram_en = 1'b0;                    //shape probe: 16-bit wiring differs from the model
+        eidx = 0;
+        emit_wreg_w(32'hFFFF_FF62, 16'h3FB0);                 //BCR2: A3SZ=10 (word) FIRST
+        emit_sdram_init(16'h5020, 16'hFFDF, 32'hFFFF_E440);   //AMX=0100; 16-bit SDMR window (p.302)
+        emit_ldrn(1, 32'hAC00_0018);
+        emit_ldr0(32'hFEED_C0DE);
+        imem[eidx] = 16'h2102; eidx = eidx + 1;               // MOV.L R0,@R1: 2 WRIT halves
+        m1 = eidx;
+        imem[eidx] = 16'hE701; eidx = eidx + 1;               // marker 1
+        emit_ldr0(32'd200);
+        imem[eidx] = 16'h6203; eidx = eidx + 1;
+        imem[eidx] = 16'h4210; eidx = eidx + 1;               // DT/BF delay
+        imem[eidx] = 16'h8BFD; eidx = eidx + 1;
+        emit_ldrn(1, 32'hAC00_0012);
+        imem[eidx] = 16'h6411; eidx = eidx + 1;               // MOV.W @R1,R4: 1 READ beat
+        m2 = eidx;
+        imem[eidx] = 16'hE702; eidx = eidx + 1;               // marker 2
+        emit_ldr0(32'd200);
+        imem[eidx] = 16'h6203; eidx = eidx + 1;
+        imem[eidx] = 16'h4210; eidx = eidx + 1;
+        imem[eidx] = 16'h8BFD; eidx = eidx + 1;
+        emit_ldrn(1, 32'hAC00_0011);
+        imem[eidx] = 16'h6510; eidx = eidx + 1;               // MOV.B @R1,R5 (odd byte)
+        m3 = eidx;
+        imem[eidx] = 16'hE703; eidx = eidx + 1;               // marker 3
+        emit_ldr0(32'd200);
+        imem[eidx] = 16'h6203; eidx = eidx + 1;
+        imem[eidx] = 16'h4210; eidx = eidx + 1;
+        imem[eidx] = 16'h8BFD; eidx = eidx + 1;
+        imem[eidx] = 16'hE0EC; eidx = eidx + 1;               // MOV #0xEC,R0 (CCR)
+        imem[eidx] = 16'hE10F; eidx = eidx + 1;               // MOV #0x0F,R1
+        imem[eidx] = 16'h2012; eidx = eidx + 1;               // MOV.L R1,@R0: cache on
+        emit_ldrn(1, 32'h8C00_0040);
+        imem[eidx] = 16'h6712; eidx = eidx + 1;               // MOV.L @R1,R7: 8-beat fill
+        m4 = eidx;
+        imem[eidx] = 16'hE704; eidx = eidx + 1;               // marker 4
+        emit_sentinel_loop(eidx, sent);
+        do_reset;
+        sdm_clr = 1'b1; run_cycles(4); sdm_clr = 1'b0;
+        run_until_retire(m1, 60000);
+        run_cycles(120);
+        chk("long write: 2 WRIT half-beats",   sdm_cas_cnt, 32'd2);
+        chk("last half col: A3:A1 walked, AP at A11",
+            {6'd0, sdm_col_a}, 32'h0000_081A);
+        chk("write DQM on the low rails",      {28'd0, sdm_cas_dqm}, {28'd0, 4'b1100});
+        sdm_clr = 1'b1; run_cycles(4); sdm_clr = 1'b0;
+        run_until_retire(m2, 60000);
+        run_cycles(120);
+        chk("word read: one beat",             sdm_cas_cnt, 32'd1);
+        chk("word read col + AP",              {6'd0, sdm_col_a}, 32'h0000_0812);
+        chk("word read DQM: DQMLU+DQMLL",      {28'd0, sdm_cas_dqm}, {28'd0, 4'b1100});
+        sdm_clr = 1'b1; run_cycles(4); sdm_clr = 1'b0;
+        run_until_retire(m3, 60000);
+        run_cycles(120);
+        chk("odd byte read: one beat",         sdm_cas_cnt, 32'd1);
+        chk("odd byte DQM: DQMLL only",        {28'd0, sdm_cas_dqm}, {28'd0, 4'b1110});
+        sdm_clr = 1'b1; run_cycles(4); sdm_clr = 1'b0;
+        run_until_retire(m4, 60000);
+        run_cycles(150);
+        chk("cache fill: 8 READ half-beats",   sdm_cas_cnt, 32'd8);
+        chk("cache fill: 8 BS Td data cycles", sdm_td_cnt,  32'd8);
+        run_until_retire(sent, 60000);
+        end_test;
+    end
+endtask
+
+task automatic test_bs_td_dqm;
+    integer sent, m0, m1, m2, m3;
+    begin
+        begin_test("BS on Td data cycles + per-byte read DQM against the live device (p.283)");
+        sdram_poke(32'h0C00_0030, 32'h1122_3344);
+        eidx = 0;
+        emit_sdram_init(16'h5038, 16'hFFDF, 32'hFFFF_E880);   //CL2, AMX=0111
+        m0 = eidx;
+        imem[eidx] = 16'hE700; eidx = eidx + 1;               // marker 0 (init done)
+        emit_ldr0(32'd60);
+        imem[eidx] = 16'h6203; eidx = eidx + 1;
+        imem[eidx] = 16'h4210; eidx = eidx + 1;               // DT/BF delay
+        imem[eidx] = 16'h8BFD; eidx = eidx + 1;
+        emit_ldrn(1, 32'hAC00_0030);
+        imem[eidx] = 16'h6312; eidx = eidx + 1;               // MOV.L @R1,R3
+        m1 = eidx;
+        imem[eidx] = 16'hE701; eidx = eidx + 1;               // marker 1
+        emit_ldr0(32'd200);
+        imem[eidx] = 16'h6203; eidx = eidx + 1;
+        imem[eidx] = 16'h4210; eidx = eidx + 1;
+        imem[eidx] = 16'h8BFD; eidx = eidx + 1;
+        emit_ldrn(1, 32'hAC00_0031);
+        imem[eidx] = 16'h6410; eidx = eidx + 1;               // MOV.B @R1,R4 (byte 1)
+        m2 = eidx;
+        imem[eidx] = 16'hE702; eidx = eidx + 1;               // marker 2
+        emit_ldr0(32'd200);
+        imem[eidx] = 16'h6203; eidx = eidx + 1;
+        imem[eidx] = 16'h4210; eidx = eidx + 1;
+        imem[eidx] = 16'h8BFD; eidx = eidx + 1;
+        imem[eidx] = 16'hE0EC; eidx = eidx + 1;               // MOV #0xEC,R0 (CCR)
+        imem[eidx] = 16'hE10F; eidx = eidx + 1;               // MOV #0x0F,R1
+        imem[eidx] = 16'h2012; eidx = eidx + 1;               // MOV.L R1,@R0: cache on
+        emit_ldrn(1, 32'h8C00_0030);
+        imem[eidx] = 16'h6512; eidx = eidx + 1;               // MOV.L @R1,R5: 4-beat fill
+        m3 = eidx;
+        imem[eidx] = 16'hE703; eidx = eidx + 1;               // marker 3
+        emit_sentinel_loop(eidx, sent);
+        do_reset;
+        run_until_retire(m0, 60000);
+        sdm_clr = 1'b1; run_cycles(4); sdm_clr = 1'b0;
+        run_until_retire(m1, 60000);
+        run_cycles(120);
+        chk("single read: 1 READ, 1 Td",   sdm_cas_cnt * 16 + sdm_td_cnt, 32'd17);
+        //data lands CL device clocks after registration = CL-1 command
+        //windows later in the controller frame (the rd_lat capture pipeline)
+        chk("BS marks the CL-2 data window", (sdm_td_t - sdm_cas_t), 32'd20);
+        chk("long read DQM all lanes",     {28'd0, sdm_cas_dqm}, 32'd0);
+        chk("read data (device answered)", gpr(3), 32'h1122_3344);
+        sdm_clr = 1'b1; run_cycles(4); sdm_clr = 1'b0;
+        run_until_retire(m2, 60000);
+        run_cycles(120);
+        chk("byte read DQM: DQMUL lane only", {28'd0, sdm_cas_dqm}, {28'd0, 4'b1011});
+        chk("byte read data through its lane", gpr(4), 32'h0000_0022);
+        sdm_clr = 1'b1; run_cycles(4); sdm_clr = 1'b0;
+        run_until_retire(m3, 60000);
+        run_cycles(150);
+        chk("burst fill: 4 READ, 4 Td",    sdm_cas_cnt * 16 + sdm_td_cnt, 32'd68);
+        chk("fill word 0 data",            gpr(5), 32'h1122_3344);
+        run_until_retire(sent, 60000);
+        end_test;
+    end
+endtask
+
+task automatic test_release_pads;
+    integer sent, m1, m2, c;
+    begin
+        begin_test("Bus-release pads: PULA 4-cycle window, PULD, HIZCNT, IRQOUT on pending refresh");
+        eidx = 0;
+        emit_sdram_init(16'h503C, 16'hFFDF, 32'hFFFF_E880);   //RFSH=1
+        emit_wreg_w(32'hFFFF_FF72, 16'hA520);                 //RTCOR = 0x20
+        emit_wreg_w(32'hFFFF_FF6E, 16'hA508);                 //RTCSR: CKS=001 (bus/4)
+        emit_wreg_w(32'hFFFF_FF60, 16'hD008);                 //BCR1: PULA|PULD|HIZCNT
+        m1 = eidx;
+        imem[eidx] = 16'hE701; eidx = eidx + 1;               // marker 1
+        emit_ldr0(32'd60);
+        imem[eidx] = 16'h6203; eidx = eidx + 1;
+        imem[eidx] = 16'h4210; eidx = eidx + 1;               // DT/BF delay
+        imem[eidx] = 16'h8BFD; eidx = eidx + 1;
+        emit_wreg_w(32'hFFFF_FF60, 16'hC008);                 //BCR1: HIZCNT off
+        m2 = eidx;
+        imem[eidx] = 16'hE702; eidx = eidx + 1;               // marker 2
+        emit_sentinel_loop(eidx, sent);
+        do_reset;
+        run_until_retire(m1, 60000);
+        apu_clr = 1'b1; run_cycles(4); apu_clr = 1'b0;
+        breq_n = 1'b0;
+        c = 0;
+        while(back_n !== 1'b0 && c < 60000) begin @(posedge clk); c = c + 1; end
+        run_cycles(40);                     //the 4-cycle pull window has passed
+        chk("PULA: A pins pulled exactly 4 CKIO cycles", apu_hi_cnt, 32'd4);
+        chk_true("A pull-up released after the window",  a_pu      === 1'b0);
+        chk_true("HIZCNT=1: RAS/CAS pads stay driven",   rascas_oe === 1'b1);
+        chk_true("other shared pads released",           bus_oe    === 1'b0);
+        chk_true("PULD: D pins pulled while idle",       d_pu      === 1'b1);
+        c = 0;                              //a refresh request must pend -> IRQOUT
+        while(irqout_n !== 1'b0 && c < 4000) begin @(posedge clk); c = c + 1; end
+        chk_true("IRQOUT asserted on pending refresh",   irqout_n  === 1'b0);
+        breq_n = 1'b1;
+        c = 0;                              //bus regained: the refresh cycle runs
+        while(irqout_n !== 1'b1 && c < 4000) begin @(posedge clk); c = c + 1; end
+        chk_true("IRQOUT negated once the refresh ran",  irqout_n  === 1'b1);
+        run_until_retire(m2, 60000);
+        breq_n = 1'b0;
+        c = 0;
+        while(back_n !== 1'b0 && c < 60000) begin @(posedge clk); c = c + 1; end
+        run_cycles(10);
+        chk_true("HIZCNT=0: RAS/CAS pads released too",  rascas_oe === 1'b0);
+        breq_n = 1'b1;
+        run_until_retire(sent, 60000);
         end_test;
     end
 endtask
@@ -3907,6 +4457,17 @@ initial begin
     test_int_tas_sweep;
     test_exc_int_collision_soc;
     test_boundary_summary;
+
+    group("14. BSC Group C: MCS pins, bus widths, AMX, BS/DQM shapes, release pads");
+    test_mcs_pins;
+    test_width8;
+    test_amx_shapes;
+    test_sdram16_shapes;
+    test_bs_td_dqm;
+    test_release_pads;
+
+    group("15. Board-bus shape monitors (whole run)");
+    test_bus_monitors;
 
     $display("");
     $display("################################");

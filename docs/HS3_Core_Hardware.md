@@ -36,8 +36,10 @@ architectural cycle.
 The **RTC is the only true second clock domain.** Everything the RTC exposes to the
 CPU crosses back into the `i_CLK` domain through tick-synchronizers and no-reset
 toggle flags; the manual's own ~91.6 µs command latency (p.421) absorbs the CDC
-skew. `o_CKIO` clocks the board SDRAM directly (the TB clocks its Micron model from
-the pin).
+skew. `o_CKIO` clocks the board SDRAM directly, in the **datasheet phase** (rises
+at the command edges); the board delays the device clock for the tOD margin —
+the TB gives its Micron model a half-cycle transport delay on the clock net
+(see the BSC section).
 
 ### A note on the half-clock (`dclk`) lineage
 
@@ -414,23 +416,59 @@ kill, legal; mutation, never); an unconsumed D response re-presents identically
 (loss-free retirement); an external MEM-bus request is never withdrawn or mutated
 once presented; locked accesses alternate strictly read→write (one open pair).
 
-### BSC — the external bus controller (`bsc.sv`, 1383 lines)
+### BSC — the external bus controller (`bsc.sv`, 1952 lines)
 
 The BSC exposes the **real SH7709S chip pin set** (Table 10.1, PCMCIA-less) at the
 `HS3` top: `A[25:0]`, a split data bus (`o_D_O`/`o_D_OE`/`i_D_I`, `inout` only at
 board level), `BS_n`, `CS0/2–6_n`, `RD_WR`, `RAS3L/U_n`, `CASL/U_n`, `WE_n[3:0]`
-(= DQM), `RD_n`, `i_WAIT_n`, `CKE`, and `BREQ_n`/`BACK_n`. Front-end route classes:
+(= DQM), `RD_n`, `i_WAIT_n`, `CKE`, `BREQ_n`/`BACK_n`, plus (Group C) the pad-state
+exports `o_A_PU`/`o_D_PU`/`o_RASCAS_OE`, `IRQOUT_n`, and the MCS0–7 selects riding
+the port-C pads. Front-end route classes:
 
-- **SDRAM engine** — MRS / single / burst-of-4 / auto-refresh / self-refresh /
+- **SDRAM engine** — MRS / single / burst / auto-refresh / self-refresh /
   bank-active with per-bank open rows, tWR guard, CL read pipe. Timing is driven
   exactly by the `MCR`/`WCR2` registers (CL/RCD/tRP), on the 50 MHz `i_BCEN` enable.
   Reproduces the natural SDRAM latency of the original board (most emulated code runs
-  from SDRAM), §10.3.4 figs 10.14–10.28.
-- **Ordinary / burst-ROM** — wait-states from `WCR2` (first access ∈ {0,1,2,3,4,6,8,10}),
-  `i_WAIT_n` sampled after the programmed waits; burst-ROM continuation uses the
-  pitch table. Reads sample `i_D_I` live at the completing bus edge (raw async
-  ROM/SRAM works with no handshake). An `ord_run` grid-align flop keeps every pin
-  edge on the 20 ns bus grid (a real bug the 70 ns NOR flash exposed).
+  from SDRAM), §10.3.4 figs 10.14–10.28. **Full table-10.13 address multiplexing**
+  (Group C): every AMX family decodes — row = `addr >> {8,9,10}` on `A16–A1`, the
+  column phase holds the row values on a per-mode `A16–A13` mask (which keeps the
+  bank bits standing on the device BA pins), the precharge flag rides the
+  device-A10 pin (`A12`/`A11` by bus width), single-rail modes (`1101`/32-bit,
+  `1110`/16-bit) never drive the U rails, and the open-row table compares
+  device-meaningful row bits only. **BCR2 selects a 16-bit SDRAM bus width** per
+  area: a line moves as 8 half-word beats on `A3:A1` (fig 10.15 text), singles
+  split into halves on `D15–D0` under the DQMLU/DQMLL rails. **BS marks the Td
+  data cycles** ("asserted in each of cycles Td1–Td4", p.283) via a CL-pipeline
+  predictor — commands no longer carry it — and **single reads drive only their
+  own DQM byte lanes** (p.276), which the Micron model honors lane-by-lane.
+- **Ordinary / burst-ROM** — the full fig-10.6 state model: T1 + *n*·Tw + T2
+  (first-access waits ∈ {0,1,2,3,4,6,8,10} from `WCR2`); `i_WAIT_n` decides the
+  Tw→T2 transition, sampled mid-state when `WCR1.WAITSEL`=1 (fig 10.11) or at
+  the boundary when 0 (a config silicon calls "not guaranteed"); burst-ROM
+  continuation beats total the pitch-table states exactly and always sample
+  WAIT; a write-back burst ignores the pin (p.274). `WCR1` inter-access idles
+  (1–3) gate the **pin launch** on area switches and read→write turnaround —
+  the generic-port handshake fast path never pays, which is what keeps the
+  IPC-parity law beat-exact.
+  **Strobe shapes are the fig-23.16 AC shapes** (Group B, 2026-07-07): RD/WEn
+  assert at **mid-T1** and negate at **mid-T2** (tRSD/tWED at the CKIO falls),
+  CSn negates at mid-T2 (tCSD2), read data is sampled **at the mid-T2 fall** —
+  tRDH1 = 0 ns lets the device release data the moment RD rises, so any later
+  sample is unbuildable on real parts. A split-16 longword now runs as two full
+  bus cycles with WE **rising between the halves** (an async device latches at
+  the rise — the old held-WE envelope would have lost the first half on real
+  silicon). **8-bit ports** (Group C) complete the width matrix of tables
+  10.7–10.12: a datum wider than the port walks its byte addresses low-to-high
+  on `D7–D0` with WE0 only, one full bus cycle each, endian-mirrored register
+  lanes (both endians decoded; bus arbitration never splits the multi-cycle
+  walk, §10.3.8). Pitch beats keep boundary sampling and strobe launch→close: silicon
+  holds RD low through a mid-burst sample (fig 23.19/23.20); HS3 runs each beat
+  as its own request, so CSn/RD re-pulse per beat instead of silicon's
+  burst-long CSn envelope (conservative — a page ROM re-selects fine). All ord
+  pin edges sit **on the 20 ns bus grid**: launch on the `ord_run` grid flop,
+  release at the T2-close boundary (`!ord_done`), never at a core handshake
+  edge; only a generic-port hsk *early* completion may release off-grid
+  (extension-path behavior, documented in the header).
 - **Generic mirror port** — a zero-beat pass-through toward the surrounding SoC's own
   controllers (fabric SDRAM ctrl / HPS DDR3); this is the IPC-parity path. All data
   rides the physical D pins; the generic port is pure address/control.
@@ -444,6 +482,119 @@ self-refresh park must not count as bus-busy (else fetches deadlock); and
 **TAS.B atomicity vs BREQ** — the bus must not be released between a locked pair's
 read and write (p.320). Cache line fills present as `req_burst` on I bus 1.
 
+The TB runs two **whole-run board-bus monitors** (checked as the final test):
+a D-bus contention monitor (at most one driver among DUT / TB memories / flash /
+SDRAM at any sample — this is what the WCR1 idles and strobe shapes must
+guarantee) and a WE-shape monitor (address/data must hold from WE fall to WE
+rise while an ordinary write owns the pins — the held-WE split-16 bug class
+can never return). The TB's raw memories are strobe-honest: they drive D only
+while `RD_n` is low and latch per `WE_n` lane, like the async parts in figs
+10.7–10.9; the handshake-mode controller backs off the D bus while the chip
+drives it (posted SDRAM engine writes share the pins).
+
+**CKIO pin phase — datasheet phase (fixed 2026-07-07).** The pin now *rises*
+at the command edges, exactly as figs 10.14/23.16 draw it: every bus pin
+changes at the CKIO rise and the mid-state shapes (RD/WEn edges, WAITSEL=1
+sampling) sit at the fall. A synchronous device clocked straight from the
+pin would sample at the very edge the pins change, so the board must grant
+the device the real chip's tOD margin — on the FPGA an output-delay
+constraint / clock-tree skew on the CKIO net (no PLL block needed). The TB
+models that board adjustment as a half-cycle transport delay on the Micron
+model's clock net, which reproduces the pre-fix electrical relationship
+exactly: every command lands in the same device cycle, and all SDRAM laws
+held bit-exact through the flip.
+
+**Register file — §10.2-exact (audited 2026-07-07).** POR values (BCR1
+`H'0000`+ENDIAN, BCR2 `H'3FF0`, WCR1 `H'3FF3`, WCR2 `H'FFFF`, MCR/PCR/
+MCSCR/refresh group `0`), reserved-bit masks (BCR2 `3FF0`, WCR1 `BFF3`,
+MCR `FFFE`, PCR `CFFF`, MCSCR `007F`), `BCR1.ENDIAN` read-only reflecting
+the MD5 strap (**0 = big-endian** — the audit found and fixed an inverted
+polarity), fig-10.5 write keys on the refresh group (word-only, `A5` /
+`101001`), RFCR clearing when it exceeds the LMTS limit, and CMF's clear
+bound to the *next performed CBR refresh* after the keyed write-0 (p.253) —
+no longer the simplified immediate clear. Test 22 locks all of it.
+
+**Group C — breadth (landed 2026-07-07).** Everything the earlier passes had
+catalogued as missing, minus PCMCIA and standby: full AMX decode, 16-bit
+SDRAM bus width, 8-bit ordinary ports, BS-on-Td, per-byte read DQM (all
+above); **MCS0–7 mask-ROM selects** per MCSCR0–7 / table 10.15 (CS0-or-CS2
+select, CAP-sized `A25:22` block compare, CS-shaped assertion) riding the
+**port-C pads** through the PFC "other function" mode — and, per p.323, MCS0
+claims the CS0 pad itself when MCSCR0 decodes area 0; **bus-release pad
+behavior** — PULA pulls A25–A0 up for exactly 4 CKIO after BACK asserts
+(fig 10.41), PULD marks the D pins whenever the data bus is idle
+(figs 10.42/10.43), HIZCNT keeps the RAS/CAS pads driven through a release
+(`o_RASCAS_OE`); and the **IRQOUT pin** (pp.320–321): asserted on a
+pending-not-yet-run refresh (BSC `o_REF_PEND`) or an unmasked interrupt
+(`int_level > SR.I3–I0`, BL-independent, NMI always), so a foreign master
+returns the bus. The TB gained an SDRAM command monitor (`negedge ckio`
+sampling — one sample per 20 ns command window), an 8-bit strobe-honest raw
+device, and a `sdram_en` depopulation knob so the AMX/16-bit shape probes
+don't feed the 0111-wired Micron model ill-formed sequences; tests 58–63
+lock MCS decode + the pad switch, the 8-bit walk (data + WE0 count), the
+AMX row/column pin patterns (transcribed from table 10.13 as constants),
+16-bit beats/DQM/AP-at-A11 + the 8-beat fill, BS-on-Td + lane-masked reads
+against the live device, and the release-pad/IRQOUT laws. Remaining known
+deviations: PCMCIA, and standby-mode pad states (the SoC has no standby
+mode; HIZMEM is stored but unreachable).
+
+### Cache↔BSC interaction latency — measured, with the adjustment list
+
+Measured 2026-07-07 with a scratch probe rig (a two-pass warmed loop in cached
+SDRAM code: pass 2 runs with every I-fetch hitting and the bus otherwise idle;
+auto-precharge mode, CL2/RCD2, 50 MHz bus). All numbers are core cycles at
+100 MHz; `t` = the edge the D-lookup resolves (the tag read is `t−1` — "it first
+takes a cycle to find the cache", SH7604 §7.11.2, and HS3 matches).
+
+| event | cached load miss | bypass load (P2) | bypass store (P2) |
+|---|---|---|---|
+| miss/classify resolved; `CORE_I_BUS` req; splitter; BSC accept | `t` (one edge, zero beats) | `t` | `t` |
+| first SDRAM command (ACTV) on pins | `t+1` | `t+1` | posted |
+| data beats respond (CL2) | **missed word first** at `t+10`, wrap +2/beat | `t+11` | ack `t+1` |
+| the load **retires** (fill-forward) | **`t+13`, any word offset** | `t+14` | `t+2` |
+| cache returns to `S_IDLE` (fill tail in background) | `t+17` | `t+12` | (WRIT lands `~t+7`) |
+
+*(Re-measured twice on 2026-07-07: Group A's dispatch-NOP removal moved ACTV
+`t+3`→`t+1`; the wrap fill-forward then moved the miss retire `t+19`→`t+13`.
+The original trace was ACTV `t+3`, beats `t+12+2n`, retire `t+21` — a cold
+D-miss now restarts the pipe 8 core cycles earlier, offset-independent.)*
+
+What the trace establishes, held against SH7709S §5.3.2 (p.110), SH7604
+§7.11.2/§8.4.3, and the `attic/SH-master` SH7604 implementation:
+
+1. **~~No early restart~~ — DONE (wrap fill-forward, 2026-07-07).** Fills now
+   wrap from the missed word (BSC engine issues READ columns in wrap order,
+   READA on the 4th command, fig 10.16) and the cache forwards the first beat
+   to the pipe "in parallel with being loaded to the cache" (p.110). Measured:
+   miss retire `t+21`→`t+13`, offset-independent; the fill tail runs in
+   background behind the resumed pipe. Contract change: a fault on a LATER
+   beat no longer faults the forwarded access — it silently kills the line
+   validation, and the exception binds to whichever access later requests the
+   faulting word itself (suite recoded to this more-precise contract; the
+   victim-invalidate law is unchanged). The background drain also gained a
+   launch slot on hit-resolve edges — early-restarted hit streams have no
+   request-free edges, which starved it.
+2. **~~Accept→ACTV dispatch NOP~~ — DONE (Group A4, 2026-07-07).** The first
+   command now issues at the `E_IDLE` dispatch edge from the live op fields;
+   accept→ACTV measured 1 cycle, every SDRAM op 2 core cycles faster.
+3. **The front half is already optimal — do not touch.** Miss determination,
+   cache request, splitter, and BSC accept all land on **one edge** (the
+   SH-master reference registers its request one cycle later). Latency law of
+   §4 applies: no new beats here.
+4. **Cache-off is NOT one cycle faster, and that is correct.** SH7604 §7.11.2:
+   cache-through reads still pay "an extra cycle … to determine the cycle"
+   before the internal-bus read starts. Measured HS3: identical dispatch cost
+   for miss and bypass (both fire at `t`); the bypass is faster end-to-end only
+   because it moves one beat instead of four. No adjustment warranted.
+5. **The posted bypass store already matches the SH7604 "one-level write
+   buffer" model** (ack at `t+1`, retire `t+2`, WRIT on pins ~`t+9`,
+   fire-and-forget). The BSC is one-outstanding, so a *following* external
+   access stalls until the posted write completes — same as the manual's
+   "during reads, the CPU always has to wait."
+
+Self-modifying-code note: fill-forward tightened the I-side visibility window
+— `SELFMOD_K` relocked 4→2 (only IF/ID + the pair slot hold stale opcodes).
+
 ---
 
 ## 5. Peripherals
@@ -453,10 +604,10 @@ remains the critical path.
 
 | Module | File | Function |
 |---|---|---|
-| **CPG / WDT** | `cpg_wdt.sv` (282) | FRQCR/STBCR/STBCR2 clock-pulse generator; Pφ divider N∈{1,2,3,4,6}; watchdog timer with keyed `0x5A`/`0xA5` writes + reset stretcher; owns `o_BCEN` and the `o_CKIO` pin (B-φ = core/2, p.207 — FRQCR has no CKOEN, CKIO always drives in modes 0–2). |
+| **CPG / WDT** | `cpg_wdt.sv` (286) | FRQCR/STBCR/STBCR2 clock-pulse generator; Pφ divider N∈{1,2,3,4,6}; watchdog timer with keyed `0x5A`/`0xA5` writes + reset stretcher; owns `o_BCEN` and the `o_CKIO` pin (B-φ = core/2, p.207 — FRQCR has no CKOEN, CKIO always drives in modes 0–2; datasheet phase: rises at the command edges). |
 | **INTC** | `intc.sv` (455) | Full §6 interrupt controller: IRQ / IRL / IRLS / PINT / NMI, a 37-entry **2-stage registered priority resolver**, `INTEVT2`, `o_INT_ACK`/`o_NMI_ACK` (the acks latch/clear pending state — the core's ack-implies-entry law makes the handshake lossless). Interrupt inputs tap the I/O pads (below). |
 | **TMU** | `tmu.sv` (262) | 3× 32-bit auto-reload down-counters; shared Pφ prescaler taps (P/4, /16, /64, /256); external TCLK clock (per CKEG, 2FF + edge detect); ch2 input capture (TCPR2, ICPF); underflow interrupts `TUNI0-2`/`TICPI2` → INTC (IPRA). |
-| **I/O ports / PFC** | `ioport.sv` (232) | All 12 ports (A–L, SCP) as `pcr[]`/`pdr[]` arrays with per-port capability masks (drive/pull-up), PFC mode muxing (`MD1 ? pin : (DRV & DR)`), the PGCR PTG0 quirk (p.577). |
+| **I/O ports / PFC** | `ioport.sv` (236) | All 12 ports (A–L, SCP) as `pcr[]`/`pdr[]` arrays with per-port capability masks (drive/pull-up), PFC mode muxing (`MD1 ? pin : (DRV & DR)`), the PGCR PTG0 quirk (p.577), the `o_PC_FN` grant vector handing port-C pads to the BSC's MCS outputs. |
 | **RTC** | `rtc.sv` (407) | §13, **two clock domains**: the `i_EXTAL2` 32.768 kHz oscillator (7-bit prescaler → RTCCLK 16.384 kHz + 256 Hz tap) and the bus domain (R64CNT, BCD calendar, alarms, periodic interrupt). CDC by tick-sync + no-reset toggles. Counters/alarms never pin-reset (Table 13.2). Feeds TMU `i_RTCCLK`/`i_RTC_TICK`. |
 
 **Real-chip pin sharing (Table 18.1):** the dedicated `i_IRQ`/`i_IRLS`/`i_PINT`

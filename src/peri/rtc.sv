@@ -26,10 +26,9 @@
     RTCEN/START, p.420).
 
     Deviations: no module standby / VCC-RTC power pin; XTAL2 is not modeled
-    (clock input only); the 2 s periodic tap derives from RSECCNT bit-0
-    parity, so it halts with START=0; counter writes while START=1 are
-    accepted (13.4.1 forbids them - a write wins over a same-cycle carry);
-    wrong-size register writes take the low byte.
+    (clock input only); counter writes while START=1 are accepted (13.4.1
+    forbids them - a write wins over a same-cycle carry); wrong-size register
+    writes take the low byte.
 */
 
 module rtc (
@@ -189,6 +188,11 @@ end
 */
 
 logic           t128_ph;                    //halves the 256 Hz tick to the R64CNT pace
+logic           sec_par;                    //0.5 Hz divider bit (seconds parity): the 2 s
+                                            //periodic tap. R64CNT is 7-bit and bottoms out at
+                                            //1 Hz, so 2 s needs one more divider stage; it must
+                                            //ride the free-running divider (not RSECCNT) so the
+                                            //PES=2s interrupt is START-independent (p.421).
 wire            ev128    = tick256 & t128_ph;           //R64CNT count-up (128/s)
 wire            sec_ev   = ev128 & (r64cnt == 7'h7F);   //1 Hz wrap = seconds carry
 wire            divrst_cmd;                             //RESET/ADJ write (control section)
@@ -197,15 +201,18 @@ always_ff @(posedge i_CLK) begin if(i_CEN) begin
     if(divrst_cmd) begin
         t128_ph <= 1'b0;
         r64cnt  <= 7'd0;
+        sec_par <= 1'b0;
     end
     else begin
         if(tick256) t128_ph <= ~t128_ph;
         if(ev128)   r64cnt  <= r64cnt + 7'd1;
+        if(sec_ev)  sec_par <= ~sec_par;                //toggle on the 1 Hz carry = 0.5 Hz
     end
 end end
 
-//periodic interrupt event per PES (p.421): pre-increment all-ones low bits
-//select the 2^n subdivisions of the 128 Hz grid; 2 s adds RSECCNT parity
+//periodic interrupt event per PES (p.421): all-ones low bits of the 128 Hz
+//grid select the 2^n subdivisions; 2 s uses the 0.5 Hz divider bit (sec_par)
+//so it fires off the free-running divider regardless of RCR2.START
 logic           pev;
 always_comb begin
     unique case(pes)
@@ -215,7 +222,7 @@ always_comb begin
         3'd4:    pev = ev128 & (r64cnt[4:0] == 5'h1F);  //1/4 s
         3'd5:    pev = ev128 & (r64cnt[5:0] == 6'h3F);  //1/2 s
         3'd6:    pev = sec_ev;                          //1 s
-        3'd7:    pev = sec_ev & rseccnt[0];             //2 s (odd->even second)
+        3'd7:    pev = sec_ev & sec_par;                //2 s: 1 Hz carry gated by the 0.5 Hz bit
         default: pev = 1'b0;                            //000: no periodic interrupts
     endcase
 end
