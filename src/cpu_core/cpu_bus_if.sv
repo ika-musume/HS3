@@ -89,7 +89,11 @@ modport monitor (
 endinterface
 
 /* SH7709S I bus 1 (Fig 1.1, p.6). One outstanding transaction (the cache FSM
-   serializes on mem_pending); a store is posted - rsp only frees the master. */
+   serializes on mem_pending); a store is posted - rsp only frees the master.
+   The DMAC sideband (req_dack fields, req_saddr) rides along like req_lock: the
+   DMAC master tags its accesses, only the BSC consumes them (DACK framed on
+   the CSn window, p.345; single-address cycles fig 11.10); the CPU/cache
+   master ties them off. */
 interface IBus_1;
 logic           req_valid;
 logic           req_ready;
@@ -100,6 +104,13 @@ logic   [31:0]  req_addr;
 logic   [31:0]  req_wdata;
 logic   [3:0]   req_wstrb;
 logic           req_lock;
+/* DMAC sideband - AM (which dual-mode cycle gets DACK, p.338) is resolved by
+   the DMAC, so the BSC only ever sees "frame DACK on THIS bus cycle" */
+logic           req_dack;       //assert DACKn over this cycle's CSn window
+logic           req_dack_ch;    //DACK pin select: 0 = DACK0, 1 = DACK1
+logic           req_dack_al;    //CHCR.AL: DACK polarity, 1 = active-high
+logic           req_saddr;      //single-address mode cycle ("saddr": write = external
+                                //device drives D31-0 while WE runs, fig 11.10a)
 logic           rsp_valid;
 logic           rsp_ready;
 logic   [31:0]  rsp_rdata;
@@ -107,13 +118,15 @@ logic           rsp_fault;
 
 modport master (
     output req_valid, req_write, req_size, req_burst, req_addr, req_wdata,
-            req_wstrb, req_lock, rsp_ready,
+            req_wstrb, req_lock, req_dack, req_dack_ch, req_dack_al, req_saddr,
+            rsp_ready,
     input  req_ready, rsp_valid, rsp_rdata, rsp_fault
 );
 
 modport slave (
     input  req_valid, req_write, req_size, req_burst, req_addr, req_wdata,
-            req_wstrb, req_lock, rsp_ready,
+            req_wstrb, req_lock, req_dack, req_dack_ch, req_dack_al, req_saddr,
+            rsp_ready,
     output req_ready, rsp_valid, rsp_rdata, rsp_fault
 );
 endinterface

@@ -716,6 +716,11 @@ assign  I_BUS.req_wdata = (state == S_DRAIN_REQ) ? wb_data[wb_drain_word] : cur_
 assign  I_BUS.req_wstrb = st_fill                ? 4'b0000 :
                             (state == S_DRAIN_REQ) ? 4'b1111 : cur_wstrb;
 assign  I_BUS.req_lock  = cur_lock;
+//DMAC sideband: CPU accesses never carry DACK/single-address tags
+assign  I_BUS.req_dack    = 1'b0;
+assign  I_BUS.req_dack_ch = 1'b0;
+assign  I_BUS.req_dack_al = 1'b0;
+assign  I_BUS.req_saddr   = 1'b0;
 assign  I_BUS.rsp_ready = mem_pending &&
                             ((state == S_IFILL_WAIT) || (state == S_IBYP_WAIT) ||
                              (state == S_DFILL_WAIT) || (state == S_STORE_WAIT) ||

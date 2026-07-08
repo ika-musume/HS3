@@ -174,7 +174,9 @@ wire            rst_all_n = rst_por_n & rst_man_n;
 //////  Bus Fabric
 ////
 
-IBus_1          CORE_I_BUS();       //I bus 1: cache master -> splitter
+IBus_1          CORE_I_BUS();       //I bus 1: cache master -> arbiter
+IBus_1          DMA_I_BUS();        //I bus 1: DMAC master -> arbiter (tied off until the engine lands)
+IBus_1          ARB_I_BUS();        //arbiter -> splitter (the single downstream master)
 IBus_1          BRG_I_BUS();        //splitter -> bridge (register windows)
 IBus_1          BSC_I_BUS();        //splitter -> BSC (memory + BSC registers)
 IBus_2          REG_CPG();          //bridge -> cpg_wdt   (0xFFFFFF80-8F)
@@ -185,12 +187,40 @@ IBus_2          PBUS_RTC();         //P bus: BSC -> rtc    (0xFFFFFEC0-DE)
 IBus_2          PBUS_PORT();        //P bus: BSC -> ioport (0x04000100-137)
 IBus_2          PBUS_DMAC();        //P bus: BSC -> dmac   (0x04000020-77)
 
+//DMAC master leg parked until the transfer engine lands (phase 3): no
+//requests, always response-ready, sideband inert
+assign  DMA_I_BUS.req_valid   = 1'b0;
+assign  DMA_I_BUS.req_write   = 1'b0;
+assign  DMA_I_BUS.req_size    = 2'd0;
+assign  DMA_I_BUS.req_burst   = 1'b0;
+assign  DMA_I_BUS.req_addr    = 32'd0;
+assign  DMA_I_BUS.req_wdata   = 32'd0;
+assign  DMA_I_BUS.req_wstrb   = 4'd0;
+assign  DMA_I_BUS.req_lock    = 1'b0;
+assign  DMA_I_BUS.req_dack    = 1'b0;
+assign  DMA_I_BUS.req_dack_ch = 1'b0;
+assign  DMA_I_BUS.req_dack_al = 1'b0;
+assign  DMA_I_BUS.req_saddr   = 1'b0;
+assign  DMA_I_BUS.rsp_ready   = 1'b1;
+
+ibus_arb u_arb (
+    .i_RST_n                (rst_all_n                              ),
+    .i_CLK                  (i_CLK                                  ),
+    .i_CEN                  (i_CEN                                  ),
+
+    .CPU_BUS                (CORE_I_BUS                             ),
+    .DMA_BUS                (DMA_I_BUS                              ),
+    .CORE_BUS               (ARB_I_BUS                              ),
+
+    .i_DMA_HOLD             (1'b0                                   )
+);
+
 ibus_splitter u_split (
     .i_RST_n                (rst_all_n                              ),
     .i_CLK                  (i_CLK                                  ),
     .i_CEN                  (i_CEN                                  ),
 
-    .CORE_BUS               (CORE_I_BUS                             ),
+    .CORE_BUS               (ARB_I_BUS                              ),
     .BRG_BUS                (BRG_I_BUS                              ),
     .EXT_BUS                (BSC_I_BUS                              )
 );
