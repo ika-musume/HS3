@@ -8,7 +8,7 @@ manual or the SH-3 software manual unless noted.
 
 **Target:** Intel Cyclone V FPGA, 100 MHz deliverable. **Verification:** Verilator
 (`cpu_core_tb` = 103/103, `HS3_tb` = 57/57 — see §7). **Physical status:** Quartus
-out-of-context (OOC) restricted Fmax **≈ 76–79 MHz across seeds** on the full SoC
+out-of-context (OOC) restricted Fmax **≈ 77–79 MHz across seeds** on the full SoC
 (§6); the gap to 100 MHz is a flat plateau of protected single-cycle datapath loops
 (see §0 and §6), not the cache, bus, or peripherals — every OOC critical path is
 CPU-internal, and none passes through the interrupt/exception machinery.
@@ -627,25 +627,30 @@ that peripheral function and GPIO multiplex on the same physical pins.
 ## 6. Timing summary — where the Fmax goes
 
 Full-SoC OOC (Quartus 17, Cyclone V `5CSEBA6U23I7`, AGGRESSIVE PERFORMANCE,
-`set_max_delay` false-paths on the M10K RDW arcs), measured across seeds on the
+`set_max_delay` false-paths on the M10K RDW arcs), measured across five seeds on the
 final tree:
 
 | Seed | Worst multicorner slack @ 10 ns | Restricted Fmax | Top-20 headline class |
 |---|---|---|---|
-| 3 | −2.92 ns | 79.6 MHz | `bram_addr` → cache M10K address capture (request front) |
-| 4 | −3.98 ns | 71.6 MHz | `fwd_lane_b_agu` → AGU adder → cache M10K address capture |
-| 5 | −2.30 ns | **81.3 MHz** | `fwd_dep_a_agu` → AGU → exception-MMIO decode (`o_TEA`) |
+| 1 | −2.90 ns | 77.5 MHz | cache-tag `di_q` → GPR read-ahead M10K address capture (Wall A) |
+| 3 | −2.92 ns | 77.8 MHz | `fwd_dep_a_agu` → `fetch_pending_pc` (advance loop / AGU front) |
+| 4 | **−2.67 ns** | **78.9 MHz** | `fwd_lane_b` → EX adder → `exma.gpr0_data` (operand → EX result) |
+| 5 | −2.72 ns | 78.6 MHz | `fwd_lane_b_agu` → AGU → exception-MMIO decode (`o_TEA`) |
+| 7 | −2.96 ns | 77.2 MHz | `second_access_agu` → cache write-through bypass (`byp_q`) |
 
-(Measured 2026-07-09 on the complete SoC including the full DMAC — **zero
-dmac/arb cones appear in any seed's top-20**; every headline is the same CPU
-advance-loop family as before the DMAC existed.)
+(Measured 2026-07-09 on `main` after the DMAC merge — the complete SoC including the
+full DMAC *through the phase-7 ordinary burst envelope*. Mean worst slack −2.83 ns,
+cluster spread 0.29 ns (inside fit noise); best-slack fit is seed 4 at −2.67 ns /
+78.9 MHz. **Zero dmac/arb/bsc cones appear in any seed's top-20** — every headline is
+the same CPU advance-loop family as before the DMAC existed, and the five seeds each
+pick a *different* one, which is the plateau signature.)
 
 > **Read this as a plateau, not a ranking.** The design sits on a *flat cluster* of
 > single-cycle protected loops all within ~0.4 ns of each other; each seed's
 > placement picks a different one as the headline, and per-seed coarse Fmax moves
 > by more than real structural changes do. Judge any change by worst-slack trend
 > *and cone composition across seeds*, never by one fit. The 100 MHz deliverable
-> corresponds to worst slack ≥ 0; the measured gap is ~2.6–3.2 ns of mostly
+> corresponds to worst slack ≥ 0; the measured gap is ~2.7–3.0 ns of mostly
 > interconnect (55–65 % of every failing path is routing).
 
 The recurring cone classes, all protected by the no-bubbles rule (each is a

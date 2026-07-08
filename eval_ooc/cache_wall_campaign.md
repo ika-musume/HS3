@@ -289,3 +289,37 @@ Levers that COULD move the plateau (all bigger / need a decision):
   fixed).
 - DMAC campaign CLOSED: all six plan phases landed with per-phase OOC
   gates; the DMAC never entered a top-20 path at any phase.
+
+### Post-merge re-baseline — full DMAC incl. phase-7 burst envelope (2026-07-09, seeds 1/3/4/5/7) — NEUTRAL
+- Context: DMAC merged to `main` (`e1c1658 add dmac (#5)`). This is the FIRST OOC of
+  the phase-7 ordinary-path burst envelope (bsc.sv `obuf` prefetch + `req_burst` from
+  the 16-byte DMAC units + the ibus_arb fault-vs-`burst_open` clear) — the pending
+  item 7.6 (`[[dmac-progress]]`) is now closed. FIVE seeds this pass (added 1 and 7 to
+  the standard 3/4/5, matching the core noise-floor set) via
+  `quartus_ooc.py all eval_ooc/HS3/config{,_s1,_s4,_s5,_s7}.json`, run in parallel.
+- Worst multicorner slack @ 10 ns / restricted Fmax:
+  seed1 −2.898 / 77.53, seed3 −2.920 / 77.83, seed4 **−2.673 / 78.91 (BEST SLACK)**,
+  seed5 −2.716 / 78.64, seed7 −2.960 / 77.16. Mean −2.833 vs the −2.97/−2.98/−3.07
+  historical means: NEUTRAL. Cluster spread 0.287 ns — the whole 5-seed set fits
+  inside the documented ±0.4 fit-noise band. seed4 swung −3.98→−2.673 and seed5
+  −2.30→−2.716 vs the phase-6 run on ~identical RTL: pure placement noise, exactly the
+  plateau the doc warns about (judge by cones, not coarse Fmax).
+- Headlines are FIVE DIFFERENT catalogued CPU cones — one per seed, the plateau
+  signature: seed1 cache-tag `di_q` → GPR read-ahead M10K address (Wall A); seed3
+  `fwd_dep_a_agu` → `fetch_pending_pc` (advance loop / AGU front); seed4 `fwd_lane_b`
+  → EX adder → `exma.gpr0_data` (operand→EX result, ~10 LUT levels); seed5
+  `fwd_lane_b_agu` → `exc_handler|o_TEA` (advance front → exception-MMIO decode); seed7
+  `second_access_agu` → cache `byp_q` (Wall B WT-bypass).
+- Cones: **ZERO dmac/arb/bsc/peripheral logic in ANY of the 5 seeds' top-20.** The
+  phase-7 burst envelope (obuf 4:1 prefetch into the OWN_GEN rsp leaf, ordp_env/cnt
+  trackers, `req_burst` on the 16-byte units) lands entirely off the walls, like every
+  prior BSC change — item 7.6's "expect neutral" prediction confirmed.
+- Resources (best seed 4): 9,828 / 41,910 ALMs (23 %), 7,617 registers (phase-6:
+  7,430/7,343/7,402 — the ~+200 is the burst-envelope trackers + obuf twins), block
+  memory bits 158,336 (phase-6: 158,208 — the +128 is the `obuf[0:3]` 4×32-bit
+  prefetch buffer, inferred as a small RAM, Quartus 276020). Latch-inference log CLEAN
+  (the phases-1-2 10240 fix holds); zero errors; warnings all benign (unused-signal
+  lint, LogicLock-unlicensed, OOC pin/SDC-filter notes).
+- Verdict: NEUTRAL — the frozen cache-wall plateau is unchanged and the DMAC (all 7
+  phases) remains timing-invisible. Best-slack fit **seed 4, −2.673 ns / 78.91 MHz** is
+  the reference used to refresh docs/HS3_Core_Hardware.md §6.
