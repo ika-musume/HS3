@@ -55,6 +55,7 @@ module intc (
     /* CPU CONTRACT - pre-prioritized request + accept strobes back */
     output  logic           o_NMI_VALID,
     output  wire            o_NMI_BLMSK,    //ICR1.BLMSK: NMI accepted even under SR.BL (p.133)
+    output  wire            o_NMI_EDGE,     //accepted NMI edge pulse -> DMAOR.NMIF (p.344)
     output  logic           o_INT_VALID,
     output  logic   [3:0]   o_INT_LEVEL,
     output  logic   [11:0]  o_INT_CODE,     //INTEVT code (level code or source code, tables 6.4/6.5)
@@ -140,6 +141,10 @@ always_ff @(posedge i_CLK or negedge i_RST_n) begin
 end
 
 assign  o_NMI_VALID = nmi_pend & ~mai_block;
+//the DMAC's NMIF hook: the same lockout-qualified edge the pend latch
+//trusts, exported raw - it must set NMIF even while the DMAC idles and
+//independently of the CPU's accept handshake (11.6 note 3)
+assign  o_NMI_EDGE  = nmi_edge && (nmie_lock == 5'd0);
 
 
 

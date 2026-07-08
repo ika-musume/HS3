@@ -83,7 +83,8 @@ module ioport (
 
     /* PFC FANOUT */
     output  wire            o_PH7_FN,       //PTH7 mode 00: pad belongs to TCLK (TMU, p.392)
-    output  wire    [7:0]   o_PC_FN         //PTC mode 00: pad belongs to MCS (BSC, p.323)
+    output  wire    [7:0]   o_PC_FN,        //PTC mode 00: pad belongs to MCS (BSC, p.323)
+    output  wire    [7:0]   o_PD_FN         //PTD mode 00: pad belongs to DACK/DREQ/DRAK (DMAC)
 );
 
 ///////////////////////////////////////////////////////////
@@ -230,6 +231,9 @@ assign  o_PH7_FN  = (pcr[7][15:14] == 2'b00);
 
 //PTC mode 00 hands each pad to its MCS output (table 18.1; merge at the top)
 assign  o_PC_FN   = ~md1[2] & ~md0[2];
+
+//PTD mode 00 hands each pad to the DMAC's DACK/DREQ/DRAK (table 18.1)
+assign  o_PD_FN   = ~md1[3] & ~md0[3];
 
 endmodule
 

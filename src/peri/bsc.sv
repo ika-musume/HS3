@@ -55,10 +55,16 @@
         is the compliant mid-state (CKIO-fall) sample point.
       - strobe shapes follow fig 23.16: RD/WEn mid-T1 -> mid-T2, CSn T1 ->
         mid-T2, per width-split sub-cycle, read data sampled at the mid-T2
-        fall (tRDH1 = 0 ns). Pitch beats strobe launch -> close instead of
-        silicon's continuous burst envelope: HS3 runs each beat as its own
-        request, so CSn/RD re-pulse per beat where fig 23.19 holds CSn low
-        across the burst (a page ROM re-selects fine - conservative shape).
+        fall (tRDH1 = 0 ns). A 4-beat line burst (cache fill/drain, DMAC
+        16-byte unit) is paced by the CONTROLLER, not by the per-beat bus
+        calls: beats chain back-to-back with no idle states (fig 11.11),
+        burst-ROM reads hold CSn/RD-WR/DACK low across the whole run with
+        A3-A0 stepping at the beat-launch posedges (p.304, figs 10.29/10.30,
+        23.19/23.20), and burst WRITE runs ignore the WAIT pin (p.304:
+        16-byte DMA writes, single-address dev->mem, cache write-back).
+        Write beats always run as basic cycles (figs 10.29/10.30 notes);
+        their calls post like SDRAM drain beats - only the 4th call waits
+        for the envelope so a unit fault stays visible to the master.
       - a generic-port hsk EARLY completion releases the pins at its core
         edge (off the bus grid) - extension-path behavior; the timed/raw
         path always releases at the T2-close boundary edge.
@@ -97,6 +103,7 @@ module bsc #(
     IBus_2.master           REG_TMU,    //P bus: TMU window 0xFFFFFE90-B8
     IBus_2.master           REG_RTC,    //P bus: RTC window 0xFFFFFEC0-DE
     IBus_2.master           REG_PORT,   //P bus: PFC/port window 0x04000100-137
+    IBus_2.master           REG_DMAC,   //P bus: DMAC+CMT window 0x04000020-77
 
     /* BSC PHYSICAL PINS - the real chip's external bus, table 10.1
        (pp.226-227). Ordinary memory / burst ROM and SDRAM SHARE these,
@@ -162,6 +169,14 @@ module bsc #(
     input   wire            i_MEM_RSP_VALID,
     input   wire            i_MEM_FAULT,
     output  wire            o_MEM_RSP_READY,
+
+    /* DMAC SIDEBAND CONSUMER (section 11.3.4-11.3.5): active-high DACK
+       window strobes framed on the tagged ordinary cycle's CSn assertion
+       ("DACK is output for the same duration as CSn", p.363); the DMAC
+       applies the AL pad polarity. Single-address cycles additionally
+       tri-state the write data path (fig 11.10a). SDRAM-area DACK/single
+       cycles are NOT implemented (ordinary/burst-ROM areas only). */
+    output  wire    [1:0]   o_DACK_WIN,     //[0]=DACK0 window, [1]=DACK1 window
 
     /* REFRESH TIMER INTERRUPTS (table 6.4 REF entries) */
     output  wire            o_RCMI_REQ,     //compare match  (INTEVT 0x580)
@@ -235,11 +250,19 @@ wire            fe_tmu   = (fa[31:8] == 24'hFFFF_FE) &&
 wire            fe_rtc   = (fa[31:8] == 24'hFFFF_FE) &&
                            (fa[7:4] == 4'hC || fa[7:4] == 4'hD);
 wire            fe_port  = !fe_p4 && (fe_area == 3'd1) && (fa[25:6] == 20'h0_0004);
-wire            fe_pbus  = fe_tmu || fe_rtc || fe_port;
+//DMAC window (tables 11.2 + 11.7): quads+DMAOR 0x20-61, CMT 0x70-77; the
+//0x62-6F hole stays undecoded (section 11.6 note 11) and 0x00-1F is the
+//INTC-low page (bridge-owned P2 alias) - both fall to fe_dummy here
+wire            fe_dma_pg = !fe_p4 && (fe_area == 3'd1) && (fa[25:7] == 19'h0_0000);
+wire            fe_dmac  = fe_dma_pg && ((fa[6:5] == 2'b01) || (fa[6:5] == 2'b10) ||  //0x20-5F
+                                         (fa[6:1] == 6'b11_0000) ||                   //0x60 DMAOR
+                                         (fa[6:3] == 4'b1110));                       //0x70-77 CMT
+wire            fe_pbus  = fe_tmu || fe_rtc || fe_port || fe_dmac;
 wire            fe_dummy = (fe_p4 && !fe_reg && !fe_sdmr && !fe_tmu && !fe_rtc) ||
-                           (!fe_p4 && ((fe_area == 3'd1 && !fe_port) || fe_area == 3'd7));
+                           (!fe_p4 && ((fe_area == 3'd1 && !fe_port && !fe_dmac) ||
+                                       fe_area == 3'd7));
 wire            fe_local = fe_reg || fe_dummy;
-wire            fe_gen   = !fe_p4 && !fe_sdram && !fe_dummy && !fe_port;
+wire            fe_gen   = !fe_p4 && !fe_sdram && !fe_dummy && !fe_port && !fe_dmac;
 wire            fe_eng   = fe_sdram || fe_sdmr;         //engine-owned classes
 
 wire            bus_held;           //BREQ requested or granted (defined below)
@@ -297,8 +320,12 @@ wire            pbs_ready;          //P-bus bridge idle (defined in its section)
 
 //the SHARED external bus admits one cycle at a time: ordinary accepts wait
 //for the engine (a posted SDRAM write/MRS/refresh still owns the pins) and
-//the engine waits for an open ordinary cycle (dispatch gate in E_IDLE)
-assign  I_BUS.req_ready = fe_gen  ? !(ord_busy || eng_busy || eng_go || bus_blk) :
+//the engine waits for an open ordinary cycle (dispatch gate in E_IDLE).
+//Burst continuation calls ride the open envelope: they only need the
+//previous call's response consumed (the sd_ready continuation twin)
+assign  I_BUS.req_ready = fe_gen  ? (ord_bcont ? !(ob_wait || ord_wr_ack) :
+                                     !(ord_busy || ordb_act || ordw_act ||
+                                       eng_busy || eng_go || bus_blk)) :
                           fe_eng  ? sd_ready  :
                           fe_pbus ? pbs_ready : loc_ready;
 
@@ -343,6 +370,9 @@ logic           ord_write, ord_burst;
 logic   [1:0]   ord_size;
 logic   [3:0]   ord_wstrb;
 logic   [2:0]   ord_area;
+logic           ord_dack;           //DMAC sideband: frame DACK on this cycle's CSn (p.363)
+logic           ord_dack_ch;        //  which pin: 0 = DACK0, 1 = DACK1
+logic           ord_saddr;          //  single-address cycle: a write leaves D undriven (fig 11.10a)
 
 assign  o_MEM_REQ       = ord_busy ? 1'b1            :
                           (I_BUS.req_valid & ~fe_p4 & (fe_gen | I_BUS.req_ready));
@@ -351,7 +381,13 @@ assign  o_MEM_BURST     = ord_busy ? ord_burst       : I_BUS.req_burst;
 assign  o_MEM_SIZE      = ord_busy ? ord_size        : I_BUS.req_size;
 assign  o_MEM_ADDR      = ord_busy ? ord_addr[28:0]  : fa[28:0];
 assign  o_MEM_WSTRB     = ord_busy ? ord_wstrb       : I_BUS.req_wstrb;
-assign  o_MEM_RSP_READY = I_BUS.rsp_ready & (owner_q == OWN_GEN);
+//posted/prefetched envelope beats SELF-ACCEPT their external completion
+//("accept pacing is always internal"): a pulse no call is waiting on must
+//not wedge the external controller's response handshake
+wire            ord_self_acc = (ordb_act && !(ob_wait && ordb_cnt == ordp_cnt)) ||
+                               ((ordw_act || ord_wr_ack || ow_last_wait) &&
+                                !(ow_last_wait && ordp_cnt == 2'd3));
+assign  o_MEM_RSP_READY = (I_BUS.rsp_ready & (owner_q == OWN_GEN)) | ord_self_acc;
 
 wire    [2:0]   cs_area = ord_busy ? ord_area : fe_area;
 genvar gi;
@@ -361,18 +397,36 @@ end endgenerate
 
 //response mux back to the cache: the generic owner completes on the external
 //handshake (READY or RSP_VALID, one full 32-bit D-bus transfer - the parity
-//fast path) OR the width-aware timed bus cycle (ord_data assembly)
+//fast path) OR the width-aware timed bus cycle (ord_data assembly).
+//Envelope calls instead stream: a read call serves from the prefetch
+//buffer (or passes a live hsk pulse straight through when it completes the
+//very beat the call waits on); write calls 1-3 answer as posted acks and
+//the 4th at the envelope end (ord_done) carrying any accumulated fault
 wire            gen_ext_done = i_MEM_RSP_VALID | i_MEM_READY;
 wire            pbs_rsp_v;          //P-bus bridge response (defined in its section)
 logic   [31:0]  pbs_rdata_q;
-assign  I_BUS.rsp_valid = (owner_q == OWN_GEN) ? (gen_ext_done | ord_done) :
+wire            ob_rsp_v  = ob_wait && (obuf_v[ordb_cnt] ||
+                                        (gen_ext_done && ordb_cnt == ordp_cnt));
+wire            ow_rsp_v  = ord_wr_ack ||
+                            (ow_last_wait && (ord_done ||
+                                              (gen_ext_done && ordp_cnt == 2'd3)));
+wire            gen_bctx  = ordb_act || ordw_act || ow_last_wait || ord_wr_ack;
+assign  I_BUS.rsp_valid = (owner_q == OWN_GEN) ?
+                              (gen_bctx ? (ordb_act ? ob_rsp_v : ow_rsp_v)
+                                        : (gen_ext_done | ord_done)) :
                           (owner_q == OWN_LOC) ? loc_rsp_v       :
                           (owner_q == OWN_PBS) ? pbs_rsp_v       :
                           (sd_rd_wait ? wv[sd_rd_beat] : sd_wr_ack);
-assign  I_BUS.rsp_rdata = (owner_q == OWN_GEN) ? (gen_ext_done ? i_D_I : ord_data) :
+assign  I_BUS.rsp_rdata = (owner_q == OWN_GEN) ?
+                              (ordb_act ? (obuf_v[ordb_cnt] ? obuf[ordb_cnt] : i_D_I)
+                                        : (gen_ext_done ? i_D_I : ord_data)) :
                           (owner_q == OWN_LOC) ? loc_rsp_d   :
                           (owner_q == OWN_PBS) ? pbs_rdata_q : rd_buf[sd_rd_beat];
-assign  I_BUS.rsp_fault = (owner_q == OWN_GEN) ? (gen_ext_done & i_MEM_FAULT) : 1'b0;
+assign  I_BUS.rsp_fault = (owner_q == OWN_GEN) ?
+                              (ordb_act ? (obuf_v[ordb_cnt] ? obuf_f[ordb_cnt]
+                                                            : (gen_ext_done & i_MEM_FAULT)) :
+                               gen_bctx ? (ordw_fault | (gen_ext_done & i_MEM_FAULT))
+                                        : (gen_ext_done & i_MEM_FAULT)) : 1'b0;
 
 wire            fe_rsp_done = I_BUS.rsp_valid && I_BUS.rsp_ready;
 
@@ -385,15 +439,16 @@ wire            fe_rsp_done = I_BUS.rsp_valid && I_BUS.rsp_ready;
 /*
     Bus cycles tick on i_BCEN (the 50 MHz CKIO view). A first access runs
     T1 + n Tw + T2 = 2 + WCR2-first-wait states, read data sampled at the
-    END of T2 (figs 10.6/10.10). The WAIT pin stretches the Tw region when
-    enabled for the area (nonzero wait setting; a 0-wait area ignores the
-    pin, pp.241-244) - the Tw->T2 decision uses the WAITSEL-selected sample
-    (mid-state when WCR1[15]=1, fig 10.11). Burst-ROM continuation beats
-    (line fill beats 1-3 of a BCR1-enabled area, p.304) instead total the
-    burst-pitch states exactly (their last state is the data state), and
-    sample WAIT for every wait code (p.242); a write-back burst ignores the
-    pin entirely (p.274). Read data samples i_MEM_RDATA live at the
-    completing bus edge, like pins of a real asynchronous bus.
+    mid-T2 fall (figs 10.6/10.10, 23.16). The WAIT pin stretches the Tw
+    region when enabled for the area (nonzero wait setting; a 0-wait area
+    ignores the pin, pp.241-244) - the Tw->T2 decision uses the WAITSEL-
+    selected sample (mid-state when WCR1[15]=1, fig 10.11). Every beat is
+    T2-shaped (strobe mid-first-state -> mid-data-state, figs 23.19/23.20):
+    burst-ROM continuation beats (beats 1-3 of an envelope on a BCR1 area,
+    p.304) just total the burst-pitch states (ord_cnt = pitch - 1) and
+    sample WAIT for every wait code (p.242); every burst WRITE run ignores
+    the pin entirely (p.304/p.274). Read data samples i_D_I live at the
+    sampling fall, like pins of a real asynchronous bus.
 */
 
 //WCR2 3-bit encodings: first-access waits and burst pitch (states-1), p.241
@@ -434,13 +489,43 @@ always_comb begin
     ord_pin_en = (ord_w3 != 3'd0);
 end
 
-//a burst-ROM continuation beat rides the open line: pitch timing (p.304).
-//Fill bursts WRAP from the missed word (p.110), so the head is not word 0:
-//an ordinary-bus read line fill is tracked in flight (head opens, the 4th
-//beat's response - or a fault, the cache abandons the fill - closes)
-logic           ordb_act;           //ordinary read line fill in flight
-logic   [1:0]   ordb_cnt;           //its consumed-beat count
-wire            ord_cont = I_BUS.req_burst && ord_bst_en && ordb_act;
+/*
+    ORDINARY BURST ENVELOPE (figs 10.29/10.30, 23.19/23.20, 11.11): the HEAD
+    call of a 4-beat line burst latches the pins; the controller then paces
+    the remaining beats ITSELF, back-to-back on the grid - a one-outstanding
+    call/return can never chain beats without idle states, so continuation
+    calls only stream data. Reads PREFETCH into obuf (rd_buf twin) and the
+    calls drain it; write calls queue into obuf ahead of the pins and post
+    their acks (wr_buf twin), the 4th call completing with the envelope so
+    a unit fault stays visible. Beat timing: head = first-access; beats 2-4
+    = burst pitch on a BCR1 burst-ROM area (WAIT always sampled, p.304),
+    first-access again on plain areas (fig 11.11). Burst-ROM READS hold
+    CSn/DACK across the whole run ("CS0 is not negated, only the address
+    is changed", p.304); writes re-frame per beat (basic cycles, figs
+    10.29/10.30 notes) and ignore the WAIT pin (p.304). Fill bursts WRAP
+    from the missed word (p.110): obuf is indexed by SERVICE ORDER (= call
+    order); write bursts are position-ordered 0..3 (drains, DMAC units).
+    A fault (hsk injection) aborts the run: the master abandons the rest.
+*/
+logic           ordb_act;           //read burst in flight (head opens, 4th rsp/fault closes)
+logic   [1:0]   ordb_cnt;           //its consumed-call count = the waiting call's obuf slot
+logic           ordw_act;           //write burst call tracker (head opens, 4th accept closes)
+logic           ob_wait;            //a burst-read call outstanding (index rides ordb_cnt)
+logic           ow_last_wait;       //the 4th write call outstanding (rsp at the envelope end)
+logic           ord_wr_ack;         //posted burst-write ack pending (beats 0-2)
+logic           ordw_fault;         //accumulated fault of posted write beats
+logic   [31:0]  obuf    [0:3];      //beat buffer: read prefetch line / write play-out
+logic   [3:0]   obuf_v;             //slot valid (read landed / write queued)
+logic   [3:0]   obuf_f;             //read slot faulted (hsk injection, per beat)
+logic   [3:0]   ostrb   [0:3];      //write beat strobes
+logic   [1:0]   ordp_cnt;           //pin-side beat index within the envelope
+logic           ordp_env;           //pin-side envelope open (beats remain)
+logic           ordp_stall;         //write beat awaits its datum (masters stream fast
+                                    //enough to never trigger it; safety valve)
+logic           ordp_hold_cs;       //burst-ROM read: CSn spans the run (p.304)
+
+//continuation calls of an open envelope (bookkeeping only, no pin touch)
+wire            ord_bcont = I_BUS.req_burst && (I_BUS.req_write ? ordw_act : ordb_act);
 
 ///////////////////////////////////////////////////////////
 //////  WCR1 Inter-Access Idles (p.240)
@@ -495,9 +580,10 @@ wire            ord_idle_ok_q  = idle_ok(ord_area, ord_write);        //at a hel
 //pin data-cycle end events (BCEN edges): ord close of the LAST sub-cycle,
 //engine last CL landing, engine last write beat. Refresh/MRS move no data.
 //A handshake-completed (generic port) access never drove the D pins: skipped.
+//every datum now closes through its T2 state; an envelope ends at the
+//LAST beat's close only (mid-run chains insert no idles - same area/dir)
 wire            ord_end_tk = ord_busy && ord_run && !ord_done && ord_subs == 2'd0 &&
-                             (ord_t2 || (!ord_ft2 && ord_cnt == 4'd0 &&
-                                         (!ord_pin_q || wait_ok_now)));
+                             ord_t2 && !(ordp_env && ordp_cnt != 2'd3);
 wire            eng_rd_end;         //E_RD_DRAIN exit: the last CL landing edge
 
 always_ff @(posedge i_CLK or negedge i_POR_n) begin
@@ -559,16 +645,14 @@ logic           ord_w16;            //this access runs on a 16-bit port (D15-D0)
 logic           ord_w8;             //... or an 8-bit port (D7-D0, WE0 only)
 logic   [1:0]   ord_ba;             //sub-cycle byte address (walks the A1:A0 pins)
 logic   [1:0]   ord_subs;           //sub-cycles still owed after the current one
-logic           ord_t2;             //in the final T2 state (data at its end, fig 10.6)
-logic           ord_ft2;            //current sub-cycle is first-access timed (has a T2);
-logic           ord_ft2_2;          //  burst-pitch beats total the table states directly
+logic           ord_t2;             //in this sub's data state (sampled at its mid fall)
 logic           ord_run;            //pins asserted: bus cycle is ON the bus-clock grid
-logic           ord_stb;            //RD/WEn data strobe: mid-T1 -> mid-T2 on first-access
-                                    //timing (tRSD/tWED at the CKIO falls, fig 23.16);
-                                    //pitch beats strobe from the launch instead (silicon
-                                    //holds RD low through a mid-burst sample, fig 23.19)
+logic           ord_stb;            //RD/WEn data strobe: mid-first-state -> mid-data-
+                                    //state (tRSD/tWED at the CKIO falls, figs 23.16/
+                                    //23.19) - re-pulses per beat, low through the waits
 logic           ord_cs;             //CSn view: asserts with the launch, negates mid-T2
-                                    //(tCSD2) - a split pair shows the half-CKIO gap
+                                    //(tCSD2) - a split pair shows the half-CKIO gap;
+                                    //a burst-ROM read run holds it low across beats
 
 //width-split lane views (tables 10.7-10.12): the register lane of a byte
 //address is endian-mirrored, and the core already laid the datum there
@@ -598,30 +682,34 @@ always_ff @(posedge i_CLK or negedge i_RST_n) begin
         ord_ba   <= 2'd0;
         ord_subs <= 2'd0;
         ord_t2   <= 1'b0;
-        ord_ft2  <= 1'b0;
-        ord_ft2_2<= 1'b0;
         ord_run  <= 1'b0;
         ord_stb  <= 1'b0;
         ord_cs   <= 1'b0;
+        ord_dack <= 1'b0;
+        ord_dack_ch <= 1'b0;
+        ord_saddr <= 1'b0;
+        ordp_cnt <= 2'd0;
+        ordp_env <= 1'b0;
+        ordp_stall <= 1'b0;
+        ordp_hold_cs <= 1'b0;
     end
     else begin
-        if(i_CEN && fe_acc && fe_gen) begin             //request latched at the accept edge;
-            ord_busy  <= 1'b1;                          //pins assert on the bus-clock grid
-            ord_done  <= 1'b0;                          //(an off-grid accept waits <=1 core
-            ord_run   <= i_BCEN && ord_idle_ok_nx;      //cycle; WCR1 idles hold the launch)
-            ord_cnt   <= ord_cont ? w3_pitch(ord_w3) : ord_first;
-            ord_cnt2  <= ord_bst_en ? w3_pitch(ord_w3) : ord_first;
-            //WAIT pin: enabled per WCR2 for first-access timing, ALWAYS for
-            //burst-pitch beats (p.242 tables), never on a write-back burst (p.274)
-            ord_pin_q <= (I_BUS.req_burst && I_BUS.req_write) ? 1'b0 :
-                         ord_cont ? 1'b1 : ord_pin_en;
+        if(i_CEN && fe_acc && fe_gen && !ord_bcont) begin   //HEAD/single latched at the
+            ord_busy  <= 1'b1;                          //accept edge; pins assert on the
+            ord_done  <= 1'b0;                          //bus-clock grid (an off-grid accept
+            ord_run   <= i_BCEN && ord_idle_ok_nx;      //waits <=1 core cycle; WCR1 idles
+            ord_cnt   <= ord_first;                     //hold the launch). Head beat =
+            //continuation beats/subs: burst pitch on a BCR1 burst-ROM area  //first-access
+            //(total states = pitch, so count = pitch - 1), first-access again on plain
+            ord_cnt2  <= ord_bst_en ? (w3_pitch(ord_w3) - 4'd1) : ord_first;
+            //WAIT pin: enabled per WCR2 for the first access, ALWAYS for pitch
+            //beats (p.304/p.242) - but never inside a burst WRITE run (p.304)
+            ord_pin_q <= (I_BUS.req_burst && I_BUS.req_write) ? 1'b0 : ord_pin_en;
             ord_pin2  <= (I_BUS.req_burst && I_BUS.req_write) ? 1'b0 :
                          ord_bst_en ? 1'b1 : ord_pin_en;
             ord_bs_n  <= 1'b0;
             ord_t2    <= 1'b0;
-            ord_ft2   <= !ord_cont;                     //first-access cycles get a T2;
-            ord_ft2_2 <= !ord_bst_en;                   //pitch beats total the table states
-            ord_stb   <= ord_cont;                      //pitch strobes from the launch;
+            ord_stb   <= 1'b0;                          //every beat strobes at its mid-launch
             ord_cs    <= 1'b1;                          //  (pins masked until ord_run)
             ord_w16   <= ord_w16_c;
             ord_w8    <= ord_w8_c;
@@ -639,72 +727,128 @@ always_ff @(posedge i_CLK or negedge i_RST_n) begin
             ord_wstrb <= I_BUS.req_wstrb;
             ord_wdata <= I_BUS.req_wdata;
             ord_area  <= fe_area;
+            ord_dack  <= I_BUS.req_dack;    //DMAC sideband rides the whole run (p.363)
+            ord_dack_ch <= I_BUS.req_dack_ch;
+            ord_saddr <= I_BUS.req_saddr;
+            //line-burst envelope: the controller paces beats 2-4 itself
+            ordp_env  <= I_BUS.req_burst;
+            ordp_cnt  <= 2'd0;
+            ordp_stall<= 1'b0;
+            ordp_hold_cs <= I_BUS.req_burst && !I_BUS.req_write && ord_bst_en;
         end
-        else if(i_CEN && fe_rsp_done && owner_q == OWN_GEN) begin
-            ord_busy <= 1'b0;                           //either completion path closes it
-            ord_done <= 1'b0;
-            ord_run  <= 1'b0;
-            ord_stb  <= 1'b0;                           //hsk fast path may end mid-cycle
+        else if(i_CEN && fe_rsp_done && owner_q == OWN_GEN &&
+                (!gen_bctx || I_BUS.rsp_fault ||
+                 (ob_wait && ordb_cnt == 2'd3) ||
+                 (ow_last_wait && !ord_wr_ack))) begin
+            ord_busy <= 1'b0;               //completion closes it: a plain access on
+            ord_done <= 1'b0;               //either path, an envelope's 4th call, or
+            ord_run  <= 1'b0;               //a FAULT (the master abandons the rest)
+            ord_stb  <= 1'b0;               //hsk fast path may end mid-cycle
             ord_cs   <= 1'b0;
+            ordp_env <= 1'b0;
+            ordp_stall <= 1'b0;
+        end
+        //hsk fast path completes the CURRENT envelope beat early (off-grid,
+        //documented extension behavior - no physical device is on the pins)
+        else if(i_CEN && gen_ext_done && ordp_env && ord_busy && !ordp_stall) begin
+            if(i_MEM_FAULT || ordp_cnt == 2'd3) begin   //a fault abandons the run
+                ord_done <= 1'b1;
+                ordp_env <= 1'b0;
+                ord_t2   <= 1'b0;
+                ord_stb  <= 1'b0;
+                ord_cs   <= 1'b0;
+            end
+            else if(!ord_write || obuf_v[ordp_cnt + 2'd1]) begin
+                ordp_cnt <= ordp_cnt + 2'd1;
+                ord_addr[3:2] <= ord_addr[3:2] + 2'd1;  //wraps round the line (p.110)
+                ord_ba   <= 2'b00;                      //line beats are longwords
+                ord_subs <= ord_w8 ? 2'd3 : ord_w16 ? 2'd1 : 2'd0;
+                ord_cnt  <= ord_cnt2;
+                ord_pin_q<= ord_pin2;
+                ord_bs_n <= 1'b0;
+                ord_t2   <= 1'b0;
+                ord_stb  <= 1'b0;
+                ord_cs   <= 1'b1;
+                if(ord_write) begin
+                    ord_wdata <= obuf [ordp_cnt + 2'd1];
+                    ord_wstrb <= ostrb[ordp_cnt + 2'd1];
+                end
+            end
+            else ordp_stall <= 1'b1;        //datum not queued yet (see below)
         end
         else if(i_BCEN && ord_busy && !ord_run) begin
             if(ord_idle_ok_q) ord_run <= 1'b1;          //grid-align + WCR1 idle gap
         end
         else if(i_BCEN && ord_busy && !ord_done) begin
             ord_bs_n <= 1'b1;                           //BS covers each sub's first cycle
-            if(ord_t2) begin                            //T2 closes (data sampled at mid-T2)
+            if(ordp_stall) begin
+                //write envelope paused between beats: the next datum was not
+                //queued in time. Masters stream calls faster than the pins
+                //consume beats, so this is a safety valve only; the paused
+                //shape is legal (write beats are stand-alone basic cycles)
+                if(obuf_v[ordp_cnt + 2'd1]) begin
+                    ordp_stall <= 1'b0;
+                    ordp_cnt   <= ordp_cnt + 2'd1;
+                    ord_addr[3:2] <= ord_addr[3:2] + 2'd1;
+                    ord_ba     <= 2'b00;
+                    ord_subs   <= ord_w8 ? 2'd3 : ord_w16 ? 2'd1 : 2'd0;
+                    ord_cnt    <= ord_cnt2;
+                    ord_pin_q  <= ord_pin2;
+                    ord_bs_n   <= 1'b0;
+                    ord_cs     <= 1'b1;
+                    ord_wdata  <= obuf [ordp_cnt + 2'd1];
+                    ord_wstrb  <= ostrb[ordp_cnt + 2'd1];
+                end
+            end
+            else if(ord_t2) begin                       //data state closes (sampled at its mid)
                 ord_t2 <= 1'b0;
                 if(ord_subs != 2'd0) begin              //advance to the next byte address
                     ord_subs   <= ord_subs - 2'd1;
                     ord_ba     <= ord_ba + (ord_w8 ? 2'd1 : 2'd2);
                     ord_cnt    <= ord_cnt2;             //a fresh bus cycle, fresh waits
-                    ord_ft2    <= ord_ft2_2;
                     ord_pin_q  <= ord_pin2;
                     ord_bs_n   <= 1'b0;
-                    ord_stb    <= !ord_ft2_2;           //a pitch-timed sub strobes now
-                    ord_cs     <= 1'b1;                 //CSn re-asserts: fresh bus cycle
-                end
-                else ord_done <= 1'b1;
-            end
-            else if(ord_cnt != 4'd0)             ord_cnt  <= ord_cnt - 4'd1;
-            else if(!ord_pin_q || wait_ok_now) begin    //WAIT stretches enabled areas
-                if(ord_ft2) ord_t2 <= 1'b1;             //Tw -> T2 transition (fig 10.10/10.11)
-                else begin                              //pitch beat: last state IS the data state
-                    if(ord_w8)       ord_data[{ord_lane8, 3'd0} +: 8] <= i_D_I[7:0];
-                    else if(ord_w16) begin
-                        if(ord_hi16) ord_data[31:16] <= i_D_I[15:0];
-                        else         ord_data[15:0]  <= i_D_I[15:0];
-                    end
-                    else ord_data <= i_D_I;
-                    if(ord_subs != 2'd0) begin
-                        ord_subs   <= ord_subs - 2'd1;
-                        ord_ba     <= ord_ba + (ord_w8 ? 2'd1 : 2'd2);
+                    ord_cs     <= 1'b1;                 //CSn re-asserts (held on a burst-
+                end                                     //  ROM read run: mid-T2 kept it)
+                else if(ordp_env && ordp_cnt != 2'd3) begin
+                    //beat boundary: chain the next beat back-to-back (fig 11.11 /
+                    //figs 10.29-10.30) - A3:A2 step at this launch posedge
+                    if(!ord_write || obuf_v[ordp_cnt + 2'd1]) begin
+                        ordp_cnt   <= ordp_cnt + 2'd1;
+                        ord_addr[3:2] <= ord_addr[3:2] + 2'd1;  //wraps round the line
+                        ord_ba     <= 2'b00;
+                        ord_subs   <= ord_w8 ? 2'd3 : ord_w16 ? 2'd1 : 2'd0;
                         ord_cnt    <= ord_cnt2;
-                        ord_ft2    <= ord_ft2_2;
                         ord_pin_q  <= ord_pin2;
                         ord_bs_n   <= 1'b0;
-                        ord_stb    <= !ord_ft2_2;       //(pitch stays strobed; ft2 waits
-                        ord_cs     <= 1'b1;             //  for its own mid-T1)
+                        ord_cs     <= 1'b1;
+                        if(ord_write) begin
+                            ord_wdata <= obuf [ordp_cnt + 2'd1];
+                            ord_wstrb <= ostrb[ordp_cnt + 2'd1];
+                        end
                     end
-                    else begin
-                        ord_done <= 1'b1;
-                        ord_stb  <= 1'b0;               //envelope drops at this edge too
-                        ord_cs   <= 1'b0;
-                    end
+                    else ordp_stall <= 1'b1;
+                end
+                else begin
+                    ord_done <= 1'b1;
+                    ordp_env <= 1'b0;
                 end
             end
+            else if(ord_cnt != 4'd0)           ord_cnt <= ord_cnt - 4'd1;
+            else if(!ord_pin_q || wait_ok_now) ord_t2  <= 1'b1;  //Tw -> data state
         end
-        //mid-state edge (the CKIO fall): strobes assert at mid-T1 (tRSD/tWED)
-        //and negate at mid-T2 together with CSn (tCSD2); the read sample is
-        //bound to the SAME fall - tRDH1 = 0 ns (p.671) lets the device release
-        //data the moment RD rises, so sampling any later is unbuildable.
-        //Pitch beats keep boundary sampling: their strobe spans the beat and
-        //silicon holds RD low through a mid-burst sample (fig 23.19/23.20)
+        //mid-state edge (the CKIO fall): strobes assert at mid-launch (tRSD/
+        //tWED) and negate at the data-state mid together with CSn (tCSD2);
+        //the read sample is bound to the SAME fall - tRDH1 = 0 ns (p.671)
+        //lets the device release data the moment RD rises, so sampling any
+        //later is unbuildable. Inside a burst-ROM READ run only the strobe
+        //re-pulses; CSn stays low until the run's last datum (p.304, fig 23.19)
         else if(i_CEN && !i_BCEN && ord_busy && ord_run && !ord_done) begin
-            if(!ord_bs_n && ord_ft2) ord_stb <= 1'b1;   //mid-T1 (BS marks the first state)
-            if(ord_t2) begin                            //mid-T2: sample, then negate
+            if(!ord_bs_n) ord_stb <= 1'b1;              //mid-launch (BS marks that state)
+            if(ord_t2) begin                            //data mid: sample, then negate
                 ord_stb <= 1'b0;
-                ord_cs  <= 1'b0;
+                if(!ordp_hold_cs || (ordp_cnt == 2'd3 && ord_subs == 2'd0))
+                    ord_cs <= 1'b0;
                 if(ord_w8)       ord_data[{ord_lane8, 3'd0} +: 8] <= i_D_I[7:0];  //8-bit: D7-D0
                 else if(ord_w16) begin                  //16-bit port: D15-D0 per half
                     if(ord_hi16) ord_data[31:16] <= i_D_I[15:0];
@@ -714,6 +858,45 @@ always_ff @(posedge i_CLK or negedge i_RST_n) begin
             end
         end
     end
+end
+
+//beat buffer (single writer): write calls queue ahead of the pins (their
+//own slot - bursts are position-ordered 0..3); a read beat lands at its
+//close (timed path, ord_data holds the assembled datum) or straight off
+//the live pulse (hsk path completes beats as full 32-bit transfers)
+always_ff @(posedge i_CLK) begin if(i_CEN) begin
+    if(fe_acc && fe_gen && I_BUS.req_burst && I_BUS.req_write) begin
+        obuf [fa[3:2]] <= I_BUS.req_wdata;
+        ostrb[fa[3:2]] <= I_BUS.req_wstrb;
+    end
+    else if(gen_ext_done && ordp_env && ord_busy && !ordp_stall && !ord_write)
+        obuf[ordp_cnt] <= i_D_I;
+    else if(i_BCEN && ord_busy && !ord_done && !ordp_stall && ord_t2 &&
+            ord_subs == 2'd0 && ordp_env && !ord_write)
+        obuf[ordp_cnt] <= ord_data;
+end end
+
+always_ff @(posedge i_CLK or negedge i_RST_n) begin
+    if(!i_RST_n) begin
+        obuf_v <= 4'd0;
+        obuf_f <= 4'd0;
+    end
+    else begin if(i_CEN) begin
+        if(fe_acc && fe_gen && I_BUS.req_burst) begin
+            if(!ord_bcont) begin                //head resets the line's marks
+                obuf_v <= {3'b000, I_BUS.req_write};
+                obuf_f <= 4'd0;
+            end
+            else if(I_BUS.req_write) obuf_v[fa[3:2]] <= 1'b1;
+        end
+        else if(gen_ext_done && ordp_env && ord_busy && !ordp_stall && !ord_write) begin
+            obuf_v[ordp_cnt] <= 1'b1;
+            obuf_f[ordp_cnt] <= i_MEM_FAULT;    //buffered fault: reported on ITS call
+        end
+        else if(i_BCEN && ord_busy && !ord_done && !ordp_stall && ord_t2 &&
+                ord_subs == 2'd0 && ordp_env && !ord_write)
+            obuf_v[ordp_cnt] <= 1'b1;
+    end end
 end
 
 
@@ -754,8 +937,18 @@ always_ff @(posedge i_CLK or negedge i_RST_n) begin
         b_wr_act   <= 1'b0;
         ordb_act   <= 1'b0;
         ordb_cnt   <= 2'd0;
+        ordw_act   <= 1'b0;
+        ob_wait    <= 1'b0;
+        ow_last_wait <= 1'b0;
+        ord_wr_ack <= 1'b0;
+        ordw_fault <= 1'b0;
     end
     else begin if(i_CEN) begin
+        //posted write beats: accumulate an hsk-injected fault for the 4th
+        //call's response (the fire-and-forget beats already acknowledged)
+        if(gen_ext_done && i_MEM_FAULT && ordp_env && ord_busy && ord_write)
+            ordw_fault <= 1'b1;
+
         if(fe_acc) begin
             owner_q <= fe_gen ? OWN_GEN : fe_local ? OWN_LOC : fe_pbus ? OWN_PBS : OWN_SDR;
 
@@ -764,10 +957,23 @@ always_ff @(posedge i_CLK or negedge i_RST_n) begin
                 loc_rsp_d <= fe_reg ? {2{reg_rd_w}} : 32'd0;
             end
 
-            //ordinary-bus read line fill: the head beat opens the in-flight track
+            //ordinary-bus read line burst: the head call opens the in-flight track
             if(fe_gen && I_BUS.req_burst && !I_BUS.req_write && !ordb_act) begin
                 ordb_act <= 1'b1;
                 ordb_cnt <= 2'd0;
+            end
+
+            //ordinary burst call bookkeeping (sd_rd_wait/sd_wr_ack twins)
+            if(fe_gen && I_BUS.req_burst) begin
+                if(!I_BUS.req_write) ob_wait <= 1'b1;   //call index rides ordb_cnt
+                else if(fa[3:2] == 2'b11) begin         //4th call: rsp at the envelope
+                    ordw_act     <= 1'b0;               //end so a unit fault is seen
+                    ow_last_wait <= 1'b1;
+                end
+                else begin                              //beats 0-2 post their acks
+                    ordw_act   <= 1'b1;
+                    ord_wr_ack <= 1'b1;
+                end
             end
 
             if(fe_eng) begin
@@ -789,18 +995,27 @@ always_ff @(posedge i_CLK or negedge i_RST_n) begin
         if(fe_rsp_done) begin
             loc_rsp_v <= 1'b0;
             sd_wr_ack <= 1'b0;
+            ob_wait    <= 1'b0;
+            ord_wr_ack <= 1'b0;
+            //the 4th write call's response retires the write-burst context;
+            //a posted ack pending outranks it (one response per cycle)
+            if(ow_last_wait && !ord_wr_ack) begin
+                ow_last_wait <= 1'b0;
+                ordw_fault   <= 1'b0;
+            end
             if(sd_rd_wait) begin
                 sd_rd_wait <= 1'b0;
                 //the 4th consumed beat closes the read burst (count, not position)
                 b_rd_cnt <= b_rd_cnt + 2'd1;
                 if(b_rd_act && b_rd_cnt == 2'd3) b_rd_act <= 1'b0;
             end
-            //ordinary fill: 4th beat - or a fault (the cache abandons the fill,
-            //no further beats will come) - closes the in-flight track
+            //ordinary burst: 4th call - or a fault (the master abandons the
+            //run, no further calls will come) - closes the in-flight track
             if(owner_q == OWN_GEN && ordb_act) begin
                 if(I_BUS.rsp_fault || ordb_cnt == 2'd3) ordb_act <= 1'b0;
                 else ordb_cnt <= ordb_cnt + 2'd1;
             end
+            if(owner_q == OWN_GEN && I_BUS.rsp_fault) ordw_act <= 1'b0;
         end
     end end
 end
@@ -875,7 +1090,7 @@ end
 */
 
 localparam logic [1:0] P_IDLE = 2'd0, P_ACC = 2'd1, P_RSP = 2'd2;
-localparam logic [1:0] PW_TMU = 2'd0, PW_RTC = 2'd1, PW_PRT = 2'd2;
+localparam logic [1:0] PW_TMU = 2'd0, PW_RTC = 2'd1, PW_PRT = 2'd2, PW_DMA = 2'd3;
 
 logic   [1:0]   pbs_state;
 logic   [1:0]   pbs_win_q;          //captured window select (PW_*)
@@ -905,7 +1120,8 @@ end
 //selected slave read, replicated onto the lanes so the pipe's load aligner
 //picks the correct byte/halfword from any naturally aligned offset
 wire    [31:0]  pbs_sel_rdata = (pbs_win_q == PW_TMU) ? REG_TMU.rdata :
-                                (pbs_win_q == PW_RTC) ? REG_RTC.rdata : REG_PORT.rdata;
+                                (pbs_win_q == PW_RTC) ? REG_RTC.rdata :
+                                (pbs_win_q == PW_DMA) ? REG_DMAC.rdata : REG_PORT.rdata;
 logic   [31:0]  pbs_rdata_rep;
 always_comb begin
     unique case(pbs_size_q)
@@ -929,7 +1145,8 @@ always_ff @(posedge i_CLK or negedge i_RST_n) begin
         unique case(pbs_state)
             P_IDLE: begin
                 if(fe_acc && fe_pbus) begin                     //accept edge: latch everything
-                    pbs_win_q   <= fe_tmu ? PW_TMU : fe_rtc ? PW_RTC : PW_PRT;
+                    pbs_win_q   <= fe_tmu  ? PW_TMU : fe_rtc ? PW_RTC :
+                                   fe_dmac ? PW_DMA : PW_PRT;
                     pbs_addr_q  <= fa[7:0];
                     pbs_we_q    <= I_BUS.req_write;
                     pbs_size_q  <= I_BUS.req_size;
@@ -953,6 +1170,7 @@ end
 assign  REG_TMU.stb    = (pbs_state == P_ACC) && (pbs_win_q == PW_TMU);
 assign  REG_RTC.stb    = (pbs_state == P_ACC) && (pbs_win_q == PW_RTC);
 assign  REG_PORT.stb   = (pbs_state == P_ACC) && (pbs_win_q == PW_PRT);
+assign  REG_DMAC.stb   = (pbs_state == P_ACC) && (pbs_win_q == PW_DMA);
 
 assign  REG_TMU.we     = pbs_we_q;
 assign  REG_TMU.size   = pbs_size_q;
@@ -966,6 +1184,10 @@ assign  REG_PORT.we    = pbs_we_q;
 assign  REG_PORT.size  = pbs_size_q;
 assign  REG_PORT.addr  = pbs_addr_q;
 assign  REG_PORT.wdata = pbs_wdata_q;
+assign  REG_DMAC.we    = pbs_we_q;
+assign  REG_DMAC.size  = pbs_size_q;
+assign  REG_DMAC.addr  = pbs_addr_q;
+assign  REG_DMAC.wdata = pbs_wdata_q;
 
 
 
@@ -1925,7 +2147,8 @@ assign  o_D_O     = !ord_pins ? sd_dq_o :
                     ord_w8    ? {4{ord_wdata[{ord_lane8, 3'd0} +: 8]}} :
                     ord_w16   ? {2{ord_hi16 ? ord_wdata[31:16] : ord_wdata[15:0]}} :
                     ord_wdata;
-assign  o_D_OE    = ord_pins ? ord_write      : sd_dq_oe;   //write data T1..T2 end (tWDH1)
+//single-address write: WE runs but the EXTERNAL device drives D31-0 (fig 11.10a)
+assign  o_D_OE    = ord_pins ? (ord_write && !ord_saddr) : sd_dq_oe;    //write data T1..T2 end (tWDH1)
 assign  o_BS_n    = ord_pins ? ord_bs_n       : sd_bs_n;
 assign  o_CS0_n   = ~(ord_pins && ord_cs && ord_area == 3'd0);
 assign  o_CS2_n   = ord_pins ? !(ord_cs && ord_area == 3'd2) : sd_cs2_n;
@@ -1945,6 +2168,12 @@ assign  o_WE_n    = !ord_pins ? sd_dqm :
                                                  : ~ord_wstrb[1:0]} :       //WE1/WE0 lanes
                     ~ord_wstrb;
 assign  o_RD_n    = ~(ord_pins && !ord_write && ord_stb);   //ordinary read strobe
+
+//DACK windows: exactly the tagged cycle's CSn assertion window ("DACK is
+//output for the same duration as CSn", p.363); a width-split access
+//re-frames per sub-cycle just as CSn does. Polarity applied in the DMAC.
+assign  o_DACK_WIN[0] = ord_pins && ord_cs && ord_dack && !ord_dack_ch;
+assign  o_DACK_WIN[1] = ord_pins && ord_cs && ord_dack &&  ord_dack_ch;
 assign  o_CKE     = sd_cke;
 
 endmodule

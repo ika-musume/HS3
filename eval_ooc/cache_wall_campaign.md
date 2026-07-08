@@ -216,3 +216,76 @@ Levers that COULD move the plateau (all bigger / need a decision):
 - Resources: 8,363/8,340/8,346 ALMs (20%), registers 6,516/6,520/6,509
   (baseline 6,531/6,608/6,567 — fitter duplication noise swallows the ~60
   new flops), block memory bits identical (158,208).
+
+### Re-baseline after DMAC phases 1-2 (2026-07-08, seeds 3/4/5) — NEUTRAL
+- RTL delta since the BSC Group C re-baseline: DMAC register block (`dmac.sv` +
+  `dmac_channel.sv` x4: SAR/DAR/DMATCR/CHCR quads, DMAOR, full CMT counter) on a
+  new BSC P-bus window 0x04000020-77, DEI->INTC wiring, the IBus_1 DMAC sideband
+  (req_dack/_ch/_al, req_saddr; cache ties off), and `ibus_arb` inserted between
+  the cache master and the splitter (owner flop parked on CPU, single 2:1 mux
+  with registered select, DMAC leg tied off). Suites 67/67 + 103/103, laws
+  bit-exact (the arb's zero-cost idle path held).
+- Worst slack (i_CLK): seed3 −2.92→−3.03 (−0.11), seed4 −3.22→−3.20 (+0.02),
+  seed5 −2.78→−2.70 (+0.08). Mean −2.97→−2.98; every delta deep inside the
+  ±0.4 ns fit-noise band. Restricted Fmax 76.78 / 75.76 / 78.76 MHz.
+- Cones: **zero arb/dmac logic in any seed's top-20** — the plateau is the same
+  int_pipe forwarding/pair + AGU set (u_agu_d, fwd_lane_b_agu, pair_pc/
+  pair_capture, gpr_2r2w, nx_read0). The 2:1 arb mux on the reqn/addr class is
+  timing-invisible at this fit; the frozen cache-wall verdict stands.
+- Resources: registers 7,018/6,985/7,002 (baseline 6,516/6,520/6,509 — the
+  ~+490 is the DMAC regfile + CMT + arb owner/track flops), memory bits
+  identical (158,208).
+- Note: these runs flagged Quartus 10240 latch-inference on the parameter-absent
+  CHCR bits (reset-only assignment when the feature param is false) —
+  functionally benign (bits sweep to GND) and fixed in-tree right after by
+  gating the assigned VALUE instead of the assignment; next OOC should log clean.
+- Config note: the three new sources were added to eval_ooc/HS3/config*.json.
+
+### Re-baseline after DMAC phases 3-4 (2026-07-09, seeds 3/4/5) — NEUTRAL
+- RTL delta since the phases-1-2 re-baseline: the full DMAC transfer engine
+  (auto/CMT/external-DREQ requests, dual-direct + single-address units, fixed
+  priority, cycle-steal/burst, channel iteration datapaths), the arb rsp-done
+  owner-flip fix, BSC DACK windows + single-address D_OE gate, Port D pad
+  merges (o_PD_FN), DREQ samplers on the CKIO-fall cen. Suites 75/75 +
+  103/103, laws bit-exact throughout.
+- Worst slack (i_CLK): seed3 −3.03→−2.92 (dead on the frozen baseline),
+  seed4 −3.20→−2.23 (best HS3 fit recorded), seed5 −2.70→−3.79. Mean
+  −2.98 vs the −2.97 baseline: NEUTRAL. Per-seed spread widened to ±0.8 —
+  placement noise on the known plateau (seed5's worst path is the catalogued
+  int_pipe fwd_lane/address_error/early_d_req_valid cone; identical-RTL probe
+  runs have swung −2.61..−3.20 before). Restricted Fmax 79.87/81.74/72.54.
+- Cones: **zero dmac/arb logic in any seed's top-20** across all three seeds.
+  The engine's request/address muxes (registered grant selects, flat req
+  cones through the arb 2:1) are timing-invisible as designed.
+- Resources: registers 7,202/7,228/7,257 (phases-1-2: 7,018/6,985/7,002 —
+  the ~+230 is the sequencer, DREQ/DRAK samplers, and single-address paths),
+  memory bits identical (158,208).
+
+### Final re-baseline after DMAC phases 5-6 (2026-07-09, seeds 3/4/5) — NEUTRAL
+- RTL delta since phases 3-4: 16-byte 4-beat units (4x32 gather buffer,
+  registered +4 address stepping), ch3 indirect pointer-fetch states, ch2
+  source reload (SAR shadow + 4-counter in the channel), round-robin
+  priority (2-bit rr_head rotation), NMIF from the INTC's qualified NMI
+  edge (new intc o_NMI_EDGE port), AE address errors (grant-time alignment
+  masks + in-flight rsp_fault abandonment). Suites 83/83 + 103/103, all
+  laws bit-exact throughout.
+- Worst slack (i_CLK): seed3 −2.92 (dead on the frozen baseline again),
+  seed4 −3.98, seed5 −2.30. Mean −3.07 vs the −2.97/−2.98 historical
+  means: NEUTRAL within the documented plateau spread (identical-RTL
+  probes have swung −2.2..−3.9). Restricted Fmax 79.58/71.55/81.27 —
+  seed5's 81.27 is the best HS3 fit recorded.
+- Headlines are all the catalogued CPU advance-loop family: seed3
+  bram_addr→M10K address capture, seed4 fwd_lane_b_agu→AGU→M10K address
+  capture, seed5 fwd_dep_a_agu→AGU→exc-MMIO o_TEA decode.
+- Cones: **zero dmac/arb logic in any seed's top-20**. The specials
+  (16-byte beats, pointer states, rotation mux) and abort checks
+  (alignment masks off registered CHCR/SAR/DAR, flag set-priority) all
+  landed off the walls; the alignment cone feeds only the grant enable,
+  which was already a multi-level IDLE-only qualifier.
+- Resources: registers 7,430/7,343/7,402 (phases 3-4: 7,202/7,228/7,257 —
+  the ~+180 is the 4x32 buffer, rr_head/beat/sz16 state, sar_init shadow
+  + ro_cnt on ch2, and the AE/NMIF plumbing), memory bits identical
+  (158,208). Latch-inference log clean (the phases-1-2 10240 note stays
+  fixed).
+- DMAC campaign CLOSED: all six plan phases landed with per-phase OOC
+  gates; the DMAC never entered a top-20 path at any phase.

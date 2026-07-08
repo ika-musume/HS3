@@ -58,7 +58,8 @@ logic           tclk_pin;           //-> PTH7 pad (TMU TCLK)
 logic   [7:0]   pta_pin;            //-> PTA pads (port tests)
 logic   [7:0]   ptg_pin;            //-> PTG pads (PGCR quirk test)
 wire    [7:0]   pta_o, pta_oe, pta_pu;      //port A pad ring view
-wire    [7:0]   ptd_o, ptd_oe;              //port D (read-only bit checks)
+wire    [7:0]   ptd_o, ptd_oe;              //port D (DACK/DRAK pads + bit checks)
+logic   [7:0]   ptd_pin;                    //port D pad inputs (PTD4/6 = DREQ0/1, active-low)
 wire    [7:0]   pth_o, pth_oe;              //PTH pad ring view (TCLK merge)
 
 IBus_1          MEM_BUS();       //generic-port view; tb memory model slaves it
@@ -89,6 +90,7 @@ assign  d_bus = d_oe ? d_o : 32'hzzzz_zzzz;
 
 //clock pins: CKIO output (drives the SDRAM model below) and the RTC crystal
 wire            ckio;
+wire            ckio_pcen, ckio_ncen;       //CKIO edge enables (DREQ/WAIT phase checks)
 logic           extal2 = 1'b0;
 
 HS3 #(
@@ -100,6 +102,8 @@ HS3 #(
     .i_CLK                     (clk),
     .i_CEN                     (1'b1),
     .o_CKIO                    (ckio),
+    .o_CKIO_PCEN               (ckio_pcen),
+    .o_CKIO_NCEN               (ckio_ncen),
     .i_EXTAL2                  (extal2),
 
     .o_MEM_REQ                 (mem_req),
@@ -158,7 +162,7 @@ HS3 #(
     .o_PTC_O                   (ptc_o),
     .o_PTC_OE                  (ptc_oe),
     .o_PTC_PU                  (),
-    .i_PTD_I                   (8'h00),
+    .i_PTD_I                   (ptd_pin),
     .o_PTD_O                   (ptd_o),
     .o_PTD_OE                  (ptd_oe),
     .o_PTD_PU                  (),
@@ -368,13 +372,22 @@ integer         d_latency;       //extra response-wait cycles
 logic           mem_pending;
 logic   [31:0]  mem_addr;
 logic           mem_is_data;
+logic           mem_is_sgw;     //single-address DMA write: device drives the resolved bus
+logic           mem_is_dack;    //DACK-tagged cycle (live sideband at the accept edge)
+logic           sgdev_en;       //DMAC single-address device attached to DACK0 (test knob)
+logic           sgdev_clr;      //latch clear knob (sgdev_latch has ONE writer: the model)
+logic   [31:0]  sgdev_data;     //pattern the device drives (dev->mem)
+logic   [31:0]  sgdev_latch;    //what the device captured (mem->dev)
 logic           mem_is_write;
 logic   [3:0]   mem_wstrb_q;
 logic           mem_is_fault;
 integer         mem_wait_cnt;
 
 //I/D discriminator (test probe into the cache FSM; exact while bypass-only)
-wire            req_is_data = u_dut.u_cpu.u_cache.cur_is_data;
+//DMAC-mastered accesses are always data (the imem/dmem split is a tb
+//artifact keyed off the cache's current-access flag, which a DMA cycle
+//never updates)
+wire            req_is_data = u_dut.u_arb.own_dma || u_dut.u_cpu.u_cache.cur_is_data;
 
 assign MEM_BUS.req_ready = !mem_pending && !MEM_BUS.rsp_valid;
 
@@ -639,17 +652,22 @@ always_ff @(posedge clk or negedge sys_rst_n) begin
     end
     else begin
         //a write is only taken once the BSC drives the D bus (o_D_OE) - a
-        //stalled request may be presented before its bus cycle opens
+        //stalled request may be presented before its bus cycle opens. A
+        //single-address DMA write never drives D (fig 11.10a): take it at
+        //the accept and delay the sample until the device's DACK window
         if(MEM_BUS.req_valid && MEM_BUS.req_ready && mem_owned &&
-           (!MEM_BUS.req_write || d_oe)) begin
+           (!MEM_BUS.req_write || d_oe || u_dut.BSC_I_BUS.req_saddr)) begin
             mem_pending  <= 1'b1;
             mem_addr     <= MEM_BUS.req_addr;
             mem_is_data  <= req_is_data;
             mem_is_write <= MEM_BUS.req_write;
+            mem_is_sgw   <= MEM_BUS.req_write && u_dut.BSC_I_BUS.req_saddr;
+            mem_is_dack  <= u_dut.BSC_I_BUS.req_dack;
             mem_wstrb_q  <= MEM_BUS.req_wstrb;
             if(req_is_data) begin
                 mem_is_fault <= d_fault_en && (MEM_BUS.req_addr[9:2] == d_fault_widx);
-                mem_wait_cnt <= d_latency;
+                mem_wait_cnt <= (MEM_BUS.req_write && u_dut.BSC_I_BUS.req_saddr)
+                                ? 6 : d_latency;    //wait for the grid-aligned CS window
             end
             else begin
                 mem_is_fault <= if_fault_en && (MEM_BUS.req_addr[11:1] == if_fault_widx);
@@ -660,17 +678,25 @@ always_ff @(posedge clk or negedge sys_rst_n) begin
             if(mem_wait_cnt == 0) begin
                 mem_pending       <= 1'b0;
                 MEM_BUS.rsp_valid <= 1'b1;
-                //write data sampled off the physical D bus (held bus cycle)
+                //write data sampled off the physical D bus (held bus cycle);
+                //a single-address write reads the RESOLVED bus - the external
+                //DACK device is driving, not the chip
                 if(mem_is_write && mem_is_data && !mem_is_fault) begin
-                    if(mem_wstrb_q[0]) dmem[mem_addr[9:2]][7:0]   <= d_o[7:0];
-                    if(mem_wstrb_q[1]) dmem[mem_addr[9:2]][15:8]  <= d_o[15:8];
-                    if(mem_wstrb_q[2]) dmem[mem_addr[9:2]][23:16] <= d_o[23:16];
-                    if(mem_wstrb_q[3]) dmem[mem_addr[9:2]][31:24] <= d_o[31:24];
+                    if(mem_wstrb_q[0]) dmem[mem_addr[9:2]][7:0]   <= mem_is_sgw ? d_bus[7:0]   : d_o[7:0];
+                    if(mem_wstrb_q[1]) dmem[mem_addr[9:2]][15:8]  <= mem_is_sgw ? d_bus[15:8]  : d_o[15:8];
+                    if(mem_wstrb_q[2]) dmem[mem_addr[9:2]][23:16] <= mem_is_sgw ? d_bus[23:16] : d_o[23:16];
+                    if(mem_wstrb_q[3]) dmem[mem_addr[9:2]][31:24] <= mem_is_sgw ? d_bus[31:24] : d_o[31:24];
                 end
                 MEM_BUS.rsp_rdata <= mem_is_data ? dmem[mem_addr[9:2]]
                                                  : {imem[{mem_addr[11:2], 1'b0}],
                                                     imem[{mem_addr[11:2], 1'b1}]};
                 MEM_BUS.rsp_fault <= mem_is_fault;
+                //DMAC single-address device: take a DACK-tagged read's datum
+                //at its completion (dmem reads never ride the physical D pins
+                //and early-complete before the pin window opens, so the pin-
+                //level model can't see them; single writer - see sgdev_clr)
+                if(sgdev_en && mem_is_data && !mem_is_write && mem_is_dack)
+                    sgdev_latch <= dmem[mem_addr[9:2]];
             end
             else begin
                 mem_wait_cnt <= mem_wait_cnt - 1;
@@ -679,8 +705,115 @@ always_ff @(posedge clk or negedge sys_rst_n) begin
         if(MEM_BUS.rsp_valid && MEM_BUS.rsp_ready) begin
             MEM_BUS.rsp_valid <= 1'b0;
         end
+        if(sgdev_clr) sgdev_latch <= 32'd0;     //knob clear (tasks must not write
+    end                                         //an always_ff variable directly)
+end
+
+
+///////////////////////////////////////////////////////////
+//////  DMAC External Device Model + DACK Monitor (section 11)
+////
+
+/*
+    Single-address "external device with DACK" (figs 11.9-11.10): on a
+    DACK-tagged WRITE cycle the device drives D31-0 (the chip's o_D_OE
+    stays low - fig 11.10a) and bumps its pattern at each window close;
+    on a DACK-tagged READ it latches the memory's data off the bus.
+    The monitor locks the DACK-window laws: the window sits inside the
+    CS0 assertion ("same duration as CSn", p.363) and lands on the
+    read or write cycle per AM. Counters clear when a test enables it.
+*/
+
+logic           dackmon_en;             //DACK-law counters run
+logic           dackmon_rst = 1'b0;     //counter clear knob (single-writer law)
+integer         dackw_cnt;              //DACK0 window cycles observed
+integer         dackf_cnt;              //DACK0 window OPENINGS: envelope framing law
+                                        //(fig 11.11: 4 per plain 16-byte unit;
+                                        // fig 23.19: 1 per burst-ROM read unit)
+integer         dack_naked;             //window cycles with CS0 NEGATED = violation
+integer         dack_on_rd, dack_on_wr; //window cycles in read vs write bus cycles
+integer         drak0_lo, drak0_hi;     //DRAK0 pad low/high cycles (RL polarity proof)
+integer         dackmon_t;              //monitor timebase since clear
+integer         dack_t0, dack_t1;       //first opening / last close times: t1 - t0 =
+                                        //unit span, proving beats chain with no idle
+
+wire            dack0_win = u_dut.u_bsc.o_DACK_WIN[0];
+assign  d_bus = (sgdev_en && dack0_win && !rd_wr) ? sgdev_data : 32'hzzzz_zzzz;
+
+logic           dack0_z, dack0_waswr;
+always @(posedge clk) begin
+    dack0_z <= dack0_win;
+    if(dack0_win) dack0_waswr <= !rd_wr;
+    //device pattern advances as each driven (write) window closes
+    if(sgdev_en && dack0_z && !dack0_win && dack0_waswr)
+        sgdev_data <= sgdev_data + 32'd1;
+    //(the device's read-side latch lives in the memory model's completion
+    //arm: dmem reads early-complete before the pin-level DACK window opens)
+
+    //knob clear (tasks must not write an always_ff variable directly):
+    //every counter has ONE writer - this block
+    if(dackmon_rst) begin
+        dackw_cnt  <= 0;
+        dackf_cnt  <= 0;
+        dack_naked <= 0;
+        dack_on_rd <= 0;
+        dack_on_wr <= 0;
+        drak0_lo   <= 0;
+        drak0_hi   <= 0;
+        dackmon_t  <= 0;
+        dack_t0    <= -1;
+        dack_t1    <= 0;
+    end
+    else if(dackmon_en) begin
+        if(dack0_win) begin
+            dackw_cnt <= dackw_cnt + 1;
+            if(cs0_n)   dack_naked <= dack_naked + 1;
+            if(rd_wr)   dack_on_rd <= dack_on_rd + 1;
+            else        dack_on_wr <= dack_on_wr + 1;
+        end
+        if(!dack0_z && dack0_win) begin
+            dackf_cnt <= dackf_cnt + 1;
+            if(dack_t0 < 0) dack_t0 <= dackmon_t;
+        end
+        if(dack0_z && !dack0_win) dack_t1 <= dackmon_t;
+        dackmon_t <= dackmon_t + 1;
+        if(!ptd_o[1]) drak0_lo <= drak0_lo + 1;
+        if( ptd_o[1]) drak0_hi <= drak0_hi + 1;
     end
 end
+
+task automatic dackmon_clear;
+    begin
+        dackmon_rst = 1'b1;
+        run_cycles(2);
+        dackmon_rst = 1'b0;
+    end
+endtask
+
+/*
+    DMA write-order log (round-robin/priority proofs): every completed
+    DMAC write beat appends its address page nibble addr[11:8]. Tests
+    give each channel a distinct destination page, so the accumulated
+    hex literal IS the grant order. Single writer; the dmaw_clr knob
+    clears (tasks must not write an always_ff variable directly).
+*/
+
+logic           dmaw_clr;               //write-order log clear knob
+logic   [63:0]  dmaw_log;               //page nibbles, oldest leftmost
+integer         dmaw_cnt;               //DMA write beats since clear
+
+always @(posedge clk) begin
+    if(dmaw_clr) begin
+        dmaw_log <= 64'd0;
+        dmaw_cnt <= 0;
+    end
+    else if(u_dut.DMA_I_BUS.rsp_valid && u_dut.DMA_I_BUS.rsp_ready &&
+            u_dut.u_dmac.seq == 3'd4) begin     //S_WR_WAIT completion
+        dmaw_log <= {dmaw_log[59:0], u_dut.u_dmac.addr_q[11:8]};
+        dmaw_cnt <= dmaw_cnt + 1;
+    end
+end
+
 
 
 ///////////////////////////////////////////////////////////
@@ -697,6 +830,8 @@ logic   [31:0]  entry_pc_l;
 logic           bench_arm = 1'b0;
 logic           bench_active, bench_started;
 integer         bench_arch_cycles, bench_retires;
+integer         bench_cs0f;             //CS0 assertion edges inside the window: a
+logic           bench_cs0_z;            //burst-ROM read run frames ONCE (fig 23.19)
 
 always_ff @(posedge clk or negedge sys_rst_n) begin
     if(!sys_rst_n) begin
@@ -729,6 +864,7 @@ always_ff @(posedge clk or negedge sys_rst_n) begin
             bench_started     <= 1'b0;
             bench_arch_cycles <= 0;
             bench_retires     <= 0;
+            bench_cs0f        <= 0;
         end
         else if(!bench_arm) begin
             bench_active <= 1'b0;
@@ -738,8 +874,14 @@ always_ff @(posedge clk or negedge sys_rst_n) begin
             if(bench_started) begin
                 bench_arch_cycles <= bench_arch_cycles + 1;
                 if(retire_valid) bench_retires <= bench_retires + 1;
+                //line-burst CS0 assertions only (fills), not the uncached
+                //preamble's single fetches - the envelope law counts frames
+                if(bench_cs0_z && !cs0_n &&
+                   u_dut.u_bsc.ord_busy && u_dut.u_bsc.ord_burst)
+                    bench_cs0f <= bench_cs0f + 1;
             end
         end
+        bench_cs0_z <= cs0_n;
     end
 end
 
@@ -884,6 +1026,11 @@ task automatic init_knobs;
         sdram_en       = 1'b1;      //Micron model populated
         md4_pin        = 1'b1;      //area 0 back to the 32-bit boot straps
         md3_pin        = 1'b1;
+        ptd_pin        = 8'h00;     //port D pads (the historic tie; DREQ tests
+        sgdev_en       = 1'b0;      //raise PTD4/6 to the negated-high idle)
+        sgdev_clr      = 1'b0;
+        dackmon_en     = 1'b0;
+        dmaw_clr       = 1'b0;
     end
 endtask
 
@@ -2759,7 +2906,7 @@ task automatic test_ordinary_wait;
 endtask
 
 task automatic test_burst_rom;
-    integer sent, j, c_nb, c_bst, loop_e, bf_e, disp, ph;
+    integer sent, j, c_nb, c_bst, f_nb, f_bst, loop_e, bf_e, disp, ph;
     begin
         begin_test("Burst ROM: BCR1-enabled line fills use the WCR2 burst pitch (p.304)");
         for(ph = 0; ph < 2; ph = ph + 1) begin
@@ -2798,15 +2945,20 @@ task automatic test_burst_rom;
             run_until_retire(sent, 120000);
             bench_arm = 1'b0;
             @(posedge clk);
-            if(ph == 0) c_nb  = bench_arch_cycles;
-            else        c_bst = bench_arch_cycles;
+            if(ph == 0) begin c_nb  = bench_arch_cycles; f_nb  = bench_cs0f; end
+            else        begin c_bst = bench_arch_cycles; f_bst = bench_cs0f; end
             chk("cached loop result", gpr(3), 32'd16);
             chk("loop count consumed", gpr(5), 32'd0);
         end
-        $display("      [ROM] no-burst: %0d   burst pitch: %0d", c_nb, c_bst);
-        chk("no-burst fill cycles", c_nb,  32'd1005); //relocked 2026-07-07 (Group A + fill-forward)
-        chk("burst-ROM fill cycles", c_bst, 32'd969);
+        $display("      [ROM] no-burst: %0d (%0d CS falls)   burst pitch: %0d (%0d CS falls)",
+                 c_nb, f_nb, c_bst, f_bst);
+        chk("no-burst fill cycles", c_nb,  32'd987);  //relocked 2026-07-09 (burst envelope:
+        chk("burst-ROM fill cycles", c_bst, 32'd951); //beats chain w/ no idle state, fig 10.30 -
+                                                      //9 beat transitions x 2 cycles saved)
         chk_true("burst pitch is faster", c_bst < c_nb);
+        //envelope law (p.304/fig 23.19): a burst-ROM line fill asserts CS0 ONCE
+        //("CS0 is not negated"); a plain-area fill re-frames all 4 beats
+        chk_true("burst-ROM fills hold CS0 low", f_bst * 4 == f_nb);
         end_test;
     end
 endtask
@@ -4349,6 +4501,1179 @@ endtask
 
 
 ///////////////////////////////////////////////////////////
+//////  DMAC Register Block + CMT (session 5, phase 1)
+////
+
+/*
+    Section 11 register laws (tables 11.2/11.7, pp.331-344, 377-380).
+    Phase 1 covers only the register face + CMT counter; transfers, DEI
+    interrupts (need a hardware TE set) and DREQ pins arrive with the
+    engine phases. All accesses ride the P2 window 0xA4000020-77 through
+    the BSC's P-bus bridge (shadow-invariant area-1 decode).
+*/
+
+task automatic test_dmac_channel_regs;
+    integer idx, sent;
+    begin
+        begin_test("DMAC channel quads: lanes, DMATCR mask, per-channel CHCR bits, decode holes");
+        eidx = 0;
+        emit_ldrn(1, 32'hA400_0020);                 // SAR0
+        imem[eidx] = 16'h6312; eidx = eidx + 1;              // MOV.L @R1,R3      ; reset 0 (sim; arch undefined)
+        emit_ldr0(32'h1234_5678);
+        imem[eidx] = 16'h2102; eidx = eidx + 1;              // MOV.L R0,@R1
+        imem[eidx] = 16'h6412; eidx = eidx + 1;              // MOV.L @R1,R4      ; long readback
+        emit_ldr0(32'h0000_AAAA);
+        imem[eidx] = 16'h2101; eidx = eidx + 1;              // MOV.W R0,@R1      ; upper half (big-endian)
+        imem[eidx] = 16'h6512; eidx = eidx + 1;              // MOV.L @R1,R5      ; lower half retained
+        emit_ldrn(1, 32'hA400_0022);                 // SAR0 lower half
+        emit_ldr0(32'h0000_BBBB);
+        imem[eidx] = 16'h2101; eidx = eidx + 1;              // MOV.W R0,@R1
+        emit_ldrn(1, 32'hA400_0020);
+        imem[eidx] = 16'h6712; eidx = eidx + 1;              // MOV.L @R1,R7      ; both halves written
+        imem[eidx] = 16'hE240; eidx = eidx + 1;              // MOV   #0x40,R2    ; mailbox base
+        emit_ldrn(1, 32'hA400_0028);                 // DMATCR0
+        imem[eidx] = 16'hE0FF; eidx = eidx + 1;              // MOV   #-1,R0      ; 0xFFFFFFFF
+        imem[eidx] = 16'h2102; eidx = eidx + 1;              // MOV.L R0,@R1
+        imem[eidx] = 16'h6012; eidx = eidx + 1;              // MOV.L @R1,R0
+        imem[eidx] = 16'h2202; eidx = eidx + 1;              // MOV.L R0,@R2      ; mb0: bits 31:24 masked
+        emit_ldrn(1, 32'hA400_002C);                 // CHCR0
+        imem[eidx] = 16'hE0FF; eidx = eidx + 1;              // MOV   #-1,R0
+        imem[eidx] = 16'h2102; eidx = eidx + 1;              // MOV.L R0,@R1
+        imem[eidx] = 16'h6012; eidx = eidx + 1;              // MOV.L @R1,R0
+        imem[eidx] = 16'h1201; eidx = eidx + 1;              // MOV.L R0,@(4,R2)  ; mb1: RL/AM/AL/DS live, no TE
+        imem[eidx] = 16'hE000; eidx = eidx + 1;              // MOV   #0,R0
+        imem[eidx] = 16'h8013; eidx = eidx + 1;              // MOV.B R0,@(3,R1)  ; byte lane clears CHCR0[7:0]
+        imem[eidx] = 16'h6012; eidx = eidx + 1;              // MOV.L @R1,R0
+        imem[eidx] = 16'h1202; eidx = eidx + 1;              // MOV.L R0,@(8,R2)  ; mb2: upper bytes retained
+        emit_ldrn(1, 32'hA400_003C);                 // CHCR1
+        imem[eidx] = 16'hE0FF; eidx = eidx + 1;              // MOV   #-1,R0
+        imem[eidx] = 16'h2102; eidx = eidx + 1;              // MOV.L R0,@R1
+        imem[eidx] = 16'h6012; eidx = eidx + 1;              // MOV.L @R1,R0
+        imem[eidx] = 16'h1203; eidx = eidx + 1;              // MOV.L R0,@(12,R2) ; mb3
+        emit_ldrn(1, 32'hA400_004C);                 // CHCR2
+        imem[eidx] = 16'hE0FF; eidx = eidx + 1;              // MOV   #-1,R0
+        imem[eidx] = 16'h2102; eidx = eidx + 1;              // MOV.L R0,@R1
+        imem[eidx] = 16'h6012; eidx = eidx + 1;              // MOV.L @R1,R0
+        imem[eidx] = 16'h1204; eidx = eidx + 1;              // MOV.L R0,@(16,R2) ; mb4: RO only
+        emit_ldrn(1, 32'hA400_005C);                 // CHCR3
+        imem[eidx] = 16'hE0FF; eidx = eidx + 1;              // MOV   #-1,R0
+        imem[eidx] = 16'h2102; eidx = eidx + 1;              // MOV.L R0,@R1
+        imem[eidx] = 16'h6012; eidx = eidx + 1;              // MOV.L @R1,R0
+        imem[eidx] = 16'h1205; eidx = eidx + 1;              // MOV.L R0,@(20,R2) ; mb5: DI only
+        emit_ldrn(1, 32'hA400_0068);                 // 0x62-6F hole: undecoded (11.6 note 11)
+        imem[eidx] = 16'h6012; eidx = eidx + 1;              // MOV.L @R1,R0
+        imem[eidx] = 16'h1206; eidx = eidx + 1;              // MOV.L R0,@(24,R2) ; mb6 = 0
+        emit_ldrn(1, 32'hA400_0078);                 // fringe just past the CMT
+        imem[eidx] = 16'h6012; eidx = eidx + 1;              // MOV.L @R1,R0
+        imem[eidx] = 16'h1207; eidx = eidx + 1;              // MOV.L R0,@(28,R2) ; mb7 = 0
+        emit_sentinel_loop(eidx, sent);
+        do_reset;
+        run_until_retire(sent, 30000);
+        chk("SAR0 reset 0 (sim; arch undefined)",  gpr(3), 32'h0000_0000);
+        chk("SAR0 long R/W",                       gpr(4), 32'h1234_5678);
+        chk("SAR0 word @+0: lower half retained",  gpr(5), 32'hAAAA_5678);
+        chk("SAR0 word @+2: upper half retained",  gpr(7), 32'hAAAA_BBBB);
+        chk("DMATCR0 bits 31:24 read 0 / WI",      dmem[16'h10], 32'h00FF_FFFF);
+        chk("CHCR0 all-ones: RL/AM/AL/DS, no TE",  dmem[16'h11], 32'h0007_FF7D);
+        chk("CHCR0 byte lane: 7:0 clear only",     dmem[16'h12], 32'h0007_FF00);
+        chk("CHCR1 all-ones mask == CHCR0",        dmem[16'h13], 32'h0007_FF7D);
+        chk("CHCR2 all-ones: RO only",             dmem[16'h14], 32'h0008_FF3D);
+        chk("CHCR3 all-ones: DI only",             dmem[16'h15], 32'h0010_FF3D);
+        chk("0x62-6F hole reads 0",                dmem[16'h16], 32'h0000_0000);
+        chk("0x78 fringe reads 0",                 dmem[16'h17], 32'h0000_0000);
+        end_test;
+    end
+endtask
+
+task automatic test_dmac_dmaor_cmt_regs;
+    integer idx, sent, c0;
+    begin
+        begin_test("DMAOR flag/lane laws + CMT reset values + CMCNT0 tick rate (P-phi/8)");
+        eidx = 0;
+        emit_ldrn(1, 32'hA400_0060);                 // DMAOR
+        imem[eidx] = 16'h6311; eidx = eidx + 1;              // MOV.W @R1,R3      ; reset 0x0000
+        imem[eidx] = 16'hE0FF; eidx = eidx + 1;              // MOV   #-1,R0
+        imem[eidx] = 16'h2101; eidx = eidx + 1;              // MOV.W R0,@R1      ; all-ones word
+        imem[eidx] = 16'h6411; eidx = eidx + 1;              // MOV.W @R1,R4      ; AE/NMIF refuse write-1
+        emit_ldrn(1, 32'hA400_0061);
+        imem[eidx] = 16'hE000; eidx = eidx + 1;              // MOV   #0,R0
+        imem[eidx] = 16'h2100; eidx = eidx + 1;              // MOV.B R0,@R1      ; low byte: DME clears
+        emit_ldrn(1, 32'hA400_0060);
+        imem[eidx] = 16'h6511; eidx = eidx + 1;              // MOV.W @R1,R5      ; PR retained
+        imem[eidx] = 16'hE000; eidx = eidx + 1;              // MOV   #0,R0
+        imem[eidx] = 16'h2100; eidx = eidx + 1;              // MOV.B R0,@R1      ; high byte: PR clears
+        imem[eidx] = 16'hE240; eidx = eidx + 1;              // MOV   #0x40,R2    ; mailbox base
+        imem[eidx] = 16'h6011; eidx = eidx + 1;              // MOV.W @R1,R0
+        imem[eidx] = 16'h2202; eidx = eidx + 1;              // MOV.L R0,@R2      ; mb0 = 0
+        emit_ldrn(1, 32'hA400_0076);                 // CMCOR0
+        imem[eidx] = 16'h6711; eidx = eidx + 1;              // MOV.W @R1,R7      ; reset 0xFFFF (sign-ext)
+        emit_wreg_w(32'hA400_0072, 16'h0041);        // CMCSR0: spare bit 6 + CKS=01 (P-phi/8)
+        emit_ldrn(1, 32'hA400_0072);
+        imem[eidx] = 16'h6011; eidx = eidx + 1;              // MOV.W @R1,R0
+        imem[eidx] = 16'h1201; eidx = eidx + 1;              // MOV.L R0,@(4,R2)  ; mb1 = 0x0041
+        emit_wreg_w(32'hA400_0070, 16'h0001);        // CMSTR: STR0
+        emit_sentinel_loop(eidx, sent);
+        do_reset;
+        run_until_retire(sent, 30000);
+        chk("DMAOR reset 0x0000",                  gpr(3), 32'h0000_0000);
+        chk("DMAOR all-ones: PR+DME only stick",   gpr(4), 32'h0000_0301);
+        chk("DMAOR byte @+1: DME clears, PR held", gpr(5), 32'h0000_0300);
+        chk("DMAOR byte @+0: PR clears",           dmem[16'h10], 32'h0000_0000);
+        chk("CMCOR0 reset 0xFFFF",                 gpr(7), 32'hFFFF_FFFF);
+        chk("CMCSR0 spare+CKS readback",           dmem[16'h11], 32'h0000_0041);
+        //tick-rate law: P-phi/8 = one count / 32 core cycles at the FRQCR
+        //reset ratio; 4096 is a multiple, so the delta is exact
+        c0 = u_dut.u_dmac.cmcnt;
+        run_cycles(4096);
+        chk("CMCNT0 P-phi/8: 128 counts / 4096 cycles", u_dut.u_dmac.cmcnt - c0, 32'd128);
+        end_test;
+    end
+endtask
+
+task automatic test_dmac_cmt_match;
+    integer idx, sent, c0;
+    begin
+        begin_test("CMT compare match: CMCNT0 wrap, CMF set + write-0 clear protocol, STR0 halt");
+        eidx = 0;
+        emit_wreg_w(32'hA400_0076, 16'h001F);        // CMCOR0 = 31: match / 512 cycles (P-phi/4)
+        emit_wreg_w(32'hA400_0072, 16'h0000);        // CMCSR0: CKS=00 (P-phi/4)
+        emit_wreg_w(32'hA400_0070, 16'h0001);        // CMSTR: STR0
+        emit_ldrn(3, 32'd400);                       // delay > one match period (~4 cyc/iter)
+        imem[eidx] = 16'h4310; eidx = eidx + 1;              // DT    R3
+        imem[eidx] = 16'h8BFD; eidx = eidx + 1;              // BF    .-1 (loop)
+        imem[eidx] = 16'hE240; eidx = eidx + 1;              // MOV   #0x40,R2    ; mailbox base
+        emit_ldrn(1, 32'hA400_0072);                 // CMCSR0
+        imem[eidx] = 16'h6011; eidx = eidx + 1;              // MOV.W @R1,R0
+        imem[eidx] = 16'h2202; eidx = eidx + 1;              // MOV.L R0,@R2      ; mb0 = CMF set
+        imem[eidx] = 16'hE000; eidx = eidx + 1;              // MOV   #0,R0
+        imem[eidx] = 16'h2101; eidx = eidx + 1;              // MOV.W R0,@R1      ; CMF write-0 clear
+        imem[eidx] = 16'h6011; eidx = eidx + 1;              // MOV.W @R1,R0
+        imem[eidx] = 16'h1201; eidx = eidx + 1;              // MOV.L R0,@(4,R2)  ; mb1 = cleared
+        emit_ldrn(1, 32'hA400_0074);                 // CMCNT0
+        imem[eidx] = 16'h6011; eidx = eidx + 1;              // MOV.W @R1,R0
+        imem[eidx] = 16'h1202; eidx = eidx + 1;              // MOV.L R0,@(8,R2)  ; mb2 = wrapped count
+        emit_wreg_w(32'hA400_0070, 16'h0000);        // CMSTR: STR0 off
+        emit_sentinel_loop(eidx, sent);
+        do_reset;
+        run_until_retire(sent, 30000);
+        chk("CMF set after a match period",     dmem[16'h10], 32'h0000_0080);
+        chk("CMF write-0 clears",               dmem[16'h11], 32'h0000_0000);
+        chk_true("CMCNT0 wrapped below CMCOR0", dmem[16'h12] <= 32'h0000_001F);
+        //STR0 = 0 freezes the counter dead
+        c0 = u_dut.u_dmac.cmcnt;
+        run_cycles(1024);
+        chk("STR0 off: CMCNT0 frozen", u_dut.u_dmac.cmcnt, c0[15:0]);
+        end_test;
+    end
+endtask
+
+
+///////////////////////////////////////////////////////////
+//////  DMAC Transfers (session 5, phase 3)
+////
+
+/*
+    Auto-request dual-direct engine (section 11.3): unit = read at SAR
+    then write at DAR through the on-chip arbiter and the BSC ordinary
+    bus (dmem region). DMA source/destination addresses are PHYSICAL
+    area-0 values; the CPU seeds/verifies through P2. Mailboxes: the
+    shared DEI handler uses mb0 (INTEVT2) and mb1 (CHCR readback).
+*/
+
+//DEI handler at VBR+0x600: mb0 = INTEVT2, mb1 = CHCR readback (TE visible),
+//then CHCR <- {16'd0, clr_val} to drop the DE/IE level (write-1 keeps TE)
+task automatic emit_handler_dmac(input logic [7:0] chcr_off, input logic [15:0] clr_val);
+    integer idx, k;
+    begin
+        idx = 'h300;
+        imem[idx] = 16'hE240; idx = idx + 1;              // MOV   #0x40,R2    ; mailbox base
+        emit_a4_base(idx, 3);                             // R3 = 0xA4000000
+        imem[idx] = 16'h6432; idx = idx + 1;              // MOV.L @R3,R4      ; INTEVT2
+        imem[idx] = 16'h2242; idx = idx + 1;              // MOV.L R4,@R2      ; mb0
+        imem[idx] = 16'h6033; idx = idx + 1;              // MOV   R3,R0
+        imem[idx] = 16'hCB00 | chcr_off; idx = idx + 1;   // OR    #off,R0     ; CHCRn address
+        imem[idx] = 16'h6103; idx = idx + 1;              // MOV   R0,R1
+        imem[idx] = 16'h6512; idx = idx + 1;              // MOV.L @R1,R5
+        imem[idx] = 16'h1251; idx = idx + 1;              // MOV.L R5,@(4,R2)  ; mb1 = CHCR (TE set)
+        imem[idx] = 16'hE000 | clr_val[15:8]; idx = idx + 1; // MOV #hi,R0
+        imem[idx] = 16'h4018; idx = idx + 1;              // SHLL8 R0
+        imem[idx] = 16'hCB00 | clr_val[7:0]; idx = idx + 1;  // OR  #lo,R0
+        imem[idx] = 16'h2102; idx = idx + 1;              // MOV.L R0,@R1      ; drop DE/IE level
+        for(k = 0; k < 8; k = k + 1) begin
+            imem[idx] = 16'h0009; idx = idx + 1;          // grace NOPs (resolver settle)
+        end
+        imem[idx] = 16'h002B; idx = idx + 1;              // RTE
+        imem[idx] = 16'h0009; idx = idx + 1;              // NOP (delay slot)
+    end
+endtask
+
+//seed one longword at a P2 address (CPU store; DMA later reads it raw)
+task automatic emit_poke_l(input logic [31:0] addr, input logic [31:0] v);
+    begin
+        emit_ldrn(1, addr);
+        emit_ldr0(v);
+        imem[eidx] = 16'h2102; eidx = eidx + 1;              // MOV.L R0,@R1
+    end
+endtask
+
+//poll CHCRn (address in R1) until TE (bit 1) sets
+task automatic emit_poll_te(input logic [31:0] chcr_addr);
+    begin
+        emit_ldrn(1, chcr_addr);
+        imem[eidx] = 16'h6012; eidx = eidx + 1;              // MOV.L @R1,R0
+        imem[eidx] = 16'hC802; eidx = eidx + 1;              // TST   #2,R0       ; T = !TE
+        imem[eidx] = 16'h89FC; eidx = eidx + 1;              // BT    .-2 (poll)
+    end
+endtask
+
+task automatic test_dmac_auto_long;
+    integer idx, sent;
+    begin
+        begin_test("DMAC auto-request: 4 longs mem->mem cycle-steal, end regs, TE, DEI INTEVT2=0x800");
+        eidx = 0;
+        emit_poke_l(32'hA000_0100, 32'hC0FF_EE01);   //source block
+        emit_poke_l(32'hA000_0104, 32'hC0FF_EE02);
+        emit_poke_l(32'hA000_0108, 32'hC0FF_EE03);
+        emit_poke_l(32'hA000_010C, 32'hC0FF_EE04);
+        emit_wreg_w(32'hA400_001A, 16'hD000);        // IPRE: DMAC level 13
+        emit_poke_l(32'hA400_0020, 32'h0000_0100);   // SAR0 (physical)
+        emit_poke_l(32'hA400_0024, 32'h0000_0200);   // DAR0
+        emit_poke_l(32'hA400_0028, 32'h0000_0004);   // DMATCR0 = 4
+        emit_poke_l(32'hA400_002C, 32'h0000_5415);   // CHCR0: inc/inc auto long cs IE DE
+        emit_sr_imask(eidx, 4'h0);
+        emit_wreg_w(32'hA400_0060, 16'h0001);        // DMAOR: DME last (11.6 note 6)
+        emit_sentinel_loop(eidx, sent);
+        emit_handler_dmac(8'h2C, 16'h0000);          // mb0/mb1 + CHCR0 <- 0
+        do_reset;
+        run_until_entry_count(1, 30000);
+        run_cycles(300);
+        chk("dst[0]",                       dmem[16'h80], 32'hC0FF_EE01);
+        chk("dst[1]",                       dmem[16'h81], 32'hC0FF_EE02);
+        chk("dst[2]",                       dmem[16'h82], 32'hC0FF_EE03);
+        chk("dst[3]",                       dmem[16'h83], 32'hC0FF_EE04);
+        chk("DEI0 INTEVT2 = 0x800",         dmem[16'h10], 32'h0000_0800);
+        chk("CHCR0 in handler: TE set",     dmem[16'h11], 32'h0000_5417);
+        chk("SAR0 end",  u_dut.u_dmac.u_ch0.sar, 32'h0000_0110);
+        chk("DAR0 end",  u_dut.u_dmac.u_ch0.dar, 32'h0000_0210);
+        chk("DMATCR0 end", {8'd0, u_dut.u_dmac.u_ch0.tcr}, 32'h0000_0000);
+        end_test;
+    end
+endtask
+
+task automatic test_dmac_sizes_lanes;
+    integer idx, sent;
+    begin
+        begin_test("DMAC sizes/lanes: byte inc->dec scramble + word dec->fixed, end registers");
+        eidx = 0;
+        emit_poke_l(32'hA000_0140, 32'h0123_4567);   //source bytes/words
+        emit_poke_l(32'hA000_0144, 32'h89AB_CDEF);
+        emit_poke_l(32'hA400_0030, 32'h0000_0141);   // SAR1: byte offset 1
+        emit_poke_l(32'hA400_0034, 32'h0000_01F3);   // DAR1: byte offset 3, decrementing
+        emit_poke_l(32'hA400_0038, 32'h0000_0004);   // DMATCR1 = 4 bytes
+        emit_poke_l(32'hA400_003C, 32'h0000_9401);   // CHCR1: dec/inc auto byte cs DE
+        emit_poke_l(32'hA400_0040, 32'h0000_0146);   // SAR2: word offset 2
+        emit_poke_l(32'hA400_0044, 32'h0000_01E0);   // DAR2: fixed word
+        emit_poke_l(32'hA400_0048, 32'h0000_0002);   // DMATCR2 = 2 words
+        emit_poke_l(32'hA400_004C, 32'h0000_2409);   // CHCR2: fixed/dec auto word cs DE
+        emit_wreg_w(32'hA400_0060, 16'h0001);        // DMAOR: DME (starts both)
+        emit_poll_te(32'hA400_003C);                 // wait ch1
+        emit_poll_te(32'hA400_004C);                 // wait ch2
+        imem[eidx] = 16'hE240; eidx = eidx + 1;              // MOV #0x40,R2      ; mailbox base
+        emit_ldrn(1, 32'hA400_003C);
+        imem[eidx] = 16'h6012; eidx = eidx + 1;              // MOV.L @R1,R0
+        imem[eidx] = 16'h2202; eidx = eidx + 1;              // MOV.L R0,@R2      ; mb0 = CHCR1
+        emit_ldrn(1, 32'hA400_0030);
+        imem[eidx] = 16'h6012; eidx = eidx + 1;              // MOV.L @R1,R0
+        imem[eidx] = 16'h1201; eidx = eidx + 1;              // mb1 = SAR1
+        emit_ldrn(1, 32'hA400_0034);
+        imem[eidx] = 16'h6012; eidx = eidx + 1;              // MOV.L @R1,R0
+        imem[eidx] = 16'h1202; eidx = eidx + 1;              // mb2 = DAR1
+        emit_ldrn(1, 32'hA400_0040);
+        imem[eidx] = 16'h6012; eidx = eidx + 1;              // MOV.L @R1,R0
+        imem[eidx] = 16'h1203; eidx = eidx + 1;              // mb3 = SAR2
+        emit_sentinel_loop(eidx, sent);
+        do_reset;
+        run_until_retire(sent, 30000);
+        //bytes 0x23,0x45,0x67,0x89 land at 0x1F3,0x1F2,0x1F1,0x1F0 (dec)
+        chk("byte scramble dst",            dmem[16'h7C], 32'h8967_4523);
+        //words 0xCDEF then 0x89AB both hit fixed 0x1E0 (upper lane): last wins
+        chk("word fixed-dst last wins",     dmem[16'h78], 32'h89AB_0000);
+        chk("CHCR1 TE readback",            dmem[16'h10], 32'h0000_9403);
+        chk("SAR1 end (+4 bytes)",          dmem[16'h11], 32'h0000_0145);
+        chk("DAR1 end (-4 bytes)",          dmem[16'h12], 32'h0000_01EF);
+        chk("SAR2 end (-2 words)",          dmem[16'h13], 32'h0000_0142);
+        end_test;
+    end
+endtask
+
+task automatic test_dmac_priority;
+    integer idx, sent, c;
+    begin
+        begin_test("DMAC fixed priority PR=10: ch2 strictly before ch1, DMATCR1 untouched at te2");
+        //the CPU only configures and parks in the sentinel; strict order is
+        //observed at the te2-set EDGE from the tb (a polled read is far too
+        //slow relative to a transfer unit under bus contention)
+        eidx = 0;
+        emit_poke_l(32'hA000_0100, 32'hAA00_0001);
+        emit_poke_l(32'hA000_0104, 32'hAA00_0002);
+        emit_poke_l(32'hA000_0108, 32'hAA00_0003);
+        emit_poke_l(32'hA000_010C, 32'hAA00_0004);
+        emit_poke_l(32'hA400_0040, 32'h0000_0100);   // SAR2
+        emit_poke_l(32'hA400_0044, 32'h0000_0300);   // DAR2
+        emit_poke_l(32'hA400_0048, 32'h0000_0004);   // DMATCR2 = 4
+        emit_poke_l(32'hA400_004C, 32'h0000_5411);   // CHCR2: inc/inc auto long cs DE
+        emit_poke_l(32'hA400_0030, 32'h0000_0180);   // SAR1
+        emit_poke_l(32'hA400_0034, 32'h0000_0340);   // DAR1
+        emit_poke_l(32'hA400_0038, 32'h0000_0020);   // DMATCR1 = 32
+        emit_poke_l(32'hA400_003C, 32'h0000_5411);   // CHCR1: same, lower priority at PR=10
+        emit_wreg_w(32'hA400_0060, 16'h0201);        // DMAOR: PR=10 (2>0>1>3), DME
+        emit_sentinel_loop(eidx, sent);
+        do_reset;
+        c = 0;
+        while(!u_dut.u_dmac.u_ch2.te && c < 30000) begin @(posedge clk); c = c + 1; end
+        //strict order law: ch1 has moved NOTHING when ch2's TE sets (ch1's
+        //first unit needs >=6 cycles after its first-ever grant)
+        chk("PR=10: DMATCR1 untouched at te2", {8'd0, u_dut.u_dmac.u_ch1.tcr}, 32'h0000_0020);
+        c = 0;
+        while(!u_dut.u_dmac.u_ch1.te && c < 60000) begin @(posedge clk); c = c + 1; end
+        run_cycles(50);
+        chk("ch2 image [0]",                dmem[16'hC0], 32'hAA00_0001);
+        chk("ch2 image [3]",                dmem[16'hC3], 32'hAA00_0004);
+        chk("ch1 SAR end (+128)",  u_dut.u_dmac.u_ch1.sar, 32'h0000_0200);
+        chk("ch1 DAR end (+128)",  u_dut.u_dmac.u_ch1.dar, 32'h0000_03C0);
+        chk("ch1 DMATCR end",      {8'd0, u_dut.u_dmac.u_ch1.tcr}, 32'h0000_0000);
+        end_test;
+    end
+endtask
+
+task automatic test_dmac_gating;
+    integer idx, sent;
+    begin
+        begin_test("DMAC gating: DE-clear stops without TE + TE blocks re-enable, DEI3 INTEVT2=0x860");
+        //phase A: DE-clear mid-run stops (unit completes, count freezes, no TE)
+        eidx = 0;
+        emit_poke_l(32'hA400_0020, 32'h0000_0100);   // SAR0
+        emit_poke_l(32'hA400_0024, 32'h0000_0200);   // DAR0 (clear of every checked image)
+        emit_poke_l(32'hA400_0028, 32'h0000_0040);   // DMATCR0 = 64
+        emit_poke_l(32'hA400_002C, 32'h0000_5411);   // CHCR0: inc/inc auto long cs
+        emit_wreg_w(32'hA400_0060, 16'h0001);        // DMAOR: DME (starts ch0)
+        emit_ldrn(3, 32'd12);
+        imem[eidx] = 16'h4310; eidx = eidx + 1;              // DT R3             ; brief run
+        imem[eidx] = 16'h8BFD; eidx = eidx + 1;              // BF .-1
+        emit_poke_l(32'hA400_002C, 32'h0000_5410);   // CHCR0: DE clear (in-flight unit completes)
+        imem[eidx] = 16'hE240; eidx = eidx + 1;              // MOV #0x40,R2      ; mailbox base
+        emit_ldrn(1, 32'hA400_0028);
+        imem[eidx] = 16'h6012; eidx = eidx + 1;              // MOV.L @R1,R0
+        imem[eidx] = 16'h1204; eidx = eidx + 1;              // mb4 = DMATCR0 after halt
+        emit_ldrn(3, 32'd40);
+        imem[eidx] = 16'h4310; eidx = eidx + 1;              // DT R3             ; long delay
+        imem[eidx] = 16'h8BFD; eidx = eidx + 1;              // BF .-1
+        emit_ldrn(1, 32'hA400_0028);
+        imem[eidx] = 16'h6012; eidx = eidx + 1;              // MOV.L @R1,R0
+        imem[eidx] = 16'h1205; eidx = eidx + 1;              // mb5 = DMATCR0 later (frozen)
+        emit_ldrn(1, 32'hA400_002C);
+        imem[eidx] = 16'h6012; eidx = eidx + 1;              // MOV.L @R1,R0
+        imem[eidx] = 16'h1206; eidx = eidx + 1;              // mb6 = CHCR0 (TE must be 0)
+        //phase B: ch3 completes w/ DEI (0x860); handler holds TE; DE=1 with TE=1 stays halted
+        emit_wreg_w(32'hA400_001A, 16'hD000);        // IPRE: DMAC level 13
+        emit_poke_l(32'hA400_0050, 32'h0000_0100);   // SAR3
+        emit_poke_l(32'hA400_0054, 32'h0000_01C0);   // DAR3
+        emit_poke_l(32'hA400_0058, 32'h0000_0002);   // DMATCR3 = 2
+        emit_sr_imask(eidx, 4'h0);
+        emit_poke_l(32'hA400_005C, 32'h0000_5415);   // CHCR3: IE DE (starts; DME already 1)
+        emit_poll_te(32'hA400_005C);                 // TE holds through the handler's clear
+        emit_poke_l(32'hA400_005C, 32'h0000_0403);   // DE=1 again, TE write-1 held -> no restart
+        emit_ldrn(3, 32'd40);
+        imem[eidx] = 16'h4310; eidx = eidx + 1;              // DT R3             ; settle window
+        imem[eidx] = 16'h8BFD; eidx = eidx + 1;              // BF .-1
+        emit_sentinel_loop(eidx, sent);
+        emit_handler_dmac(8'h5C, 16'h0002);          // CHCR3 <- 2: DE/IE off, TE write-1 held
+        do_reset;
+        run_until_retire(sent, 60000);
+        chk_true("DE-clear: stopped mid-count", dmem[16'h14] > 32'd0 && dmem[16'h14] < 32'd64);
+        chk("DE-clear: count frozen",       dmem[16'h15], dmem[16'h14]);
+        chk("DE-clear: TE stays 0",         dmem[16'h16], 32'h0000_5410);
+        chk("DEI3 INTEVT2 = 0x860",         dmem[16'h10], 32'h0000_0860);
+        chk("CHCR3 in handler: TE set",     dmem[16'h11], 32'h0000_5417);
+        chk("TE blocks re-enable: SAR3 froze", u_dut.u_dmac.u_ch3.sar, 32'h0000_0108);
+        chk("ch3 TE still set",             {31'd0, u_dut.u_dmac.u_ch3.te}, 32'd1);
+        end_test;
+    end
+endtask
+
+task automatic test_dmac_bus_modes;
+    integer idx, sent, c;
+    begin
+        begin_test("DMAC bus modes: DME->TE duration laws, burst locks the CPU out vs cycle-steal");
+        //phase A: cycle-steal, 8 longs, sentinel fetches interleave
+        eidx = 0;
+        emit_poke_l(32'hA400_0020, 32'h0000_0100);   // SAR0
+        emit_poke_l(32'hA400_0024, 32'h0000_0380);   // DAR0
+        emit_poke_l(32'hA400_0028, 32'h0000_0008);   // DMATCR0 = 8
+        emit_poke_l(32'hA400_002C, 32'h0000_5411);   // CHCR0: cycle-steal
+        emit_wreg_w(32'hA400_0060, 16'h0001);        // DMAOR: DME
+        emit_sentinel_loop(eidx, sent);
+        do_reset;
+        c = 0;
+        while(!u_dut.u_dmac.dme && c < 30000) begin @(posedge clk); c = c + 1; end
+        c = 0;
+        while(!u_dut.u_dmac.u_ch0.te && c < 30000) begin @(posedge clk); c = c + 1; end
+        chk("cycle-steal 8-long DME->TE law", c[31:0], 32'd94);
+        //phase B: same transfer in burst - CPU locked out, much shorter
+        clear_imem; clear_dmem;
+        eidx = 0;
+        emit_poke_l(32'hA400_0020, 32'h0000_0100);
+        emit_poke_l(32'hA400_0024, 32'h0000_0380);
+        emit_poke_l(32'hA400_0028, 32'h0000_0008);
+        emit_poke_l(32'hA400_002C, 32'h0000_5431);   // CHCR0: burst
+        emit_wreg_w(32'hA400_0060, 16'h0001);
+        emit_sentinel_loop(eidx, sent);
+        do_reset;
+        c = 0;
+        while(!u_dut.u_dmac.dme && c < 30000) begin @(posedge clk); c = c + 1; end
+        c = 0;
+        while(!u_dut.u_dmac.u_ch0.te && c < 30000) begin @(posedge clk); c = c + 1; end
+        chk("burst 8-long DME->TE law", c[31:0], 32'd66);
+        end_test;
+    end
+endtask
+
+
+///////////////////////////////////////////////////////////
+//////  DMAC External Request + Single Address (session 5, phase 4)
+////
+
+/*
+    Section 11.3.5 laws on the pins: DREQ sampled on the CKIO falling
+    edge, DS level/edge detection, DACK framed on CSn in the AM-selected
+    cycle with AL polarity, DRAK request-accepted pulse with RL polarity,
+    burst-edge runs to DMATCR=0 from ONE edge (fig 11.21), level stop/
+    resume. Port D pads granted by PDCR mode 00 (write 0xA080: PTD5/4/1
+    to their functions). DREQ tests idle PTD4 HIGH before enabling the
+    channel (11.6 note 10: keep the pin high while setting up).
+*/
+
+task automatic test_dmac_dreq_level_cs;
+    integer idx, sent, c, frozen;
+    begin
+        begin_test("DREQ0 level cycle-steal: latency law, stop/resume, DACK=CS read window, DRAK");
+        eidx = 0;
+        emit_wreg_w(32'hA400_0106, 16'hA080);        // PDCR: PTD5/4/1/0 mode 00 (fn grant)
+        emit_poke_l(32'hA000_0100, 32'hD0D0_0001);
+        emit_poke_l(32'hA000_0104, 32'hD0D0_0002);
+        emit_poke_l(32'hA400_0020, 32'h0000_0100);   // SAR0
+        emit_poke_l(32'hA400_0024, 32'h0000_0240);   // DAR0
+        emit_poke_l(32'hA400_0028, 32'h0000_0004);   // DMATCR0 = 4
+        emit_poke_l(32'hA400_002C, 32'h0000_5011);   // CHCR0: inc/inc ext-dual DS=0 AM=0 cs DE
+        emit_wreg_w(32'hA400_0060, 16'h0001);        // DMAOR: DME
+        emit_sentinel_loop(eidx, sent);
+        do_reset;
+        ptd_pin[4] = 1'b1;                           //DREQ0 negated during setup (11.6 note 10)
+        c = 0;
+        while(!u_dut.u_dmac.dme && c < 30000) begin @(posedge clk); c = c + 1; end
+        run_cycles(8);
+        dackmon_clear; dackmon_en = 1'b1;
+        ptd_pin[4] = 1'b0;                           //request
+        c = 0;
+        while(u_dut.u_dmac.seq == 3'd0 && c < 1000) begin @(posedge clk); c = c + 1; end
+        //DREQ assert -> grant law: 5 core cycles (2FF sync + CKIO-fall sample
+        //+ request resolve); the first PIN cycle lands several CKIO later,
+        //beyond the >=3-state minimum of p.363
+        chk("DREQ->grant latency law", c[31:0], 32'd5);
+        //level stop: negate after the first unit lands; the one-step-ahead
+        //sample may admit one more unit, then the count freezes
+        c = 0;
+        while(u_dut.u_dmac.u_ch0.tcr > 24'd3 && c < 5000) begin @(posedge clk); c = c + 1; end
+        ptd_pin[4] = 1'b1;
+        run_cycles(120);
+        frozen = {8'd0, u_dut.u_dmac.u_ch0.tcr};
+        run_cycles(256);
+        chk_true("level stop: mid-count",   frozen > 0 && frozen < 4);
+        chk("level stop: count frozen",     {8'd0, u_dut.u_dmac.u_ch0.tcr}, frozen[31:0]);
+        ptd_pin[4] = 1'b0;                           //resume to completion
+        c = 0;
+        while(!u_dut.u_dmac.u_ch0.te && c < 30000) begin @(posedge clk); c = c + 1; end
+        ptd_pin[4] = 1'b1;
+        run_cycles(20);
+        dackmon_en = 1'b0;
+        chk("dst[0]",                       dmem[16'h90], 32'hD0D0_0001);
+        chk("dst[1]",                       dmem[16'h91], 32'hD0D0_0002);
+        chk("SAR0 end",  u_dut.u_dmac.u_ch0.sar, 32'h0000_0110);
+        chk("DAR0 end",  u_dut.u_dmac.u_ch0.dar, 32'h0000_0250);
+        chk_true("DACK0 windows observed",  dackw_cnt > 0);
+        chk("DACK window inside CS0",       dack_naked[31:0], 32'd0);
+        chk("AM=0: no DACK on write cycles", dack_on_wr[31:0], 32'd0);
+        chk_true("DRAK0 pulses (RL=0: low)", drak0_lo > 0);
+        end_test;
+    end
+endtask
+
+task automatic test_dmac_dreq_edge_burst;
+    integer idx, sent, c;
+    begin
+        begin_test("DREQ0 edge burst: one edge runs to DMATCR=0 (fig 11.21), AM=1/AL=1 DACK, RL=1 DRAK");
+        eidx = 0;
+        emit_wreg_w(32'hA400_0106, 16'hA080);        // PDCR fn grant
+        emit_poke_l(32'hA000_0100, 32'hE0E0_0001);
+        emit_poke_l(32'hA000_0104, 32'hE0E0_0002);
+        emit_poke_l(32'hA000_0108, 32'hE0E0_0003);
+        emit_poke_l(32'hA000_010C, 32'hE0E0_0004);
+        emit_poke_l(32'hA400_0020, 32'h0000_0100);   // SAR0
+        emit_poke_l(32'hA400_0024, 32'h0000_0240);   // DAR0
+        emit_poke_l(32'hA400_0028, 32'h0000_0004);   // DMATCR0 = 4
+        emit_poke_l(32'hA400_002C, 32'h0007_5071);   // CHCR0: RL AM AL, DS=1 edge, burst
+        emit_wreg_w(32'hA400_0060, 16'h0001);        // DMAOR: DME
+        emit_sentinel_loop(eidx, sent);
+        do_reset;
+        ptd_pin[4] = 1'b1;
+        c = 0;
+        while(!u_dut.u_dmac.dme && c < 30000) begin @(posedge clk); c = c + 1; end
+        run_cycles(8);
+        dackmon_clear; dackmon_en = 1'b1;
+        ptd_pin[4] = 1'b0;                           //ONE falling edge...
+        run_cycles(16);
+        ptd_pin[4] = 1'b1;                           //...negated again mid-run
+        c = 0;
+        while(!u_dut.u_dmac.u_ch0.te && c < 30000) begin @(posedge clk); c = c + 1; end
+        run_cycles(20);
+        dackmon_en = 1'b0;
+        chk("dst[0]",                       dmem[16'h90], 32'hE0E0_0001);
+        chk("dst[3]",                       dmem[16'h93], 32'hE0E0_0004);
+        chk("DMATCR0 ran to 0 off one edge", {8'd0, u_dut.u_dmac.u_ch0.tcr}, 32'd0);
+        chk_true("DACK0 windows observed",  dackw_cnt > 0);
+        chk("DACK window inside CS0",       dack_naked[31:0], 32'd0);
+        chk("AM=1: no DACK on read cycles", dack_on_rd[31:0], 32'd0);
+        //AL=1 pad polarity: PTD5 is active-HIGH = high exactly during windows
+        chk_true("DRAK0 pulses (RL=1: high)", drak0_hi > 0 && drak0_hi < 20);
+        end_test;
+    end
+endtask
+
+task automatic test_dmac_single_addr;
+    integer idx, sent, c;
+    begin
+        begin_test("Single-address: dev->DACK->mem write w/ external drive + mem->dev latch, side masks");
+        eidx = 0;
+        emit_wreg_w(32'hA400_0106, 16'hA080);        // PDCR fn grant
+        //phase A: device -> memory (RS=0011): lone WRITE cycles, device drives D
+        emit_poke_l(32'hA400_0020, 32'h0000_0000);   // SAR0 = 0: must NOT step (mask)
+        emit_poke_l(32'hA400_0024, 32'h0000_0260);   // DAR0
+        emit_poke_l(32'hA400_0028, 32'h0000_0002);   // DMATCR0 = 2
+        emit_poke_l(32'hA400_002C, 32'h0000_5311);   // CHCR0: dm/sm inc, RS=0011, cs, long
+        emit_wreg_w(32'hA400_0060, 16'h0001);        // DMAOR: DME
+        emit_poll_te(32'hA400_002C);
+        imem[eidx] = 16'hE240; eidx = eidx + 1;              // MOV #0x40,R2      ; mailbox base
+        emit_ldrn(1, 32'hA400_0020);
+        imem[eidx] = 16'h6012; eidx = eidx + 1;              // MOV.L @R1,R0
+        imem[eidx] = 16'h2202; eidx = eidx + 1;              // mb0 = SAR0 (stayed 0)
+        emit_poke_l(32'hA400_002C, 32'h0000_0000);   // CHCR0 off (TE read-1 then write-0)
+        //phase B: memory -> device (RS=0010): lone READ cycles, device latches
+        emit_poke_l(32'hA000_0140, 32'hBEEF_00AA);
+        emit_poke_l(32'hA400_0020, 32'h0000_0140);   // SAR0
+        emit_poke_l(32'hA400_0028, 32'h0000_0001);   // DMATCR0 = 1
+        emit_poke_l(32'hA400_002C, 32'h0000_5211);   // CHCR0: dm/sm inc, RS=0010, cs, long
+        emit_poll_te(32'hA400_002C);
+        emit_sentinel_loop(eidx, sent);
+        do_reset;
+        ptd_pin[4] = 1'b1;
+        sgdev_data = 32'hFEED_0001;
+        sgdev_clr  = 1'b1;                           //latch cleared by its own writer
+        c = 0;
+        while(!u_dut.u_dmac.dme && c < 30000) begin @(posedge clk); c = c + 1; end
+        run_cycles(8);
+        sgdev_clr  = 1'b0;
+        sgdev_en   = 1'b1;
+        ptd_pin[4] = 1'b0;                           //level request through both phases
+        run_until_retire(sent, 60000);
+        ptd_pin[4] = 1'b1;
+        sgdev_en   = 1'b0;
+        chk("dev->mem [0] (device pattern)", dmem[16'h98], 32'hFEED_0001);
+        chk("dev->mem [1] (pattern +1)",     dmem[16'h99], 32'hFEED_0002);
+        chk("SAR0 frozen in dev->mem",       dmem[16'h10], 32'h0000_0000);
+        chk("mem->dev: device latched",      sgdev_latch, 32'hBEEF_00AA);
+        chk("DAR0 frozen in mem->dev",       u_dut.u_dmac.u_ch0.dar, 32'h0000_0268);
+        chk("SAR0 end (mem->dev +4)",        u_dut.u_dmac.u_ch0.sar, 32'h0000_0144);
+        end_test;
+    end
+endtask
+
+
+///////////////////////////////////////////////////////////
+//////  DMAC Specials (session 5, phase 5)
+////
+
+/*
+    16-byte units (fig 11.11), ch2 source reload (section 11.3.6), ch3
+    indirect gather (figs 11.7-11.8) and round-robin priority (figs
+    11.3-11.4). Round-robin laws come from the DMA write-order log: the
+    chip reset pins rr_head to 0, so every phase's grant sequence is a
+    static hex literal. Buffer pages: dst 0x1xx/0x2xx/0x3xx per channel
+    (= the log nibble), sources parked in the 0x0xx page.
+*/
+
+task automatic test_dmac_16byte;
+    integer idx, sent, c;
+    begin
+        begin_test("16-byte units: dual 4R->4W +16 steps, single mem->dev 4-read DACK unit");
+        //phase A: dual-direct 16-byte auto burst, 3 units = 12 longs
+        eidx = 0;
+        for(idx = 0; idx < 12; idx = idx + 1)
+            emit_poke_l(32'hA000_0100 + 32'(idx*4), 32'h16B0_0001 + 32'(idx));
+        emit_poke_l(32'hA400_0020, 32'h0000_0100);   // SAR0 (16n boundary, p.333)
+        emit_poke_l(32'hA400_0024, 32'h0000_0200);   // DAR0 (16n)
+        emit_poke_l(32'hA400_0028, 32'h0000_0003);   // DMATCR0 = 3 units (one per 16 bytes)
+        emit_poke_l(32'hA400_002C, 32'h0000_5439);   // CHCR0: inc/inc auto 16-byte burst DE
+        emit_wreg_w(32'hA400_0060, 16'h0001);        // DMAOR: DME
+        emit_poll_te(32'hA400_002C);
+        emit_sentinel_loop(eidx, sent);
+        do_reset;
+        run_until_retire(sent, 30000);
+        for(idx = 0; idx < 12; idx = idx + 1)
+            chk("16-byte dual image", dmem[16'h80 + 16'(idx)], 32'h16B0_0001 + 32'(idx));
+        chk("SAR0 end (+48)", u_dut.u_dmac.u_ch0.sar, 32'h0000_0130);
+        chk("DAR0 end (+48)", u_dut.u_dmac.u_ch0.dar, 32'h0000_0230);
+        chk("DMATCR0 end",    {8'd0, u_dut.u_dmac.u_ch0.tcr}, 32'd0);
+        //phase B: single-address mem->dev 16-byte = 4 lone DACK reads per unit
+        eidx = 0;
+        emit_wreg_w(32'hA400_0106, 16'hA080);        // PDCR: DACK/DRAK pads fn grant
+        for(idx = 0; idx < 8; idx = idx + 1)
+            emit_poke_l(32'hA000_0140 + 32'(idx*4), 32'h16B1_0001 + 32'(idx));
+        emit_poke_l(32'hA400_0020, 32'h0000_0140);   // SAR0 (16n)
+        emit_poke_l(32'hA400_0028, 32'h0000_0002);   // DMATCR0 = 2 units
+        emit_poke_l(32'hA400_002C, 32'h0000_5219);   // CHCR0: RS=0010 mem->dev, cs, 16-byte
+        emit_wreg_w(32'hA400_0060, 16'h0001);        // DMAOR: DME
+        emit_poll_te(32'hA400_002C);
+        emit_sentinel_loop(eidx, sent);
+        do_reset;
+        ptd_pin[4] = 1'b1;                           //DREQ0 negated during setup
+        c = 0;
+        while(!u_dut.u_dmac.dme && c < 30000) begin @(posedge clk); c = c + 1; end
+        run_cycles(8);
+        dackmon_clear; dackmon_en = 1'b1;
+        sgdev_en   = 1'b1;
+        ptd_pin[4] = 1'b0;                           //level request to completion
+        run_until_retire(sent, 60000);
+        ptd_pin[4] = 1'b1;
+        sgdev_en   = 1'b0;
+        dackmon_en = 1'b0;
+        chk("device latched the LAST beat",  sgdev_latch, 32'h16B1_0008);
+        chk("SAR0 end (2 x +16)", u_dut.u_dmac.u_ch0.sar, 32'h0000_0160);
+        chk("DMATCR0 end",        {8'd0, u_dut.u_dmac.u_ch0.tcr}, 32'd0);
+        chk_true("DACK windows on all 8 reads", dackw_cnt >= 8);
+        chk("DACK window inside CS0",        dack_naked[31:0], 32'd0);
+        chk("single: no DACK on write cycles", dack_on_wr[31:0], 32'd0);
+        //phase C: RAW pins - the fig 11.11 / fig 23.19 framing laws. Same
+        //single mem->dev 16-byte unit, 0-wait 32-bit area 0, one unit per
+        //sub-phase. Plain area: 4 back-to-back basic cycles, DACK re-framed
+        //per beat (4 openings x 3 cycles, T1 -> mid-T2, zero idle states).
+        //Burst ROM (A0BST=01): ONE envelope - DACK/CS0 low across all 4
+        //beats (1 opening x 15 cycles = 8 CKIO states minus the final half)
+        for(idx = 0; idx < 2; idx = idx + 1) begin
+            init_knobs;
+            clear_imem;
+            clear_dmem;
+            raw_mode = 1;
+            eidx = 0;
+            emit_wreg_w(32'hFFFF_FF66, 16'hFFF8);    // WCR2: A0W=000, 0-wait area 0
+            if(idx == 1) emit_wreg_w(32'hFFFF_FF60, 16'h0200);  // BCR1: A0BST=01
+            emit_wreg_w(32'hA400_0106, 16'hA080);    // PDCR: DACK/DRAK pads fn grant
+            emit_poke_l(32'hA400_0020, 32'h0000_0140);   // SAR0 (16n)
+            emit_poke_l(32'hA400_0028, 32'h0000_0001);   // DMATCR0 = 1 unit
+            emit_poke_l(32'hA400_002C, 32'h0000_5219);   // CHCR0: RS=0010 mem->dev, cs, 16-byte
+            emit_wreg_w(32'hA400_0060, 16'h0001);        // DMAOR: DME
+            emit_poll_te(32'hA400_002C);
+            emit_sentinel_loop(eidx, sent);
+            do_reset;
+            ptd_pin[4] = 1'b1;                           //DREQ0 negated during setup
+            c = 0;
+            while(!u_dut.u_dmac.dme && c < 60000) begin @(posedge clk); c = c + 1; end
+            run_cycles(8);
+            dackmon_clear; dackmon_en = 1'b1;
+            ptd_pin[4] = 1'b0;                           //level request to completion
+            run_until_retire(sent, 90000);
+            ptd_pin[4] = 1'b1;
+            dackmon_en = 1'b0;
+            $display("      [DACK16] %s: falls=%0d win=%0d t0=%0d t1=%0d",
+                     (idx == 0) ? "plain" : "burst", dackf_cnt, dackw_cnt, dack_t0, dack_t1);
+            chk("raw unit completed (TE path)", {8'd0, u_dut.u_dmac.u_ch0.tcr}, 32'd0);
+            chk("DACK window inside CS0", dack_naked[31:0], 32'd0);
+            if(idx == 0) begin
+                chk("plain 16-byte: DACK framed per beat (fig 11.11)", dackf_cnt[31:0], 32'd4);
+                chk("plain 16-byte: window cycles",                    dackw_cnt[31:0], 32'd12);
+            end
+            else begin
+                chk("burst ROM 16-byte: ONE DACK envelope (fig 23.19)", dackf_cnt[31:0], 32'd1);
+                chk("burst ROM 16-byte: CS0 held across the run",       dackw_cnt[31:0], 32'd15);
+            end
+            //fig 11.11 contiguity: first assertion to last release spans the
+            //unit's 8 CKIO states minus the final half - zero idle states
+            chk("16-byte unit span (no idle states)", (dack_t1 - dack_t0), 32'd15);
+        end
+        end_test;
+    end
+endtask
+
+task automatic test_dmac_ch2_reload;
+    integer idx, sent;
+    begin
+        begin_test("ch2 source reload: SAR2 returns to base every 4 transfers (fig 11.23)");
+        eidx = 0;
+        emit_poke_l(32'hA000_0100, 32'hAAAA_BBBB);   //4 source words, fetched twice
+        emit_poke_l(32'hA000_0104, 32'hCCCC_DDDD);
+        emit_poke_l(32'hA400_0040, 32'h0000_0100);   // SAR2 = reload image
+        emit_poke_l(32'hA400_0044, 32'h0000_0200);   // DAR2 increments through both rounds
+        emit_poke_l(32'hA400_0048, 32'h0000_0008);   // DMATCR2 = 8: multiple of 4 (p.373)
+        emit_poke_l(32'hA400_004C, 32'h0008_5429);   // CHCR2: RO, inc/inc auto word burst DE
+        emit_wreg_w(32'hA400_0060, 16'h0001);        // DMAOR: DME
+        emit_poll_te(32'hA400_004C);
+        emit_sentinel_loop(eidx, sent);
+        do_reset;
+        run_until_retire(sent, 30000);
+        //words SAR2+0/2/4/6, reload, then the same four again (fig 11.23)
+        chk("round 1 words [0]", dmem[16'h80], 32'hAAAA_BBBB);
+        chk("round 1 words [1]", dmem[16'h81], 32'hCCCC_DDDD);
+        chk("round 2 words [2]", dmem[16'h82], 32'hAAAA_BBBB);
+        chk("round 2 words [3]", dmem[16'h83], 32'hCCCC_DDDD);
+        chk("SAR2 end = reloaded base", u_dut.u_dmac.u_ch2.sar, 32'h0000_0100);
+        chk("DAR2 end (+16)",  u_dut.u_dmac.u_ch2.dar, 32'h0000_0210);
+        chk("DMATCR2 end",     {8'd0, u_dut.u_dmac.u_ch2.tcr}, 32'd0);
+        chk("reload 4-counter cleared by TE", {30'd0, u_dut.u_dmac.u_ch2.ro_cnt}, 32'd0);
+        end_test;
+    end
+endtask
+
+task automatic test_dmac_ch3_indirect;
+    integer idx, sent;
+    begin
+        begin_test("ch3 indirect: scattered byte gather, ptr fetch always LONG, SAR3 +4 at TS=byte");
+        eidx = 0;
+        emit_poke_l(32'hA000_0140, 32'h0000_0181);   //pointer table: three byte addresses
+        emit_poke_l(32'hA000_0144, 32'h0000_0186);   //with different lane picks [1:0]
+        emit_poke_l(32'hA000_0148, 32'h0000_018B);
+        emit_poke_l(32'hA000_0180, 32'h1122_3344);   //data pool: 0x181 -> 0x22
+        emit_poke_l(32'hA000_0184, 32'h5566_7788);   //           0x186 -> 0x77
+        emit_poke_l(32'hA000_0188, 32'h99AA_BBCC);   //           0x18B -> 0xCC
+        emit_poke_l(32'hA000_01C0, 32'h0000_0000);   //dest long cleared
+        emit_poke_l(32'hA400_0050, 32'h0000_0140);   // SAR3 = pointer table base
+        emit_poke_l(32'hA400_0054, 32'h0000_01C0);   // DAR3, byte increments
+        emit_poke_l(32'hA400_0058, 32'h0000_0003);   // DMATCR3 = 3
+        emit_poke_l(32'hA400_005C, 32'h0010_5401);   // CHCR3: DI, inc/inc auto byte cs DE
+        emit_wreg_w(32'hA400_0060, 16'h0001);        // DMAOR: DME
+        emit_poll_te(32'hA400_005C);
+        emit_sentinel_loop(eidx, sent);
+        do_reset;
+        run_until_retire(sent, 30000);
+        //a byte-size ptr fetch would read garbage addresses: correctness of the
+        //gathered bytes proves the pointer read is LONG regardless of TS
+        chk("gathered bytes at DAR3",  dmem[16'h70], 32'h2277_CC00);
+        chk("SAR3 end (3 x +4 at TS=byte, p.339)", u_dut.u_dmac.u_ch3.sar, 32'h0000_014C);
+        chk("DAR3 end (+3 bytes)", u_dut.u_dmac.u_ch3.dar, 32'h0000_01C3);
+        chk("DMATCR3 end",         {8'd0, u_dut.u_dmac.u_ch3.tcr}, 32'd0);
+        end_test;
+    end
+endtask
+
+task automatic test_dmac_round_robin;
+    integer idx, sent;
+    begin
+        begin_test("Round-robin PR=11: burst pair alternates, 3-channel rotation law (figs 11.3-11.4)");
+        //phase A: two burst auto channels, 4 units each - RR breaks the burst
+        //into alternating units (fig 11.14 note: the bus still never returns
+        //to the CPU while a burst channel is requesting)
+        eidx = 0;
+        for(idx = 0; idx < 4; idx = idx + 1)
+            emit_poke_l(32'hA000_0080 + 32'(idx*4), 32'hD0D0_0001 + 32'(idx));
+        for(idx = 0; idx < 4; idx = idx + 1)
+            emit_poke_l(32'hA000_00C0 + 32'(idx*4), 32'hD1D1_0001 + 32'(idx));
+        emit_poke_l(32'hA400_0020, 32'h0000_0080);   // SAR0
+        emit_poke_l(32'hA400_0024, 32'h0000_0100);   // DAR0: log page 1
+        emit_poke_l(32'hA400_0028, 32'h0000_0004);   // DMATCR0 = 4
+        emit_poke_l(32'hA400_002C, 32'h0000_5431);   // CHCR0: inc/inc auto long BURST DE
+        emit_poke_l(32'hA400_0030, 32'h0000_00C0);   // SAR1
+        emit_poke_l(32'hA400_0034, 32'h0000_0200);   // DAR1: log page 2
+        emit_poke_l(32'hA400_0038, 32'h0000_0004);   // DMATCR1 = 4
+        emit_poke_l(32'hA400_003C, 32'h0000_5431);   // CHCR1: same
+        emit_wreg_w(32'hA400_0060, 16'h0301);        // DMAOR: PR=11 round-robin + DME
+        emit_poll_te(32'hA400_002C);
+        emit_poll_te(32'hA400_003C);
+        emit_sentinel_loop(eidx, sent);
+        do_reset;
+        dmaw_clr = 1'b1;                             //reset pins rr_head to 0
+        run_cycles(4);
+        dmaw_clr = 1'b0;
+        run_until_retire(sent, 60000);
+        chk("burst pair alternates 0/1", dmaw_log[31:0], 32'h1212_1212);
+        chk("8 write beats logged",      dmaw_cnt[31:0], 32'd8);
+        chk("ch0 image [3]", dmem[16'h43], 32'hD0D0_0004);
+        chk("ch1 image [3]", dmem[16'h83], 32'hD1D1_0004);
+        //phase B: fig 11.3 rotation - counts 1/2/3 on ch0/1/2 cycle-steal
+        //from reset order 0>1>2>3: serve 0,1,2 then 1,2 then 2 = 1,2,3,2,3,3
+        eidx = 0;
+        emit_poke_l(32'hA000_0088, 32'hE0E0_0001);   //ch0 source (1 long)
+        emit_poke_l(32'hA000_00C8, 32'hE1E1_0001);   //ch1 source (2 longs)
+        emit_poke_l(32'hA000_00CC, 32'hE1E1_0002);
+        emit_poke_l(32'hA000_00E0, 32'hE2E2_0001);   //ch2 source (3 longs)
+        emit_poke_l(32'hA000_00E4, 32'hE2E2_0002);
+        emit_poke_l(32'hA000_00E8, 32'hE2E2_0003);
+        emit_poke_l(32'hA400_0020, 32'h0000_0088);   // SAR0
+        emit_poke_l(32'hA400_0024, 32'h0000_0100);   // DAR0: page 1
+        emit_poke_l(32'hA400_0028, 32'h0000_0001);   // DMATCR0 = 1
+        emit_poke_l(32'hA400_002C, 32'h0000_5411);   // CHCR0: inc/inc auto long cs DE
+        emit_poke_l(32'hA400_0030, 32'h0000_00C8);   // SAR1
+        emit_poke_l(32'hA400_0034, 32'h0000_0200);   // DAR1: page 2
+        emit_poke_l(32'hA400_0038, 32'h0000_0002);   // DMATCR1 = 2
+        emit_poke_l(32'hA400_003C, 32'h0000_5411);
+        emit_poke_l(32'hA400_0040, 32'h0000_00E0);   // SAR2
+        emit_poke_l(32'hA400_0044, 32'h0000_0300);   // DAR2: page 3
+        emit_poke_l(32'hA400_0048, 32'h0000_0003);   // DMATCR2 = 3
+        emit_poke_l(32'hA400_004C, 32'h0000_5411);
+        emit_wreg_w(32'hA400_0060, 16'h0301);        // DMAOR: PR=11 + DME (starts all)
+        emit_poll_te(32'hA400_002C);
+        emit_poll_te(32'hA400_003C);
+        emit_poll_te(32'hA400_004C);
+        emit_sentinel_loop(eidx, sent);
+        do_reset;
+        dmaw_clr = 1'b1;
+        run_cycles(4);
+        dmaw_clr = 1'b0;
+        run_until_retire(sent, 60000);
+        chk("rotation law 1,2,3,2,3,3", {8'd0, dmaw_log[23:0]}, 32'h0012_3233);
+        chk("6 write beats logged",     dmaw_cnt[31:0], 32'd6);
+        chk("ch2 image [0]", dmem[16'hC0], 32'hE2E2_0001);
+        chk("ch2 image [2]", dmem[16'hC2], 32'hE2E2_0003);
+        end_test;
+    end
+endtask
+
+
+///////////////////////////////////////////////////////////
+//////  DMAC Aborts + Hardening (session 5, phase 6)
+////
+
+/*
+    NMIF (INTC NMI edge -> DMAOR, 11.6 note 3 + p.375 resume protocol),
+    AE (alignment at grant + bus fault in flight, p.343), a randomized
+    legal-config differential against a tb golden model under random
+    bus latency, and BREQ cutting a burst at the bus-cycle tier.
+*/
+
+task automatic test_dmac_nmi_abort;
+    integer idx, sent, c;
+    begin
+        begin_test("NMI->NMIF: sets while DMAC idle (11.6 note 3), aborts a burst w/o TE, resumes");
+        //phase A: DMAC fully idle AND the CPU vector blocked (reset SR.BL=1
+        //is left in place) - the NMI edge must still set NMIF, proving the
+        //hook is independent of both the engine and the CPU accept
+        eidx = 0;
+        emit_ldrn(1, 32'hA400_0060);                 // DMAOR
+        imem[eidx] = 16'h6011; eidx = eidx + 1;              // MOV.W @R1,R0
+        imem[eidx] = 16'hC802; eidx = eidx + 1;              // TST   #2,R0       ; T = !NMIF
+        imem[eidx] = 16'h89FC; eidx = eidx + 1;              // BT    .-2 (poll)
+        imem[eidx] = 16'hE240; eidx = eidx + 1;              // MOV   #0x40,R2
+        imem[eidx] = 16'h6011; eidx = eidx + 1;              // MOV.W @R1,R0
+        imem[eidx] = 16'h1203; eidx = eidx + 1;              // mb3 = DMAOR (NMIF, DME=0)
+        imem[eidx] = 16'hE000; eidx = eidx + 1;              // MOV   #0,R0
+        imem[eidx] = 16'h2101; eidx = eidx + 1;              // MOV.W R0,@R1      ; write-0 clear
+        imem[eidx] = 16'h6011; eidx = eidx + 1;              // MOV.W @R1,R0
+        imem[eidx] = 16'h1204; eidx = eidx + 1;              // mb4 = cleared readback
+        emit_sentinel_loop(eidx, sent);
+        do_reset;
+        nmi_pin = 1'b1;                              //pre-charge for the falling edge
+        run_cycles(400);
+        nmi_pin = 1'b0;                              //NMI while the DMAC is idle
+        run_until_retire(sent, 30000);
+        chk("NMIF set while idle",          dmem[16'h13], 32'h0000_0002);
+        chk("NMIF write-0 cleared",         dmem[16'h14], 32'h0000_0000);
+        chk("BL held the CPU out entirely", entry_count, 32'd0);
+        //phase B: NMI mid-burst - all channels suspend at the unit boundary
+        //(registers stay stepped, TE unset); handler clears NMIF -> resume
+        eidx = 0;
+        emit_sr_imask(eidx, 4'h0);
+        for(idx = 0; idx < 16; idx = idx + 1)
+            emit_poke_l(32'hA000_0100 + 32'(idx*4), 32'hB6B6_0001 + 32'(idx));
+        emit_poke_l(32'hA400_0020, 32'h0000_0100);   // SAR0
+        emit_poke_l(32'hA400_0024, 32'h0000_0200);   // DAR0
+        emit_poke_l(32'hA400_0028, 32'h0000_0010);   // DMATCR0 = 16
+        emit_poke_l(32'hA400_002C, 32'h0000_5431);   // CHCR0: inc/inc auto long BURST DE
+        emit_wreg_w(32'hA400_0060, 16'h0001);        // DMAOR: DME
+        emit_poll_te(32'hA400_002C);
+        emit_sentinel_loop(eidx, sent);
+        //dedicated handler: mb0 = INTEVT2, mb1 = DMAOR (NMIF|DME), clear NMIF
+        idx = 'h300;
+        imem[idx] = 16'hE240; idx = idx + 1;              // MOV   #0x40,R2
+        emit_a4_base(idx, 3);                             // R3 = 0xA4000000
+        imem[idx] = 16'h6432; idx = idx + 1;              // MOV.L @R3,R4      ; INTEVT2
+        imem[idx] = 16'h2242; idx = idx + 1;              // mb0
+        imem[idx] = 16'h6033; idx = idx + 1;              // MOV   R3,R0
+        imem[idx] = 16'hCB60; idx = idx + 1;              // OR    #0x60,R0    ; DMAOR
+        imem[idx] = 16'h6103; idx = idx + 1;              // MOV   R0,R1
+        imem[idx] = 16'h6011; idx = idx + 1;              // MOV.W @R1,R0
+        imem[idx] = 16'h1201; idx = idx + 1;              // mb1 = DMAOR (0x0003)
+        imem[idx] = 16'hE001; idx = idx + 1;              // MOV   #1,R0
+        imem[idx] = 16'h2101; idx = idx + 1;              // DMAOR = 1: NMIF clear, DME kept
+        for(c = 0; c < 8; c = c + 1) begin
+            imem[idx] = 16'h0009; idx = idx + 1;          // grace NOPs
+        end
+        imem[idx] = 16'h002B; idx = idx + 1;              // RTE
+        imem[idx] = 16'h0009; idx = idx + 1;              // NOP (delay slot)
+        do_reset;
+        c = 0;                                       //config lands, burst begins...
+        while(u_dut.u_dmac.u_ch0.tcr != 24'd16 && c < 30000) begin @(posedge clk); c = c + 1; end
+        c = 0;
+        while(u_dut.u_dmac.u_ch0.tcr > 24'd10 && c < 30000) begin @(posedge clk); c = c + 1; end
+        nmi_pin = 1'b1;                              //...NMI lands mid-count
+        run_cycles(8);
+        nmi_pin = 1'b0;
+        run_until_retire(sent, 60000);
+        chk("handler INTEVT2 = 0x1C0",      dmem[16'h10], 32'h0000_01C0);
+        chk("DMAOR in handler: NMIF|DME",   dmem[16'h11], 32'h0000_0003);
+        chk("resumed image [0]",            dmem[16'h80], 32'hB6B6_0001);
+        chk("resumed image [15]",           dmem[16'h8F], 32'hB6B6_0010);
+        chk("SAR0 end", u_dut.u_dmac.u_ch0.sar, 32'h0000_0140);
+        chk("DAR0 end", u_dut.u_dmac.u_ch0.dar, 32'h0000_0240);
+        chk("DMATCR0 end", {8'd0, u_dut.u_dmac.u_ch0.tcr}, 32'd0);
+        chk_true("TE set only at true completion", u_dut.u_dmac.u_ch0.te === 1'b1);
+        end_test;
+    end
+endtask
+
+task automatic test_dmac_addr_error;
+    integer idx, sent;
+    begin
+        begin_test("AE: misaligned SAR at grant (re-arms until fixed) + bus fault abandons in flight");
+        //phase A: long transfer with SAR = 4n+2 - AE before any bus cycle
+        eidx = 0;
+        emit_poke_l(32'hA000_0100, 32'hAE00_0001);   //src seed (used after the fix)
+        emit_poke_l(32'hA000_0104, 32'hAE00_0002);
+        emit_poke_l(32'hA400_0030, 32'h0000_0102);   // SAR1: misaligned for long
+        emit_poke_l(32'hA400_0034, 32'h0000_0200);   // DAR1
+        emit_poke_l(32'hA400_0038, 32'h0000_0002);   // DMATCR1 = 2
+        emit_poke_l(32'hA400_003C, 32'h0000_5411);   // CHCR1: inc/inc auto long cs DE
+        emit_wreg_w(32'hA400_0060, 16'h0001);        // DMAOR: DME
+        emit_ldrn(1, 32'hA400_0060);
+        imem[eidx] = 16'h6011; eidx = eidx + 1;              // MOV.W @R1,R0
+        imem[eidx] = 16'hC804; eidx = eidx + 1;              // TST   #4,R0       ; T = !AE
+        imem[eidx] = 16'h89FC; eidx = eidx + 1;              // BT    .-2 (poll AE)
+        imem[eidx] = 16'hE240; eidx = eidx + 1;              // MOV   #0x40,R2
+        imem[eidx] = 16'h6011; eidx = eidx + 1;              // MOV.W @R1,R0
+        imem[eidx] = 16'h2202; eidx = eidx + 1;              // mb0 = DMAOR (AE|DME)
+        emit_ldrn(1, 32'hA400_0038);
+        imem[eidx] = 16'h6012; eidx = eidx + 1;              // MOV.L @R1,R0
+        imem[eidx] = 16'h1201; eidx = eidx + 1;              // mb1 = DMATCR1 untouched
+        emit_wreg_w(32'hA400_0060, 16'h0001);        // clear AE, config still bad...
+        emit_ldrn(1, 32'hA400_0060);
+        imem[eidx] = 16'h6011; eidx = eidx + 1;              // MOV.W @R1,R0
+        imem[eidx] = 16'hC804; eidx = eidx + 1;              // TST   #4,R0
+        imem[eidx] = 16'h89FC; eidx = eidx + 1;              // BT    .-2 (...AE re-arms)
+        imem[eidx] = 16'h6011; eidx = eidx + 1;              // MOV.W @R1,R0
+        imem[eidx] = 16'h1202; eidx = eidx + 1;              // mb2 = DMAOR (AE|DME again)
+        emit_poke_l(32'hA400_003C, 32'h0000_0000);   // fix: DE off first
+        emit_poke_l(32'hA400_0030, 32'h0000_0100);   // SAR1 aligned
+        emit_poke_l(32'hA400_003C, 32'h0000_5411);   // DE on
+        emit_wreg_w(32'hA400_0060, 16'h0001);        // AE clear LAST (11.6 note 6)
+        emit_poll_te(32'hA400_003C);
+        emit_ldrn(1, 32'hA400_0030);
+        imem[eidx] = 16'h6012; eidx = eidx + 1;              // MOV.L @R1,R0
+        imem[eidx] = 16'h1203; eidx = eidx + 1;              // mb3 = SAR1 end
+        emit_sentinel_loop(eidx, sent);
+        do_reset;
+        run_until_retire(sent, 60000);
+        chk("AE set, no transfer ran",      dmem[16'h10], 32'h0000_0005);
+        chk("DMATCR1 untouched under AE",   dmem[16'h11], 32'h0000_0002);
+        chk("AE re-arms while config bad",  dmem[16'h12], 32'h0000_0005);
+        chk("SAR1 end after fix",           dmem[16'h13], 32'h0000_0108);
+        chk("post-fix image [0]",           dmem[16'h80], 32'hAE00_0001);
+        chk("post-fix image [1]",           dmem[16'h81], 32'hAE00_0002);
+        //phase B: aligned addresses, but the bus faults the read - the unit
+        //is abandoned in flight: no write, no register step, TE unset
+        eidx = 0;
+        emit_poke_l(32'hA000_0280, 32'hDEAD_BEEF);   //dst sentinel: must survive
+        emit_poke_l(32'hA400_0020, 32'h0000_0180);   // SAR0 = the faulted word
+        emit_poke_l(32'hA400_0024, 32'h0000_0280);   // DAR0
+        emit_poke_l(32'hA400_0028, 32'h0000_0002);   // DMATCR0 = 2
+        emit_poke_l(32'hA400_002C, 32'h0000_5411);   // CHCR0: inc/inc auto long cs DE
+        emit_wreg_w(32'hA400_0060, 16'h0001);        // DMAOR: DME
+        emit_ldrn(1, 32'hA400_0060);
+        imem[eidx] = 16'h6011; eidx = eidx + 1;              // MOV.W @R1,R0
+        imem[eidx] = 16'hC804; eidx = eidx + 1;              // TST   #4,R0
+        imem[eidx] = 16'h89FC; eidx = eidx + 1;              // BT    .-2 (poll AE)
+        imem[eidx] = 16'hE240; eidx = eidx + 1;              // MOV   #0x40,R2
+        imem[eidx] = 16'h6011; eidx = eidx + 1;              // MOV.W @R1,R0
+        imem[eidx] = 16'h2202; eidx = eidx + 1;              // mb0 = DMAOR (AE|DME)
+        emit_ldrn(1, 32'hA400_0028);
+        imem[eidx] = 16'h6012; eidx = eidx + 1;              // MOV.L @R1,R0
+        imem[eidx] = 16'h1201; eidx = eidx + 1;              // mb1 = DMATCR0 (no step)
+        emit_ldrn(1, 32'hA400_0020);
+        imem[eidx] = 16'h6012; eidx = eidx + 1;              // MOV.L @R1,R0
+        imem[eidx] = 16'h1202; eidx = eidx + 1;              // mb2 = SAR0 (no step)
+        emit_poke_l(32'hA400_002C, 32'h0000_0000);   // DE off
+        emit_wreg_w(32'hA400_0060, 16'h0000);        // AE clear + DME off (leave idle)
+        emit_sentinel_loop(eidx, sent);
+        d_fault_en   = 1'b1;                         //fault the DMA read target only
+        d_fault_widx = 8'h60;                        //word 0x60 = byte address 0x180
+        do_reset;
+        run_until_retire(sent, 60000);
+        d_fault_en   = 1'b0;
+        d_fault_widx = 8'd0;
+        chk("bus fault set AE",             dmem[16'h10], 32'h0000_0005);
+        chk("DMATCR0 not stepped",          dmem[16'h11], 32'h0000_0002);
+        chk("SAR0 not stepped",             dmem[16'h12], 32'h0000_0180);
+        chk("abandoned unit wrote nothing", dmem[16'hA0], 32'hDEAD_BEEF);
+        chk_true("TE unset on AE abort",    u_dut.u_dmac.u_ch0.te === 1'b0);
+        end_test;
+    end
+endtask
+
+//big-endian lane helpers for the randomized differential's golden model
+function automatic logic [31:0] lane_get(input logic [31:0] l, input logic [1:0] a,
+                                         input logic [1:0] ts);
+    begin
+        case(ts)
+            2'd0:    lane_get = {24'd0, l[(3 - a)*8 +: 8]};
+            2'd1:    lane_get = {16'd0, a[1] ? l[15:0] : l[31:16]};
+            default: lane_get = l;
+        endcase
+    end
+endfunction
+
+function automatic logic [31:0] lane_put(input logic [31:0] old, input logic [31:0] d,
+                                         input logic [1:0] a, input logic [1:0] ts);
+    begin
+        lane_put = old;
+        case(ts)
+            2'd0:    lane_put[(3 - a)*8 +: 8] = d[7:0];
+            2'd1:    if(a[1]) lane_put[15:0] = d[15:0]; else lane_put[31:16] = d[15:0];
+            default: lane_put = d;
+        endcase
+    end
+endfunction
+
+task automatic test_dmac_random_diff;
+    integer r, i, k, sent, mism, ch, ts, sm, dm, tm, cnt, s, maxu, slot_s, slot_d;
+    logic   [31:0]  sar0, dar0, sa, da, datum, regbase;
+    logic   [31:0]  exp_dst [0:15];
+    logic   [31:0]  pool_l  [0:15];
+    begin
+        begin_test("Randomized differential: 12 legal configs vs golden model, random bus latency");
+        //seed a 16-long source pool once; every round re-snapshots it and the
+        //destination window from dmem, so rounds compose without re-seeding
+        eidx = 0;
+        for(i = 0; i < 16; i = i + 1)
+            emit_poke_l(32'hA000_0080 + 32'(i*4), $urandom);
+        emit_sentinel_loop(eidx, sent);
+        do_reset;
+        run_until_retire(sent, 30000);
+        for(r = 0; r < 12; r = r + 1) begin
+            //draw a legal config: every 4th round is 16-byte (inc/fixed only,
+            //16n addresses); dec walks start at the window's high end
+            ch = $urandom % 4;
+            ts = (r % 4 == 3) ? 3 : ($urandom % 3);
+            if(ts == 3) begin
+                sm = $urandom % 2;   dm = $urandom % 2;
+                cnt = 1 + ($urandom % 2);
+                s = 16;
+            end
+            else begin
+                sm = $urandom % 3;   dm = $urandom % 3;
+                cnt = 1 + ($urandom % 6);
+                s = 1 << ts;
+            end
+            maxu   = 64 / s;
+            slot_s = $urandom % (maxu - cnt + 1);
+            slot_d = $urandom % (maxu - cnt + 1);
+            sar0 = 32'h0000_0080 + 32'(((sm == 2) ? (slot_s + cnt - 1) : slot_s) * s);
+            dar0 = 32'h0000_0200 + 32'(((dm == 2) ? (slot_d + cnt - 1) : slot_d) * s);
+            tm = $urandom % 2;
+            d_latency = $urandom % 4;                //the invariance oracle: the golden
+                                                     //model never sees the latency
+            //golden model over tb snapshots
+            for(i = 0; i < 16; i = i + 1) pool_l[i]  = dmem[16'h20 + 16'(i)];
+            for(i = 0; i < 16; i = i + 1) exp_dst[i] = dmem[16'h80 + 16'(i)];
+            sa = sar0;  da = dar0;
+            for(i = 0; i < cnt; i = i + 1) begin
+                if(ts == 3) begin
+                    for(k = 0; k < 4; k = k + 1)
+                        exp_dst[integer'(da[5:2]) + k] = pool_l[integer'(sa[5:2]) + k];
+                end
+                else begin
+                    datum = lane_get(pool_l[sa[5:2]], sa[1:0], ts[1:0]);
+                    exp_dst[da[5:2]] = lane_put(exp_dst[da[5:2]], datum, da[1:0], ts[1:0]);
+                end
+                if(sm == 1) sa = sa + 32'(s); else if(sm == 2) sa = sa - 32'(s);
+                if(dm == 1) da = da + 32'(s); else if(dm == 2) da = da - 32'(s);
+            end
+            //program the drawn channel and run to TE
+            eidx = 0;
+            regbase = 32'hA400_0020 + 32'(ch * 16);
+            emit_poke_l(regbase + 32'd0,  sar0);
+            emit_poke_l(regbase + 32'd4,  dar0);
+            emit_poke_l(regbase + 32'd8,  32'(cnt));
+            emit_poke_l(regbase + 32'd12, (32'(dm) << 14) | (32'(sm) << 12) | 32'h0000_0400 |
+                                          (32'(tm) << 5)  | (32'(ts) << 3)  | 32'h0000_0001);
+            emit_wreg_w(32'hA400_0060, 16'h0001);    // DMAOR: DME
+            emit_poll_te(regbase + 32'd12);
+            emit_poke_l(regbase + 32'd12, 32'd0);    // DE off + TE clear for the next round
+            emit_sentinel_loop(eidx, sent);
+            do_reset;
+            run_until_retire(sent, 60000);
+            mism = 0;
+            for(i = 0; i < 16; i = i + 1)
+                if(dmem[16'h80 + 16'(i)] !== exp_dst[i]) mism = mism + 1;
+            if(mism != 0)
+                $display("      [rnd %0d] ch%0d ts%0d sm%0d dm%0d tm%0d cnt%0d sar %08x dar %08x lat %0d",
+                         r, ch, ts, sm, dm, tm, cnt, sar0, dar0, d_latency);
+            chk_true($sformatf("round %0d image (ch%0d ts%0d cnt%0d)", r, ch, ts, cnt), mism == 0);
+            chk_true($sformatf("round %0d SAR end", r), u_dut.u_dmac.ch_sar[ch] === sa);
+            chk_true($sformatf("round %0d DAR end", r), u_dut.u_dmac.ch_dar[ch] === da);
+            chk_true($sformatf("round %0d TCR end", r), u_dut.u_dmac.ch_tcr[ch] === 24'd0);
+        end
+        d_latency = 0;
+        end_test;
+    end
+endtask
+
+task automatic test_dmac_breq_cut;
+    integer idx, sent, c, saw_back;
+    begin
+        begin_test("BREQ cuts a burst: pair split at the bus-cycle tier, unit results intact");
+        eidx = 0;
+        for(idx = 0; idx < 8; idx = idx + 1)
+            emit_poke_l(32'hA000_0100 + 32'(idx*4), 32'hB4B4_0001 + 32'(idx));
+        emit_poke_l(32'hA400_0020, 32'h0000_0100);   // SAR0
+        emit_poke_l(32'hA400_0024, 32'h0000_0200);   // DAR0
+        emit_poke_l(32'hA400_0028, 32'h0000_0008);   // DMATCR0 = 8
+        emit_poke_l(32'hA400_002C, 32'h0000_5431);   // CHCR0: inc/inc auto long BURST DE
+        emit_wreg_w(32'hA400_0060, 16'h0001);        // DMAOR: DME
+        emit_poll_te(32'hA400_002C);
+        emit_sentinel_loop(eidx, sent);
+        do_reset;
+        c = 0;                                       //burst begins...
+        while(u_dut.u_dmac.u_ch0.tcr != 24'd8 && c < 30000) begin @(posedge clk); c = c + 1; end
+        c = 0;
+        while(u_dut.u_dmac.u_ch0.tcr > 24'd6 && c < 30000) begin @(posedge clk); c = c + 1; end
+        saw_back = 0;                                //...six board-bus grabs walk across it
+        for(idx = 0; idx < 6; idx = idx + 1) begin
+            breq_n = 1'b0;
+            c = 0;
+            while(back_n !== 1'b0 && c < 2000) begin @(posedge clk); c = c + 1; end
+            if(back_n === 1'b0) saw_back = saw_back + 1;
+            run_cycles(4);
+            breq_n = 1'b1;
+            run_cycles(9);                           //odd spacing: pulses walk the R/W pair
+        end
+        run_until_retire(sent, 60000);
+        chk_true("bus granted 6x during the burst", saw_back == 6);
+        for(idx = 0; idx < 8; idx = idx + 1)
+            chk("image long", dmem[16'h80 + 16'(idx)], 32'hB4B4_0001 + 32'(idx));
+        chk("SAR0 end", u_dut.u_dmac.u_ch0.sar, 32'h0000_0120);
+        chk("DAR0 end", u_dut.u_dmac.u_ch0.dar, 32'h0000_0220);
+        chk("DMATCR0 end", {8'd0, u_dut.u_dmac.u_ch0.tcr}, 32'd0);
+        end_test;
+    end
+endtask
+
+
+///////////////////////////////////////////////////////////
 //////  Main Sequence
 ////
 
@@ -4466,7 +5791,36 @@ initial begin
     test_bs_td_dqm;
     test_release_pads;
 
-    group("15. Board-bus shape monitors (whole run)");
+    group("15. DMAC register block + CMT (session 5, phase 1)");
+    test_dmac_channel_regs;
+    test_dmac_dmaor_cmt_regs;
+    test_dmac_cmt_match;
+
+    group("16. DMAC transfers: auto-request dual-direct engine (session 5, phase 3)");
+    test_dmac_auto_long;
+    test_dmac_sizes_lanes;
+    test_dmac_priority;
+    test_dmac_gating;
+    test_dmac_bus_modes;
+
+    group("17. DMAC external request + single address (session 5, phase 4)");
+    test_dmac_dreq_level_cs;
+    test_dmac_dreq_edge_burst;
+    test_dmac_single_addr;
+
+    group("18. DMAC specials: 16-byte, reload, indirect, round-robin (session 5, phase 5)");
+    test_dmac_16byte;
+    test_dmac_ch2_reload;
+    test_dmac_ch3_indirect;
+    test_dmac_round_robin;
+
+    group("19. DMAC aborts + hardening (session 5, phase 6)");
+    test_dmac_nmi_abort;
+    test_dmac_addr_error;
+    test_dmac_random_diff;
+    test_dmac_breq_cut;
+
+    group("20. Board-bus shape monitors (whole run)");
     test_bus_monitors;
 
     $display("");

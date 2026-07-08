@@ -402,13 +402,19 @@ zero bus/peripheral cone appears in any OOC top-20).
 | Bus | `addr[31:29]` | Timing | What rides it |
 |---|---|---|---|
 | **L bus** | `111` (P4) | 1-cycle R/W, zero-wait | CPU-direct control regs (CCR, exception MMIO) |
-| **I bus 1** | — | zero-wait to the BSC | the cache's master port (`I_BUS`) toward memory |
+| **I bus 1** | — | zero-wait to the BSC | two masters — the cache and the DMAC — merged by `ibus_arb` |
 | **I bus 2** | — | handshake (bridge) | CPG/WDT, INTC register file (behind the BRIDGE) |
 | **P bus** | P4 / area-1 | 2-cycle read (bridge) | TMU, RTC, I/O ports (in-BSC bridge) |
 
 Fabric glue: `ibus_splitter.sv` (86, mux-only, zero beats, `owner_q` steers the
 response), `ibus_bridge.sv` (159, IDLE→ACCESS→RESP, right-justified writes,
-lane-replicated reads), `peri_bus_if.sv` (the slim register-bus interface).
+lane-replicated reads), `peri_bus_if.sv` (the slim register-bus interface), and
+`ibus_arb.sv` (147) — the CPU/DMAC arbiter on I bus 1: one 2:1 mux with a
+**registered owner select** parked on the CPU (the `reqn_*`/addr 5 ns class stays
+one LUT level), flipping only at idle and response-done boundaries, never on an
+accept edge; `i_DMA_HOLD` from the DMAC keeps a transfer unit (and a whole burst)
+indivisible against the CPU. Zero added beats on the CPU leg — IPC parity is a
+locked law.
 
 **Bus contracts (checked suite-wide, §7):** an unaccepted D request re-presents
 identical fields every cycle until accepted or withdrawn (withdrawal = a pipeline
@@ -461,14 +467,27 @@ the port-C pads. Front-end route classes:
   10.7–10.12: a datum wider than the port walks its byte addresses low-to-high
   on `D7–D0` with WE0 only, one full bus cycle each, endian-mirrored register
   lanes (both endians decoded; bus arbitration never splits the multi-cycle
-  walk, §10.3.8). Pitch beats keep boundary sampling and strobe launch→close: silicon
-  holds RD low through a mid-burst sample (fig 23.19/23.20); HS3 runs each beat
-  as its own request, so CSn/RD re-pulse per beat instead of silicon's
-  burst-long CSn envelope (conservative — a page ROM re-selects fine). All ord
-  pin edges sit **on the 20 ns bus grid**: launch on the `ord_run` grid flop,
-  release at the T2-close boundary (`!ord_done`), never at a core handshake
-  edge; only a generic-port hsk *early* completion may release off-grid
-  (extension-path behavior, documented in the header).
+  walk, §10.3.8). **Line bursts (cache fill/drain, DMAC 16-byte units) are paced
+  by the controller itself**, not by the per-beat bus calls — a one-outstanding
+  call/return can never chain beats gap-free, so the head call opens a 4-beat
+  envelope: reads prefetch into a line buffer that the calls drain, write calls
+  queue ahead of the pins with posted acks (the 4th call completes with the
+  envelope so a unit fault stays visible). Beats chain back-to-back with **zero
+  idle states** (fig 11.11); on a BCR1 burst-ROM area, read beats 2–4 total the
+  pitch-table states, always sample WAIT, and **CSn/RD-WR/DACK stay low across
+  the whole run** with only A3–A0 stepping at the beat-launch posedges ("CS0 is
+  not negated, only the address is changed", p.304; figs 10.29/10.30, 23.19/23.20)
+  while RD re-pulses per beat mid-launch→mid-data-state; on plain areas every
+  beat is a basic cycle re-framing CSn (fig 11.11), as are all burst WRITE beats
+  (figs 10.29/10.30 notes), which additionally ignore the WAIT pin (p.304:
+  16-byte DMA writes, single-address dev→mem, cache write-back). The envelope
+  is indivisible against BREQ/refresh (silicon would split plain-area units at
+  bus-cycle boundaries, §10.3.8 — HS3 holds the run; bounded and conservative).
+  All ord pin edges sit **on the 20 ns bus grid**: launch on the `ord_run` grid
+  flop, beat chains at the close boundary, release at the last T2-close
+  (`!ord_done`), never at a core handshake edge; only a generic-port hsk *early*
+  completion may advance/release off-grid (extension-path behavior, documented
+  in the header).
 - **Generic mirror port** — a zero-beat pass-through toward the surrounding SoC's own
   controllers (fabric SDRAM ctrl / HPS DDR3); this is the IPC-parity path. All data
   rides the physical D pins; the generic port is pure address/control.
@@ -592,13 +611,16 @@ remains the critical path.
 | **TMU** | `tmu.sv` (262) | 3× 32-bit auto-reload down-counters; shared Pφ prescaler taps (P/4, /16, /64, /256); external TCLK clock (per CKEG, 2FF + edge detect); ch2 input capture (TCPR2, ICPF); underflow interrupts `TUNI0-2`/`TICPI2` → INTC (IPRA). |
 | **I/O ports / PFC** | `ioport.sv` (236) | All 12 ports (A–L, SCP) as `pcr[]`/`pdr[]` arrays with per-port capability masks (drive/pull-up), PFC mode muxing (`MD1 ? pin : (DRV & DR)`), the PGCR PTG0 quirk (p.577), the `o_PC_FN` grant vector handing port-C pads to the BSC's MCS outputs. |
 | **RTC** | `rtc.sv` (407) | §13, **two clock domains**: the `i_EXTAL2` 32.768 kHz oscillator (7-bit prescaler → RTCCLK 16.384 kHz + 256 Hz tap) and the bus domain (R64CNT, BCD calendar, alarms, periodic interrupt). CDC by tick-sync + no-reset toggles. Counters/alarms never pin-reset (Table 13.2). Feeds TMU `i_RTCCLK`/`i_RTC_TICK`. |
+| **DMAC + CMT** | `dmac.sv` (764) + `dmac_channel.sv` (195) | Full §11 4-channel DMA controller, a second I-bus-1 master that "calls the BSC like a function" (bus cycles shaped exactly as CPU accesses, p.363). Request sources: auto, the on-chip CMT (Pφ/4-64 compare-match timer, §11.4), external DREQ0/1 (CKIO-falling-edge sampling, DS level/edge, DRAK grant pulses). Units: dual-direct R→W, ch3 dual-indirect (LONG pointer fetch prologue), single-address (DACK-framed one-cycle transfers, `o_D_OE` held off for device-drive writes), byte/word/long/16-byte (4-longword gather/play with a 4×32 buffer). Fixed + round-robin priority (a single 2-bit rotation head — the p.350 rule provably keeps the order a pure rotation), re-resolved every unit boundary. ch2 source reload every 4 transfers. Aborts: NMIF from the INTC's qualified NMI edge, AE from grant-time alignment checks + in-flight bus faults; both halt all channels with TE unset. `DEI0-3` → INTC (0x800–0x860). DACK windows are CSn-framed **inside the BSC** (active-high sideband strobes; AL/RL pad polarity applied in the DMAC). 16-byte unit beats carry `req_burst`, so the BSC chains them as one gap-free run (fig 11.11; one CSn/DACK envelope on burst-ROM areas, fig 23.19; SDRAM engine line ops) and honors the p.304/§11.6-note-12 WAIT-ignore on the write runs. Deviations noted in the header: DREQ sampled every CKIO fall (not the 2-cycle one-step-ahead cadence), SDRAM-area DACK/single-address not wired. |
 
 **Real-chip pin sharing (Table 18.1):** the dedicated `i_IRQ`/`i_IRLS`/`i_PINT`
 inputs are **deleted** — interrupt sources ride the port pads
 (`i_IRQ = {SCPT7, PTH4-0}`, `i_IRLS = PTF3-0`, `i_PINT = {PTF, PTC}`); only NMI stays
 dedicated. `PTF` is shared PINT8-15/IRLS3-0, and `PTH7` mode-00 hands its pad to the
-TMU TCLK. This matches the SH7709S philosophy that peripheral function and GPIO
-multiplex on the same physical pins.
+TMU TCLK. The DMAC pins ride Port D the same way: DREQ0/1 tap `PTD4`/`PTD6` as
+inputs, DACK0/1 drive `PTD5`/`PTD7` and DRAK0/1 drive `PTD1`/`PTD0` (note the DRAK
+swap, Table 18.1) when PDCR grants mode 00. This matches the SH7709S philosophy
+that peripheral function and GPIO multiplex on the same physical pins.
 
 ---
 
@@ -610,9 +632,13 @@ final tree:
 
 | Seed | Worst multicorner slack @ 10 ns | Restricted Fmax | Top-20 headline class |
 |---|---|---|---|
-| 3 | −3.196 ns | 75.8 MHz | forward lanes → EX adder → `exma.t_data` |
-| 4 | −2.86 ns | 77.8 MHz | request front → cache accept qualifier (`acc_d_q`) |
-| 5 | −2.61 ns | **79.3 MHz** | MA-seq state → fetch-pair capture (`pair_inst`) |
+| 3 | −2.92 ns | 79.6 MHz | `bram_addr` → cache M10K address capture (request front) |
+| 4 | −3.98 ns | 71.6 MHz | `fwd_lane_b_agu` → AGU adder → cache M10K address capture |
+| 5 | −2.30 ns | **81.3 MHz** | `fwd_dep_a_agu` → AGU → exception-MMIO decode (`o_TEA`) |
+
+(Measured 2026-07-09 on the complete SoC including the full DMAC — **zero
+dmac/arb cones appear in any seed's top-20**; every headline is the same CPU
+advance-loop family as before the DMAC existed.)
 
 > **Read this as a plateau, not a ranking.** The design sits on a *flat cluster* of
 > single-cycle protected loops all within ~0.4 ns of each other; each seed's
@@ -665,7 +691,7 @@ and the three IPC laws (§1) are asserted values, not observations.
 | Bench | Scope | Tests |
 |---|---|---|
 | `cpu_core_tb` | core only (`src/cpu_core`), bus modeled in the tb | **103** |
-| `HS3_tb` | full SoC on the real pin set, vendor SDRAM/flash models | **57** |
+| `HS3_tb` | full SoC on the real pin set, vendor SDRAM/flash models | **83** |
 
 The suite is built in four layers:
 
@@ -674,7 +700,12 @@ The suite is built in four layers:
    victim drains, flush/CE semantics, LRU thrash, self-modification, the
    memory-mapped tag/data window matrix, WT-flip on dirty lines), fetch-pair laws,
    and the BSC's device-level behaviors (boot-from-flash, refresh, self-refresh,
-   `BREQ` arbitration, `i_WAIT_n`).
+   `BREQ` arbitration, `i_WAIT_n`). The DMAC's laws lock its cycle behavior the
+   same way: DREQ→grant latency, DME→TE durations per bus mode, DACK⊆CS window
+   containment, round-robin grant order (a tb write-order log turns each DMA
+   write beat's destination page into a hex-literal grant sequence), NMI/AE
+   abort-and-resume protocols, and BREQ splitting a dual-address pair at the
+   bus-cycle tier with intact results.
 2. **Collision sweeps** — an interrupt (and separately an NMI) is swept cycle-by-
    cycle across every machinery excursion: plain execution, miss/fill/drain walks,
    locked `TAS.B` pairs, the `CCR.CF` flush walk, memory-mapped array accesses,
@@ -701,7 +732,11 @@ The suite is built in four layers:
    RB=1, privileged RB=0, user mode — the latter two flip the register bank on
    every entry/RTE). The architectural end state must be identical and the handler
    count must equal the wave count. This layer subsumes the hand-built offset
-   enumeration and is the strongest regression net in the suite.
+   enumeration and is the strongest regression net in the suite. The DMAC adds a
+   randomized legal-config differential: 12 drawn configurations (channel, size
+   incl. 16-byte, inc/dec/fixed walks, bus mode, count) each run against a
+   tb-side golden model under a randomly drawn bus latency — the golden model
+   never sees the latency, so passing rounds are the latency-invariance oracle.
 
 Testbench conventions worth knowing (they encode real pitfalls): the `AFFE` guard
 word is a delayed branch, so the word after it must stay a NOP; GPRs persist across
