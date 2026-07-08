@@ -36,6 +36,8 @@ module cpg_wdt (
     output  wire            o_PCEN,         //peripheral clock (P-phi) enable, i_CEN-qualified
     output  wire            o_BCEN,         //bus clock (B-phi) enable - the SDRAM engine pace
     output  wire            o_CKIO,         //bus clock output pin (B-phi square wave)
+    output  wire            o_CKIO_PCEN,
+    output  wire            o_CKIO_NCEN,
     output  wire            o_ITI_REQ,      //WDT interval interrupt request (level = IOVF)
     output  wire            o_WDT_RST_POR_n,//watchdog reset request, RSTS=0 (16-cycle pulse)
     output  wire            o_WDT_RST_MAN_n //watchdog reset request, RSTS=1
@@ -155,6 +157,8 @@ end
 
 assign  o_BCEN = i_CEN & ckio_ph;
 assign  o_CKIO = ~ckio_ph;      //rises at the command edges (datasheet phase)
+assign  o_CKIO_PCEN = ~o_CKIO & i_CEN;
+assign  o_CKIO_NCEN =  o_CKIO & i_CEN;
 
 
 

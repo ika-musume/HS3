@@ -36,6 +36,8 @@ module HS3 #(
     input   wire            i_CLK,      //single architectural clock
     input   wire            i_CEN,      //architectural clock enable
     output  wire            o_CKIO,     //bus clock output (B-phi = core/2, p.207)
+    output  wire            o_CKIO_PCEN,
+    output  wire            o_CKIO_NCEN,
     input   wire            i_EXTAL2,   //RTC 32.768 kHz crystal pad (own clock domain)
 
     /* BSC PHYSICAL PINS - the real chip's shared external bus (table 10.1):
@@ -352,6 +354,8 @@ cpg_wdt u_cpg_wdt (
     .o_PCEN                 (pcen                                   ),
     .o_BCEN                 (bcen                                   ),
     .o_CKIO                 (o_CKIO                                 ),
+    .o_CKIO_PCEN            (o_CKIO_PCEN                            ),
+    .o_CKIO_NCEN            (o_CKIO_NCEN                            ),
     .o_ITI_REQ              (iti_req                                ),
     .o_WDT_RST_POR_n        (wdt_rst_por_n                          ),
     .o_WDT_RST_MAN_n        (wdt_rst_man_n                          )
