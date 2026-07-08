@@ -377,7 +377,10 @@ logic           mem_is_fault;
 integer         mem_wait_cnt;
 
 //I/D discriminator (test probe into the cache FSM; exact while bypass-only)
-wire            req_is_data = u_dut.u_cpu.u_cache.cur_is_data;
+//DMAC-mastered accesses are always data (the imem/dmem split is a tb
+//artifact keyed off the cache's current-access flag, which a DMA cycle
+//never updates)
+wire            req_is_data = u_dut.u_arb.own_dma || u_dut.u_cpu.u_cache.cur_is_data;
 
 assign MEM_BUS.req_ready = !mem_pending && !MEM_BUS.rsp_valid;
 
@@ -4520,6 +4523,277 @@ endtask
 
 
 ///////////////////////////////////////////////////////////
+//////  DMAC Transfers (session 5, phase 3)
+////
+
+/*
+    Auto-request dual-direct engine (section 11.3): unit = read at SAR
+    then write at DAR through the on-chip arbiter and the BSC ordinary
+    bus (dmem region). DMA source/destination addresses are PHYSICAL
+    area-0 values; the CPU seeds/verifies through P2. Mailboxes: the
+    shared DEI handler uses mb0 (INTEVT2) and mb1 (CHCR readback).
+*/
+
+//DEI handler at VBR+0x600: mb0 = INTEVT2, mb1 = CHCR readback (TE visible),
+//then CHCR <- {16'd0, clr_val} to drop the DE/IE level (write-1 keeps TE)
+task automatic emit_handler_dmac(input logic [7:0] chcr_off, input logic [15:0] clr_val);
+    integer idx, k;
+    begin
+        idx = 'h300;
+        imem[idx] = 16'hE240; idx = idx + 1;              // MOV   #0x40,R2    ; mailbox base
+        emit_a4_base(idx, 3);                             // R3 = 0xA4000000
+        imem[idx] = 16'h6432; idx = idx + 1;              // MOV.L @R3,R4      ; INTEVT2
+        imem[idx] = 16'h2242; idx = idx + 1;              // MOV.L R4,@R2      ; mb0
+        imem[idx] = 16'h6033; idx = idx + 1;              // MOV   R3,R0
+        imem[idx] = 16'hCB00 | chcr_off; idx = idx + 1;   // OR    #off,R0     ; CHCRn address
+        imem[idx] = 16'h6103; idx = idx + 1;              // MOV   R0,R1
+        imem[idx] = 16'h6512; idx = idx + 1;              // MOV.L @R1,R5
+        imem[idx] = 16'h1251; idx = idx + 1;              // MOV.L R5,@(4,R2)  ; mb1 = CHCR (TE set)
+        imem[idx] = 16'hE000 | clr_val[15:8]; idx = idx + 1; // MOV #hi,R0
+        imem[idx] = 16'h4018; idx = idx + 1;              // SHLL8 R0
+        imem[idx] = 16'hCB00 | clr_val[7:0]; idx = idx + 1;  // OR  #lo,R0
+        imem[idx] = 16'h2102; idx = idx + 1;              // MOV.L R0,@R1      ; drop DE/IE level
+        for(k = 0; k < 8; k = k + 1) begin
+            imem[idx] = 16'h0009; idx = idx + 1;          // grace NOPs (resolver settle)
+        end
+        imem[idx] = 16'h002B; idx = idx + 1;              // RTE
+        imem[idx] = 16'h0009; idx = idx + 1;              // NOP (delay slot)
+    end
+endtask
+
+//seed one longword at a P2 address (CPU store; DMA later reads it raw)
+task automatic emit_poke_l(input logic [31:0] addr, input logic [31:0] v);
+    begin
+        emit_ldrn(1, addr);
+        emit_ldr0(v);
+        imem[eidx] = 16'h2102; eidx = eidx + 1;              // MOV.L R0,@R1
+    end
+endtask
+
+//poll CHCRn (address in R1) until TE (bit 1) sets
+task automatic emit_poll_te(input logic [31:0] chcr_addr);
+    begin
+        emit_ldrn(1, chcr_addr);
+        imem[eidx] = 16'h6012; eidx = eidx + 1;              // MOV.L @R1,R0
+        imem[eidx] = 16'hC802; eidx = eidx + 1;              // TST   #2,R0       ; T = !TE
+        imem[eidx] = 16'h89FC; eidx = eidx + 1;              // BT    .-2 (poll)
+    end
+endtask
+
+task automatic test_dmac_auto_long;
+    integer idx, sent;
+    begin
+        begin_test("DMAC auto-request: 4 longs mem->mem cycle-steal, end regs, TE, DEI INTEVT2=0x800");
+        eidx = 0;
+        emit_poke_l(32'hA000_0100, 32'hC0FF_EE01);   //source block
+        emit_poke_l(32'hA000_0104, 32'hC0FF_EE02);
+        emit_poke_l(32'hA000_0108, 32'hC0FF_EE03);
+        emit_poke_l(32'hA000_010C, 32'hC0FF_EE04);
+        emit_wreg_w(32'hA400_001A, 16'hD000);        // IPRE: DMAC level 13
+        emit_poke_l(32'hA400_0020, 32'h0000_0100);   // SAR0 (physical)
+        emit_poke_l(32'hA400_0024, 32'h0000_0200);   // DAR0
+        emit_poke_l(32'hA400_0028, 32'h0000_0004);   // DMATCR0 = 4
+        emit_poke_l(32'hA400_002C, 32'h0000_5415);   // CHCR0: inc/inc auto long cs IE DE
+        emit_sr_imask(eidx, 4'h0);
+        emit_wreg_w(32'hA400_0060, 16'h0001);        // DMAOR: DME last (11.6 note 6)
+        emit_sentinel_loop(eidx, sent);
+        emit_handler_dmac(8'h2C, 16'h0000);          // mb0/mb1 + CHCR0 <- 0
+        do_reset;
+        run_until_entry_count(1, 30000);
+        run_cycles(300);
+        chk("dst[0]",                       dmem[16'h80], 32'hC0FF_EE01);
+        chk("dst[1]",                       dmem[16'h81], 32'hC0FF_EE02);
+        chk("dst[2]",                       dmem[16'h82], 32'hC0FF_EE03);
+        chk("dst[3]",                       dmem[16'h83], 32'hC0FF_EE04);
+        chk("DEI0 INTEVT2 = 0x800",         dmem[16'h10], 32'h0000_0800);
+        chk("CHCR0 in handler: TE set",     dmem[16'h11], 32'h0000_5417);
+        chk("SAR0 end",  u_dut.u_dmac.u_ch0.sar, 32'h0000_0110);
+        chk("DAR0 end",  u_dut.u_dmac.u_ch0.dar, 32'h0000_0210);
+        chk("DMATCR0 end", {8'd0, u_dut.u_dmac.u_ch0.tcr}, 32'h0000_0000);
+        end_test;
+    end
+endtask
+
+task automatic test_dmac_sizes_lanes;
+    integer idx, sent;
+    begin
+        begin_test("DMAC sizes/lanes: byte inc->dec scramble + word dec->fixed, end registers");
+        eidx = 0;
+        emit_poke_l(32'hA000_0140, 32'h0123_4567);   //source bytes/words
+        emit_poke_l(32'hA000_0144, 32'h89AB_CDEF);
+        emit_poke_l(32'hA400_0030, 32'h0000_0141);   // SAR1: byte offset 1
+        emit_poke_l(32'hA400_0034, 32'h0000_01F3);   // DAR1: byte offset 3, decrementing
+        emit_poke_l(32'hA400_0038, 32'h0000_0004);   // DMATCR1 = 4 bytes
+        emit_poke_l(32'hA400_003C, 32'h0000_9401);   // CHCR1: dec/inc auto byte cs DE
+        emit_poke_l(32'hA400_0040, 32'h0000_0146);   // SAR2: word offset 2
+        emit_poke_l(32'hA400_0044, 32'h0000_01E0);   // DAR2: fixed word
+        emit_poke_l(32'hA400_0048, 32'h0000_0002);   // DMATCR2 = 2 words
+        emit_poke_l(32'hA400_004C, 32'h0000_2409);   // CHCR2: fixed/dec auto word cs DE
+        emit_wreg_w(32'hA400_0060, 16'h0001);        // DMAOR: DME (starts both)
+        emit_poll_te(32'hA400_003C);                 // wait ch1
+        emit_poll_te(32'hA400_004C);                 // wait ch2
+        imem[eidx] = 16'hE240; eidx = eidx + 1;              // MOV #0x40,R2      ; mailbox base
+        emit_ldrn(1, 32'hA400_003C);
+        imem[eidx] = 16'h6012; eidx = eidx + 1;              // MOV.L @R1,R0
+        imem[eidx] = 16'h2202; eidx = eidx + 1;              // MOV.L R0,@R2      ; mb0 = CHCR1
+        emit_ldrn(1, 32'hA400_0030);
+        imem[eidx] = 16'h6012; eidx = eidx + 1;              // MOV.L @R1,R0
+        imem[eidx] = 16'h1201; eidx = eidx + 1;              // mb1 = SAR1
+        emit_ldrn(1, 32'hA400_0034);
+        imem[eidx] = 16'h6012; eidx = eidx + 1;              // MOV.L @R1,R0
+        imem[eidx] = 16'h1202; eidx = eidx + 1;              // mb2 = DAR1
+        emit_ldrn(1, 32'hA400_0040);
+        imem[eidx] = 16'h6012; eidx = eidx + 1;              // MOV.L @R1,R0
+        imem[eidx] = 16'h1203; eidx = eidx + 1;              // mb3 = SAR2
+        emit_sentinel_loop(eidx, sent);
+        do_reset;
+        run_until_retire(sent, 30000);
+        //bytes 0x23,0x45,0x67,0x89 land at 0x1F3,0x1F2,0x1F1,0x1F0 (dec)
+        chk("byte scramble dst",            dmem[16'h7C], 32'h8967_4523);
+        //words 0xCDEF then 0x89AB both hit fixed 0x1E0 (upper lane): last wins
+        chk("word fixed-dst last wins",     dmem[16'h78], 32'h89AB_0000);
+        chk("CHCR1 TE readback",            dmem[16'h10], 32'h0000_9403);
+        chk("SAR1 end (+4 bytes)",          dmem[16'h11], 32'h0000_0145);
+        chk("DAR1 end (-4 bytes)",          dmem[16'h12], 32'h0000_01EF);
+        chk("SAR2 end (-2 words)",          dmem[16'h13], 32'h0000_0142);
+        end_test;
+    end
+endtask
+
+task automatic test_dmac_priority;
+    integer idx, sent, c;
+    begin
+        begin_test("DMAC fixed priority PR=10: ch2 strictly before ch1, DMATCR1 untouched at te2");
+        //the CPU only configures and parks in the sentinel; strict order is
+        //observed at the te2-set EDGE from the tb (a polled read is far too
+        //slow relative to a transfer unit under bus contention)
+        eidx = 0;
+        emit_poke_l(32'hA000_0100, 32'hAA00_0001);
+        emit_poke_l(32'hA000_0104, 32'hAA00_0002);
+        emit_poke_l(32'hA000_0108, 32'hAA00_0003);
+        emit_poke_l(32'hA000_010C, 32'hAA00_0004);
+        emit_poke_l(32'hA400_0040, 32'h0000_0100);   // SAR2
+        emit_poke_l(32'hA400_0044, 32'h0000_0300);   // DAR2
+        emit_poke_l(32'hA400_0048, 32'h0000_0004);   // DMATCR2 = 4
+        emit_poke_l(32'hA400_004C, 32'h0000_5411);   // CHCR2: inc/inc auto long cs DE
+        emit_poke_l(32'hA400_0030, 32'h0000_0180);   // SAR1
+        emit_poke_l(32'hA400_0034, 32'h0000_0340);   // DAR1
+        emit_poke_l(32'hA400_0038, 32'h0000_0020);   // DMATCR1 = 32
+        emit_poke_l(32'hA400_003C, 32'h0000_5411);   // CHCR1: same, lower priority at PR=10
+        emit_wreg_w(32'hA400_0060, 16'h0201);        // DMAOR: PR=10 (2>0>1>3), DME
+        emit_sentinel_loop(eidx, sent);
+        do_reset;
+        c = 0;
+        while(!u_dut.u_dmac.u_ch2.te && c < 30000) begin @(posedge clk); c = c + 1; end
+        //strict order law: ch1 has moved NOTHING when ch2's TE sets (ch1's
+        //first unit needs >=6 cycles after its first-ever grant)
+        chk("PR=10: DMATCR1 untouched at te2", {8'd0, u_dut.u_dmac.u_ch1.tcr}, 32'h0000_0020);
+        c = 0;
+        while(!u_dut.u_dmac.u_ch1.te && c < 60000) begin @(posedge clk); c = c + 1; end
+        run_cycles(50);
+        chk("ch2 image [0]",                dmem[16'hC0], 32'hAA00_0001);
+        chk("ch2 image [3]",                dmem[16'hC3], 32'hAA00_0004);
+        chk("ch1 SAR end (+128)",  u_dut.u_dmac.u_ch1.sar, 32'h0000_0200);
+        chk("ch1 DAR end (+128)",  u_dut.u_dmac.u_ch1.dar, 32'h0000_03C0);
+        chk("ch1 DMATCR end",      {8'd0, u_dut.u_dmac.u_ch1.tcr}, 32'h0000_0000);
+        end_test;
+    end
+endtask
+
+task automatic test_dmac_gating;
+    integer idx, sent;
+    begin
+        begin_test("DMAC gating: DE-clear stops without TE + TE blocks re-enable, DEI3 INTEVT2=0x860");
+        //phase A: DE-clear mid-run stops (unit completes, count freezes, no TE)
+        eidx = 0;
+        emit_poke_l(32'hA400_0020, 32'h0000_0100);   // SAR0
+        emit_poke_l(32'hA400_0024, 32'h0000_0200);   // DAR0 (clear of every checked image)
+        emit_poke_l(32'hA400_0028, 32'h0000_0040);   // DMATCR0 = 64
+        emit_poke_l(32'hA400_002C, 32'h0000_5411);   // CHCR0: inc/inc auto long cs
+        emit_wreg_w(32'hA400_0060, 16'h0001);        // DMAOR: DME (starts ch0)
+        emit_ldrn(3, 32'd12);
+        imem[eidx] = 16'h4310; eidx = eidx + 1;              // DT R3             ; brief run
+        imem[eidx] = 16'h8BFD; eidx = eidx + 1;              // BF .-1
+        emit_poke_l(32'hA400_002C, 32'h0000_5410);   // CHCR0: DE clear (in-flight unit completes)
+        imem[eidx] = 16'hE240; eidx = eidx + 1;              // MOV #0x40,R2      ; mailbox base
+        emit_ldrn(1, 32'hA400_0028);
+        imem[eidx] = 16'h6012; eidx = eidx + 1;              // MOV.L @R1,R0
+        imem[eidx] = 16'h1204; eidx = eidx + 1;              // mb4 = DMATCR0 after halt
+        emit_ldrn(3, 32'd40);
+        imem[eidx] = 16'h4310; eidx = eidx + 1;              // DT R3             ; long delay
+        imem[eidx] = 16'h8BFD; eidx = eidx + 1;              // BF .-1
+        emit_ldrn(1, 32'hA400_0028);
+        imem[eidx] = 16'h6012; eidx = eidx + 1;              // MOV.L @R1,R0
+        imem[eidx] = 16'h1205; eidx = eidx + 1;              // mb5 = DMATCR0 later (frozen)
+        emit_ldrn(1, 32'hA400_002C);
+        imem[eidx] = 16'h6012; eidx = eidx + 1;              // MOV.L @R1,R0
+        imem[eidx] = 16'h1206; eidx = eidx + 1;              // mb6 = CHCR0 (TE must be 0)
+        //phase B: ch3 completes w/ DEI (0x860); handler holds TE; DE=1 with TE=1 stays halted
+        emit_wreg_w(32'hA400_001A, 16'hD000);        // IPRE: DMAC level 13
+        emit_poke_l(32'hA400_0050, 32'h0000_0100);   // SAR3
+        emit_poke_l(32'hA400_0054, 32'h0000_01C0);   // DAR3
+        emit_poke_l(32'hA400_0058, 32'h0000_0002);   // DMATCR3 = 2
+        emit_sr_imask(eidx, 4'h0);
+        emit_poke_l(32'hA400_005C, 32'h0000_5415);   // CHCR3: IE DE (starts; DME already 1)
+        emit_poll_te(32'hA400_005C);                 // TE holds through the handler's clear
+        emit_poke_l(32'hA400_005C, 32'h0000_0403);   // DE=1 again, TE write-1 held -> no restart
+        emit_ldrn(3, 32'd40);
+        imem[eidx] = 16'h4310; eidx = eidx + 1;              // DT R3             ; settle window
+        imem[eidx] = 16'h8BFD; eidx = eidx + 1;              // BF .-1
+        emit_sentinel_loop(eidx, sent);
+        emit_handler_dmac(8'h5C, 16'h0002);          // CHCR3 <- 2: DE/IE off, TE write-1 held
+        do_reset;
+        run_until_retire(sent, 60000);
+        chk_true("DE-clear: stopped mid-count", dmem[16'h14] > 32'd0 && dmem[16'h14] < 32'd64);
+        chk("DE-clear: count frozen",       dmem[16'h15], dmem[16'h14]);
+        chk("DE-clear: TE stays 0",         dmem[16'h16], 32'h0000_5410);
+        chk("DEI3 INTEVT2 = 0x860",         dmem[16'h10], 32'h0000_0860);
+        chk("CHCR3 in handler: TE set",     dmem[16'h11], 32'h0000_5417);
+        chk("TE blocks re-enable: SAR3 froze", u_dut.u_dmac.u_ch3.sar, 32'h0000_0108);
+        chk("ch3 TE still set",             {31'd0, u_dut.u_dmac.u_ch3.te}, 32'd1);
+        end_test;
+    end
+endtask
+
+task automatic test_dmac_bus_modes;
+    integer idx, sent, c;
+    begin
+        begin_test("DMAC bus modes: DME->TE duration laws, burst locks the CPU out vs cycle-steal");
+        //phase A: cycle-steal, 8 longs, sentinel fetches interleave
+        eidx = 0;
+        emit_poke_l(32'hA400_0020, 32'h0000_0100);   // SAR0
+        emit_poke_l(32'hA400_0024, 32'h0000_0380);   // DAR0
+        emit_poke_l(32'hA400_0028, 32'h0000_0008);   // DMATCR0 = 8
+        emit_poke_l(32'hA400_002C, 32'h0000_5411);   // CHCR0: cycle-steal
+        emit_wreg_w(32'hA400_0060, 16'h0001);        // DMAOR: DME
+        emit_sentinel_loop(eidx, sent);
+        do_reset;
+        c = 0;
+        while(!u_dut.u_dmac.dme && c < 30000) begin @(posedge clk); c = c + 1; end
+        c = 0;
+        while(!u_dut.u_dmac.u_ch0.te && c < 30000) begin @(posedge clk); c = c + 1; end
+        chk("cycle-steal 8-long DME->TE law", c[31:0], 32'd94);
+        //phase B: same transfer in burst - CPU locked out, much shorter
+        clear_imem; clear_dmem;
+        eidx = 0;
+        emit_poke_l(32'hA400_0020, 32'h0000_0100);
+        emit_poke_l(32'hA400_0024, 32'h0000_0380);
+        emit_poke_l(32'hA400_0028, 32'h0000_0008);
+        emit_poke_l(32'hA400_002C, 32'h0000_5431);   // CHCR0: burst
+        emit_wreg_w(32'hA400_0060, 16'h0001);
+        emit_sentinel_loop(eidx, sent);
+        do_reset;
+        c = 0;
+        while(!u_dut.u_dmac.dme && c < 30000) begin @(posedge clk); c = c + 1; end
+        c = 0;
+        while(!u_dut.u_dmac.u_ch0.te && c < 30000) begin @(posedge clk); c = c + 1; end
+        chk("burst 8-long DME->TE law", c[31:0], 32'd66);
+        end_test;
+    end
+endtask
+
+
+///////////////////////////////////////////////////////////
 //////  Main Sequence
 ////
 
@@ -4642,7 +4916,14 @@ initial begin
     test_dmac_dmaor_cmt_regs;
     test_dmac_cmt_match;
 
-    group("16. Board-bus shape monitors (whole run)");
+    group("16. DMAC transfers: auto-request dual-direct engine (session 5, phase 3)");
+    test_dmac_auto_long;
+    test_dmac_sizes_lanes;
+    test_dmac_priority;
+    test_dmac_gating;
+    test_dmac_bus_modes;
+
+    group("17. Board-bus shape monitors (whole run)");
     test_bus_monitors;
 
     $display("");

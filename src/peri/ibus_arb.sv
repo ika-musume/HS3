@@ -57,9 +57,12 @@ logic           burst_open;
 wire            req_acc  = CORE_BUS.req_valid && CORE_BUS.req_ready;
 wire            rsp_done = CORE_BUS.rsp_valid && CORE_BUS.rsp_ready;
 
-//idle boundary: nothing outstanding, no atomic sequence open on either side.
-//back-to-back accepts keep busy high (set outranks the same-edge clear)
-wire            at_idle  = !busy && !cpu_lock_hold && !burst_open &&
+//idle boundary: nothing outstanding (or completing this very edge - every
+//BSC/bridge leg's ready is registered, so a same-edge re-accept can't race
+//the flip), no atomic sequence open on either side. Deciding at the
+//completion edge is what gives the DMAC its priority over a CPU that
+//re-requests every cycle (section 10 on-chip order: DMAC > CPU)
+wire            at_idle  = (!busy || rsp_done) && !cpu_lock_hold && !burst_open &&
                            !(own_dma && i_DMA_HOLD);
 
 always_ff @(posedge i_CLK or negedge i_RST_n) begin

@@ -3,13 +3,17 @@
 /*
     Direct memory access controller DMAC (SH7709S section 11, pp.327-387).
 
-    This block is the DMAC's register face + the on-chip compare match
+    This block is the DMAC's register face, the on-chip compare match
     timer CMT (section 11.4 - a 16-bit up-counter whose compare match is
-    a DMA request source; it has NO INTC line on the SH7709S). The
-    transfer engine (request priority, start-up control, bus interface of
-    Fig 11.1) arrives in later phases; per the manual the engine calls
-    the BSC like a function - external bus cycles are shaped by the BSC
-    "in the same way as when the CPU is the bus master" (p.363).
+    a DMA request source; it has NO INTC line on the SH7709S), and the
+    transfer engine (request priority + start-up control + bus interface
+    of Fig 11.1). The engine masters IBus_1 through the on-chip arbiter
+    and calls the BSC like a function - external bus cycles are shaped
+    by the BSC "in the same way as when the CPU is the bus master"
+    (p.363). Phase 3 scope: auto-request + CMT-request dual-direct
+    transfers, byte/word/long, cycle-steal + burst, fixed priority.
+    External DREQ/DACK (phase 4), 16-byte/reload/indirect/round-robin
+    (phase 5), NMI/AE aborts (phase 6) follow.
 
     Register window (tables 11.2 + 11.7): channel quads at 0x04000020 +
     0x10*n {SAR, DAR, DMATCR, CHCR}, DMAOR at 0x60, CMT at 0x70-76. The
@@ -40,6 +44,10 @@ module dmac (
 
     /* INTERFACES */
     IBus_2.slave            REG_BUS,        //P bus window 0x04000020-77 (behind the BSC)
+    IBus_1.master           I_BUS,          //transfer engine -> ibus_arb DMA leg
+
+    /* BUS ARBITER HOOK */
+    output  wire            o_BUS_HOLD,     //transfer-unit / burst bus hold (arb i_DMA_HOLD)
 
     /* INTERRUPT REQUESTS - levels, table 6.4 order */
     output  wire    [3:0]   o_DEI           //{DEI3, DEI2, DEI1, DEI0} = per-channel TE & IE
@@ -128,34 +136,36 @@ wire    [31:0]  ch_dar  [0:3];
 wire    [23:0]  ch_tcr  [0:3];
 wire    [31:0]  ch_chcr [0:3];
 
+logic   [3:0]   ch_upd;                     //sequencer: unit completed on channel c
+
 //feature asymmetry per pp.336-342: DREQ/DACK bits on ch0/1, reload on
-//ch2, indirect on ch3; TE set hooks arrive with the transfer engine
+//ch2, indirect on ch3; i_UPD drives each channel's iteration datapath
 dmac_channel #(.CH_ID(0), .HAS_EXT(1'b1)) u_ch0 (
     .i_RST_n(i_RST_n), .i_CLK(i_CLK), .i_CEN(i_CEN),
     .i_WR_SAR(wr_sar[0]), .i_WR_DAR(wr_dar[0]), .i_WR_TCR(wr_tcr[0]), .i_WR_CHCR(wr_chcr[0]),
     .i_WDATA(wd_lane), .i_WMASK(wm_lane),
-    .i_TE_SET(1'b0),
+    .i_UPD(ch_upd[0]),
     .o_SAR(ch_sar[0]), .o_DAR(ch_dar[0]), .o_TCR(ch_tcr[0]), .o_CHCR(ch_chcr[0])
 );
 dmac_channel #(.CH_ID(1), .HAS_EXT(1'b1)) u_ch1 (
     .i_RST_n(i_RST_n), .i_CLK(i_CLK), .i_CEN(i_CEN),
     .i_WR_SAR(wr_sar[1]), .i_WR_DAR(wr_dar[1]), .i_WR_TCR(wr_tcr[1]), .i_WR_CHCR(wr_chcr[1]),
     .i_WDATA(wd_lane), .i_WMASK(wm_lane),
-    .i_TE_SET(1'b0),
+    .i_UPD(ch_upd[1]),
     .o_SAR(ch_sar[1]), .o_DAR(ch_dar[1]), .o_TCR(ch_tcr[1]), .o_CHCR(ch_chcr[1])
 );
 dmac_channel #(.CH_ID(2), .HAS_RELOAD(1'b1)) u_ch2 (
     .i_RST_n(i_RST_n), .i_CLK(i_CLK), .i_CEN(i_CEN),
     .i_WR_SAR(wr_sar[2]), .i_WR_DAR(wr_dar[2]), .i_WR_TCR(wr_tcr[2]), .i_WR_CHCR(wr_chcr[2]),
     .i_WDATA(wd_lane), .i_WMASK(wm_lane),
-    .i_TE_SET(1'b0),
+    .i_UPD(ch_upd[2]),
     .o_SAR(ch_sar[2]), .o_DAR(ch_dar[2]), .o_TCR(ch_tcr[2]), .o_CHCR(ch_chcr[2])
 );
 dmac_channel #(.CH_ID(3), .HAS_INDIRECT(1'b1)) u_ch3 (
     .i_RST_n(i_RST_n), .i_CLK(i_CLK), .i_CEN(i_CEN),
     .i_WR_SAR(wr_sar[3]), .i_WR_DAR(wr_dar[3]), .i_WR_TCR(wr_tcr[3]), .i_WR_CHCR(wr_chcr[3]),
     .i_WDATA(wd_lane), .i_WMASK(wm_lane),
-    .i_TE_SET(1'b0),
+    .i_UPD(ch_upd[3]),
     .o_SAR(ch_sar[3]), .o_DAR(ch_dar[3]), .o_TCR(ch_tcr[3]), .o_CHCR(ch_chcr[3])
 );
 
@@ -200,6 +210,7 @@ end
 
 wire            wr_cmcnt = wr_cmt_b && (wm_lane[3] || wm_lane[2]);  //CMCNT0 = view lanes 3:2
 wire            cmt_match = cmstr_str0 && cmt_tick && (cmcnt == cmcor);
+wire            cmt_fire  = cmt_match && !wr_cmcnt; //CMF set + DMA request (fig 11.27)
 
 always_ff @(posedge i_CLK or negedge i_RST_n) begin
     if(!i_RST_n) begin
@@ -247,10 +258,186 @@ always_ff @(posedge i_CLK or negedge i_RST_n) begin
 
         //CMF: match tick sets (unless the same-edge write replaced the count),
         //else CMCSR0 write-0 clears (write-1 holds)
-        if(cmt_match && !wr_cmcnt)         cmf <= 1'b1;
+        if(cmt_fire)                       cmf <= 1'b1;
         else if(wr_cmt_a && wm_lane[0])    cmf <= cmf & wd_lane[7];
     end end
 end
+
+
+
+///////////////////////////////////////////////////////////
+//////  Transfer Engine (start-up + request priority + bus interface)
+////
+
+/*
+    One transfer unit at a time: the dual-direct pair = read at SAR then
+    write at DAR (figs 11.5/11.6). Per-edge dataflow (core clock, i_CEN):
+
+      IDLE     ch_req (pending&enable regs, ~2 lvl) -> fixed-priority win
+               (~2 lvl, p.349) -> latch grant_q/addr_q(=SAR)/sarlo_q/size_q,
+               clear a cycle-steal pending (request withdrawn at the FIRST
+               transfer, p.348), go RD_REQ
+      RD_REQ   req_valid high, addr/size straight from regs (flat cone
+               through the arb 2:1); accept -> RD_WAIT
+      RD_WAIT  rsp_valid: extract the SAR-lane datum (shift ~2 lvl),
+               replicate onto lanes, latch wdata_q/wstrb_q(DAR lane)/
+               addr_q(=DAR), go WR_REQ
+      WR_REQ   req_valid+write; accept -> WR_WAIT
+      WR_WAIT  rsp_valid (posted-write ack): ch_upd strobe (channel steps
+               SAR/DAR/DMATCR, sets TE on the last unit); burst -> IDLE
+               (priority re-resolved EVERY unit boundary: a higher-priority
+               channel preempts between units, fig 11.14, but o_BUS_HOLD
+               keeps the CPU off); cycle-steal -> GAP
+      GAP      one request-free cycle so the arb owner returns to the CPU
+               (the fig 11.12 cycle-steal boundary), then IDLE
+
+    Ending laws (p.374): enables are checked at grant only - clearing
+    DE/DME mid-unit lets the WRITE of the pair complete (law d), the
+    channel then stops with TE unset. DMAC address error / NMIF arrive
+    in phase 6; rsp_fault is ignored until then.
+*/
+
+//request sources (phase 3): auto = level while enabled (p.347); CMT = the
+//compare-match pulse latched until served (p.348). Other RS codes inert.
+logic   [3:0]   pend;                       //CMT request latch per channel
+logic   [3:0]   ch_en, ch_req, ch_tm_v, ch_rs_cmt;
+always_comb begin
+    for(int c = 0; c < 4; c++) begin
+        logic rs_auto;
+        rs_auto      = (ch_chcr[c][11:8] == 4'b0100);
+        ch_rs_cmt[c] = (ch_chcr[c][11:8] == 4'b1111);
+        //enable = DE & ~TE & DME & ~NMIF & ~AE (p.342)
+        ch_en[c]     = ch_chcr[c][0] & ~ch_chcr[c][1] & dme & ~nmif & ~ae;
+        ch_req[c]    = ch_en[c] & (rs_auto | (ch_rs_cmt[c] & pend[c]));
+        ch_tm_v[c]   = ch_chcr[c][5];       //TM: burst flag per channel
+    end
+end
+
+//fixed channel priority (p.349); PR=11 is round-robin (phase 5) - until
+//then it resolves like the reset order
+logic   [1:0]   win;
+always_comb begin
+    unique case(pr)
+        2'b01:   win = ch_req[0] ? 2'd0 : ch_req[2] ? 2'd2 : ch_req[3] ? 2'd3 : 2'd1;
+        2'b10:   win = ch_req[2] ? 2'd2 : ch_req[0] ? 2'd0 : ch_req[1] ? 2'd1 : 2'd3;
+        default: win = ch_req[0] ? 2'd0 : ch_req[1] ? 2'd1 : ch_req[2] ? 2'd2 : 2'd3;
+    endcase
+end
+wire            win_v = |ch_req;
+
+//sequencer state ("seq"): the unit pipeline above
+localparam logic [2:0] S_IDLE = 3'd0, S_RD_REQ = 3'd1, S_RD_WAIT = 3'd2,
+                       S_WR_REQ = 3'd3, S_WR_WAIT = 3'd4, S_GAP = 3'd5;
+logic   [2:0]   seq;
+logic   [1:0]   grant_q;                    //granted channel (registered mux select)
+logic   [1:0]   sarlo_q;                    //granted SAR[1:0]: read-lane pick
+logic   [1:0]   size_q;                     //granted TS size
+logic   [31:0]  addr_q;                     //read address, then write address
+logic   [31:0]  wdata_q;                    //lane-replicated write data
+logic   [3:0]   wstrb_q;                    //DAR-lane strobes
+
+//granted-channel views (4:1 muxes, registered grant_q select)
+wire    [31:0]  dar_g = ch_dar[grant_q];
+wire            tm_g  = ch_tm_v[grant_q];
+
+//read-lane extract: right-justify the SAR-addressed datum (big-endian,
+//(3-a)*8 = {~a,000}), then replicate - wstrb picks the DAR lane, so no
+//DAR-dependent shift is ever needed
+wire    [31:0]  rd_sh = I_BUS.rsp_rdata >> {~sarlo_q, 3'b000};
+logic   [31:0]  wr_rep;
+logic   [3:0]   wr_stb;
+always_comb begin
+    unique case(size_q)
+        2'd0: begin                         //byte
+            wr_rep = {4{rd_sh[7:0]}};
+            wr_stb = 4'b1000 >> dar_g[1:0];
+        end
+        2'd1: begin                         //word
+            wr_rep = {2{sarlo_q[1] ? I_BUS.rsp_rdata[15:0] : I_BUS.rsp_rdata[31:16]}};
+            wr_stb = dar_g[1] ? 4'b0011 : 4'b1100;
+        end
+        default: begin                      //longword
+            wr_rep = I_BUS.rsp_rdata;
+            wr_stb = 4'b1111;
+        end
+    endcase
+end
+
+wire            unit_done = (seq == S_WR_WAIT) && I_BUS.rsp_valid;
+
+always_ff @(posedge i_CLK or negedge i_RST_n) begin
+    if(!i_RST_n) begin
+        seq     <= S_IDLE;
+        grant_q <= 2'd0;
+        sarlo_q <= 2'd0;
+        size_q  <= 2'd0;
+        addr_q  <= 32'd0;
+        wdata_q <= 32'd0;
+        wstrb_q <= 4'd0;
+        pend    <= 4'd0;
+    end
+    else begin if(i_CEN) begin
+        unique case(seq)
+            S_IDLE: begin
+                if(win_v) begin             //start-up: latch the winner's unit
+                    grant_q <= win;
+                    addr_q  <= ch_sar[win];
+                    sarlo_q <= ch_sar[win][1:0];
+                    size_q  <= {ch_chcr[win][4], ch_chcr[win][3]};
+                    seq     <= S_RD_REQ;
+                end
+            end
+            S_RD_REQ:  if(I_BUS.req_ready) seq <= S_RD_WAIT;
+            S_RD_WAIT: begin
+                if(I_BUS.rsp_valid) begin   //buffer the datum, turn the pair around
+                    wdata_q <= wr_rep;
+                    wstrb_q <= wr_stb;
+                    addr_q  <= dar_g;
+                    seq     <= S_WR_REQ;
+                end
+            end
+            S_WR_REQ:  if(I_BUS.req_ready) seq <= S_WR_WAIT;
+            S_WR_WAIT: begin
+                if(I_BUS.rsp_valid)         //burst re-arbitrates at once (fig 11.14);
+                    seq <= tm_g ? S_IDLE : S_GAP;   //cycle-steal yields a CPU boundary
+            end
+            default: seq <= S_IDLE;         //S_GAP: one request-free cycle
+        endcase
+
+        //CMT pending: match sets (outranks the clears), a cycle-steal grant
+        //withdraws at the FIRST transfer, burst at the LAST (p.348)
+        for(int c = 0; c < 4; c++) begin
+            if(cmt_fire && ch_rs_cmt[c])                             pend[c] <= 1'b1;
+            else if(seq == S_IDLE && win_v && win == c[1:0] && !ch_tm_v[c]) pend[c] <= 1'b0;
+            else if(ch_upd[c] && ch_tcr[c] == 24'd1)                 pend[c] <= 1'b0;
+        end
+    end end
+end
+
+//unit-completion strobes into the channel iteration datapaths
+always_comb begin
+    for(int c = 0; c < 4; c++) ch_upd[c] = unit_done && (grant_q == c[1:0]);
+end
+
+//bus master drive: request fields straight from registers - one flat level
+//into the arb's 2:1 (the reqn/addr 5 ns class stays shallow)
+assign  I_BUS.req_valid   = (seq == S_RD_REQ) || (seq == S_WR_REQ);
+assign  I_BUS.req_write   = (seq == S_WR_REQ);
+assign  I_BUS.req_size    = size_q;
+assign  I_BUS.req_burst   = 1'b0;
+assign  I_BUS.req_addr    = addr_q;
+assign  I_BUS.req_wdata   = wdata_q;
+assign  I_BUS.req_wstrb   = (seq == S_WR_REQ) ? wstrb_q : 4'd0;
+assign  I_BUS.req_lock    = 1'b0;
+assign  I_BUS.req_dack    = 1'b0;           //DACK/single-address tags arrive in phase 4
+assign  I_BUS.req_dack_ch = 1'b0;
+assign  I_BUS.req_dack_al = 1'b0;
+assign  I_BUS.req_saddr   = 1'b0;
+assign  I_BUS.rsp_ready   = (seq == S_RD_WAIT) || (seq == S_WR_WAIT);
+
+//bus hold: through the unit (the R->W pair is indivisible vs the CPU,
+//fig 11.12 tier 1) and across burst units (CPU locked out, fig 11.13/11.14)
+assign  o_BUS_HOLD = ((seq != S_IDLE) && (seq != S_GAP)) || (|(ch_req & ch_tm_v));
 
 
 

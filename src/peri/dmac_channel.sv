@@ -40,8 +40,8 @@ module dmac_channel #(
     input   wire    [31:0]  i_WDATA,        //pre-aligned to register bit lanes (big-endian)
     input   wire    [3:0]   i_WMASK,        //byte-lane mask, [3] = bits 31:24
 
-    /* TRANSFER ENGINE HOOKS - tied off until the transfer phases */
-    input   wire            i_TE_SET,       //sequencer: DMATCR count completed
+    /* TRANSFER ENGINE HOOKS - the iteration datapath of fig 11.1 */
+    input   wire            i_UPD,          //sequencer: one transfer unit completed
 
     /* REGISTER READ-BACK */
     output  wire    [31:0]  o_SAR,
@@ -73,8 +73,24 @@ logic           ie, te, de;                 //interrupt enable / transfer end / 
 
 
 ///////////////////////////////////////////////////////////
-//////  Register Writes
+//////  Register Writes + Iteration Datapath
 ////
+
+/*
+    i_UPD marks one completed transfer unit (the dual R+W pair): SAR/DAR
+    step by the TS size per their SM/DM modes (fixed/inc/dec - the 11
+    code is prohibited, treated as fixed), DMATCR decrements, and TE
+    sets on the unit that brings the count to 0 (DMATCR=1 -> last;
+    DMATCR=0 programs 16M, the natural wrap gives that for free, p.335).
+    A same-edge CPU register write wins over the update (the manual
+    forbids writing a running channel's registers anyway, section 11.6);
+    the TE set outranks everything.
+*/
+
+//address step: byte/word/long -> 1/2/4 (16-byte unit arrives in phase 5)
+wire    [31:0]  step = ts[1] ? 32'd4 : ts[0] ? 32'd2 : 32'd1;
+wire    [31:0]  sar_nx = sm[1] ? sar - step : sm[0] ? sar + step : sar;
+wire    [31:0]  dar_nx = dm[1] ? dar - step : dm[0] ? dar + step : dar;
 
 always_ff @(posedge i_CLK or negedge i_RST_n) begin
     if(!i_RST_n) begin
@@ -90,6 +106,13 @@ always_ff @(posedge i_CLK or negedge i_RST_n) begin
         {ie, te, de} <= 3'd0;
     end
     else begin if(i_CEN) begin
+        //unit completion first; a same-edge bus write below overrides per lane
+        if(i_UPD) begin
+            sar <= sar_nx;
+            dar <= dar_nx;
+            tcr <= tcr - 24'd1;
+        end
+
         //byte-lane writes: a 16-bit access keeps the untouched half (p.332 note 2)
         for(int b = 0; b < 4; b++) begin
             if(i_WR_SAR && i_WMASK[b]) sar[b*8 +: 8] <= i_WDATA[b*8 +: 8];
@@ -124,8 +147,10 @@ always_ff @(posedge i_CLK or negedge i_RST_n) begin
             end
         end
 
-        //TE: hardware set outranks a same-edge write; write-1 never sets (p.341)
-        if(i_TE_SET)                     te <= 1'b1;
+        //TE: count exhaustion sets (outranks a same-edge write); write-1
+        //never sets, write-0 clears after reading 1 (p.341). NMI/AE/DE-clear
+        //endings do NOT set TE (p.374)
+        if(i_UPD && tcr == 24'd1)        te <= 1'b1;
         else if(i_WR_CHCR && i_WMASK[0]) te <= te & i_WDATA[1];
     end end
 end

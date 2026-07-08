@@ -187,21 +187,7 @@ IBus_2          PBUS_RTC();         //P bus: BSC -> rtc    (0xFFFFFEC0-DE)
 IBus_2          PBUS_PORT();        //P bus: BSC -> ioport (0x04000100-137)
 IBus_2          PBUS_DMAC();        //P bus: BSC -> dmac   (0x04000020-77)
 
-//DMAC master leg parked until the transfer engine lands (phase 3): no
-//requests, always response-ready, sideband inert
-assign  DMA_I_BUS.req_valid   = 1'b0;
-assign  DMA_I_BUS.req_write   = 1'b0;
-assign  DMA_I_BUS.req_size    = 2'd0;
-assign  DMA_I_BUS.req_burst   = 1'b0;
-assign  DMA_I_BUS.req_addr    = 32'd0;
-assign  DMA_I_BUS.req_wdata   = 32'd0;
-assign  DMA_I_BUS.req_wstrb   = 4'd0;
-assign  DMA_I_BUS.req_lock    = 1'b0;
-assign  DMA_I_BUS.req_dack    = 1'b0;
-assign  DMA_I_BUS.req_dack_ch = 1'b0;
-assign  DMA_I_BUS.req_dack_al = 1'b0;
-assign  DMA_I_BUS.req_saddr   = 1'b0;
-assign  DMA_I_BUS.rsp_ready   = 1'b1;
+wire            dmac_hold;          //DMAC transfer-unit / burst bus hold
 
 ibus_arb u_arb (
     .i_RST_n                (rst_all_n                              ),
@@ -212,7 +198,7 @@ ibus_arb u_arb (
     .DMA_BUS                (DMA_I_BUS                              ),
     .CORE_BUS               (ARB_I_BUS                              ),
 
-    .i_DMA_HOLD             (1'b0                                   )
+    .i_DMA_HOLD             (dmac_hold                              )
 );
 
 ibus_splitter u_split (
@@ -459,7 +445,9 @@ dmac u_dmac (
     .i_PCEN                 (pcen                                   ),
 
     .REG_BUS                (PBUS_DMAC                              ),
+    .I_BUS                  (DMA_I_BUS                              ),
 
+    .o_BUS_HOLD             (dmac_hold                              ),
     .o_DEI                  (dmac_dei                               )
 );
 
