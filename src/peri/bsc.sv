@@ -164,6 +164,14 @@ module bsc #(
     input   wire            i_MEM_FAULT,
     output  wire            o_MEM_RSP_READY,
 
+    /* DMAC SIDEBAND CONSUMER (section 11.3.4-11.3.5): active-high DACK
+       window strobes framed on the tagged ordinary cycle's CSn assertion
+       ("DACK is output for the same duration as CSn", p.363); the DMAC
+       applies the AL pad polarity. Single-address cycles additionally
+       tri-state the write data path (fig 11.10a). SDRAM-area DACK/single
+       cycles are NOT implemented (ordinary/burst-ROM areas only). */
+    output  wire    [1:0]   o_DACK_WIN,     //[0]=DACK0 window, [1]=DACK1 window
+
     /* REFRESH TIMER INTERRUPTS (table 6.4 REF entries) */
     output  wire            o_RCMI_REQ,     //compare match  (INTEVT 0x580)
     output  wire            o_ROVI_REQ      //count overflow (INTEVT 0x5A0)
@@ -352,6 +360,9 @@ logic           ord_write, ord_burst;
 logic   [1:0]   ord_size;
 logic   [3:0]   ord_wstrb;
 logic   [2:0]   ord_area;
+logic           ord_dack;           //DMAC sideband: frame DACK on this cycle's CSn (p.363)
+logic           ord_dack_ch;        //  which pin: 0 = DACK0, 1 = DACK1
+logic           ord_saddr;          //  single-address cycle: a write leaves D undriven (fig 11.10a)
 
 assign  o_MEM_REQ       = ord_busy ? 1'b1            :
                           (I_BUS.req_valid & ~fe_p4 & (fe_gen | I_BUS.req_ready));
@@ -612,6 +623,9 @@ always_ff @(posedge i_CLK or negedge i_RST_n) begin
         ord_run  <= 1'b0;
         ord_stb  <= 1'b0;
         ord_cs   <= 1'b0;
+        ord_dack <= 1'b0;
+        ord_dack_ch <= 1'b0;
+        ord_saddr <= 1'b0;
     end
     else begin
         if(i_CEN && fe_acc && fe_gen) begin             //request latched at the accept edge;
@@ -648,6 +662,9 @@ always_ff @(posedge i_CLK or negedge i_RST_n) begin
             ord_wstrb <= I_BUS.req_wstrb;
             ord_wdata <= I_BUS.req_wdata;
             ord_area  <= fe_area;
+            ord_dack  <= I_BUS.req_dack;    //DMAC sideband rides the cycle (p.363)
+            ord_dack_ch <= I_BUS.req_dack_ch;
+            ord_saddr <= I_BUS.req_saddr;
         end
         else if(i_CEN && fe_rsp_done && owner_q == OWN_GEN) begin
             ord_busy <= 1'b0;                           //either completion path closes it
@@ -1941,7 +1958,8 @@ assign  o_D_O     = !ord_pins ? sd_dq_o :
                     ord_w8    ? {4{ord_wdata[{ord_lane8, 3'd0} +: 8]}} :
                     ord_w16   ? {2{ord_hi16 ? ord_wdata[31:16] : ord_wdata[15:0]}} :
                     ord_wdata;
-assign  o_D_OE    = ord_pins ? ord_write      : sd_dq_oe;   //write data T1..T2 end (tWDH1)
+//single-address write: WE runs but the EXTERNAL device drives D31-0 (fig 11.10a)
+assign  o_D_OE    = ord_pins ? (ord_write && !ord_saddr) : sd_dq_oe;    //write data T1..T2 end (tWDH1)
 assign  o_BS_n    = ord_pins ? ord_bs_n       : sd_bs_n;
 assign  o_CS0_n   = ~(ord_pins && ord_cs && ord_area == 3'd0);
 assign  o_CS2_n   = ord_pins ? !(ord_cs && ord_area == 3'd2) : sd_cs2_n;
@@ -1961,6 +1979,12 @@ assign  o_WE_n    = !ord_pins ? sd_dqm :
                                                  : ~ord_wstrb[1:0]} :       //WE1/WE0 lanes
                     ~ord_wstrb;
 assign  o_RD_n    = ~(ord_pins && !ord_write && ord_stb);   //ordinary read strobe
+
+//DACK windows: exactly the tagged cycle's CSn assertion window ("DACK is
+//output for the same duration as CSn", p.363); a width-split access
+//re-frames per sub-cycle just as CSn does. Polarity applied in the DMAC.
+assign  o_DACK_WIN[0] = ord_pins && ord_cs && ord_dack && !ord_dack_ch;
+assign  o_DACK_WIN[1] = ord_pins && ord_cs && ord_dack &&  ord_dack_ch;
 assign  o_CKE     = sd_cke;
 
 endmodule

@@ -42,6 +42,8 @@ module dmac_channel #(
 
     /* TRANSFER ENGINE HOOKS - the iteration datapath of fig 11.1 */
     input   wire            i_UPD,          //sequencer: one transfer unit completed
+    input   wire    [1:0]   i_UPD_MASK,     //{DAR, SAR} step enables - single-address units
+                                            //only step the memory-side register (fig 11.10)
 
     /* REGISTER READ-BACK */
     output  wire    [31:0]  o_SAR,
@@ -108,8 +110,8 @@ always_ff @(posedge i_CLK or negedge i_RST_n) begin
     else begin if(i_CEN) begin
         //unit completion first; a same-edge bus write below overrides per lane
         if(i_UPD) begin
-            sar <= sar_nx;
-            dar <= dar_nx;
+            if(i_UPD_MASK[0]) sar <= sar_nx;
+            if(i_UPD_MASK[1]) dar <= dar_nx;
             tcr <= tcr - 24'd1;
         end
 

@@ -105,10 +105,10 @@ logic   [31:0]  req_wdata;
 logic   [3:0]   req_wstrb;
 logic           req_lock;
 /* DMAC sideband - AM (which dual-mode cycle gets DACK, p.338) is resolved by
-   the DMAC, so the BSC only ever sees "frame DACK on THIS bus cycle" */
+   the DMAC, so the BSC only ever sees "frame DACK on THIS bus cycle"; the BSC
+   returns an active-high window strobe and the DMAC applies the AL polarity */
 logic           req_dack;       //assert DACKn over this cycle's CSn window
 logic           req_dack_ch;    //DACK pin select: 0 = DACK0, 1 = DACK1
-logic           req_dack_al;    //CHCR.AL: DACK polarity, 1 = active-high
 logic           req_saddr;      //single-address mode cycle ("saddr": write = external
                                 //device drives D31-0 while WE runs, fig 11.10a)
 logic           rsp_valid;
@@ -118,14 +118,14 @@ logic           rsp_fault;
 
 modport master (
     output req_valid, req_write, req_size, req_burst, req_addr, req_wdata,
-            req_wstrb, req_lock, req_dack, req_dack_ch, req_dack_al, req_saddr,
+            req_wstrb, req_lock, req_dack, req_dack_ch, req_saddr,
             rsp_ready,
     input  req_ready, rsp_valid, rsp_rdata, rsp_fault
 );
 
 modport slave (
     input  req_valid, req_write, req_size, req_burst, req_addr, req_wdata,
-            req_wstrb, req_lock, req_dack, req_dack_ch, req_dack_al, req_saddr,
+            req_wstrb, req_lock, req_dack, req_dack_ch, req_saddr,
             rsp_ready,
     output req_ready, rsp_valid, rsp_rdata, rsp_fault
 );

@@ -58,7 +58,8 @@ logic           tclk_pin;           //-> PTH7 pad (TMU TCLK)
 logic   [7:0]   pta_pin;            //-> PTA pads (port tests)
 logic   [7:0]   ptg_pin;            //-> PTG pads (PGCR quirk test)
 wire    [7:0]   pta_o, pta_oe, pta_pu;      //port A pad ring view
-wire    [7:0]   ptd_o, ptd_oe;              //port D (read-only bit checks)
+wire    [7:0]   ptd_o, ptd_oe;              //port D (DACK/DRAK pads + bit checks)
+logic   [7:0]   ptd_pin;                    //port D pad inputs (PTD4/6 = DREQ0/1, active-low)
 wire    [7:0]   pth_o, pth_oe;              //PTH pad ring view (TCLK merge)
 
 IBus_1          MEM_BUS();       //generic-port view; tb memory model slaves it
@@ -161,7 +162,7 @@ HS3 #(
     .o_PTC_O                   (ptc_o),
     .o_PTC_OE                  (ptc_oe),
     .o_PTC_PU                  (),
-    .i_PTD_I                   (8'h00),
+    .i_PTD_I                   (ptd_pin),
     .o_PTD_O                   (ptd_o),
     .o_PTD_OE                  (ptd_oe),
     .o_PTD_PU                  (),
@@ -371,6 +372,12 @@ integer         d_latency;       //extra response-wait cycles
 logic           mem_pending;
 logic   [31:0]  mem_addr;
 logic           mem_is_data;
+logic           mem_is_sgw;     //single-address DMA write: device drives the resolved bus
+logic           mem_is_dack;    //DACK-tagged cycle (live sideband at the accept edge)
+logic           sgdev_en;       //DMAC single-address device attached to DACK0 (test knob)
+logic           sgdev_clr;      //latch clear knob (sgdev_latch has ONE writer: the model)
+logic   [31:0]  sgdev_data;     //pattern the device drives (dev->mem)
+logic   [31:0]  sgdev_latch;    //what the device captured (mem->dev)
 logic           mem_is_write;
 logic   [3:0]   mem_wstrb_q;
 logic           mem_is_fault;
@@ -645,17 +652,22 @@ always_ff @(posedge clk or negedge sys_rst_n) begin
     end
     else begin
         //a write is only taken once the BSC drives the D bus (o_D_OE) - a
-        //stalled request may be presented before its bus cycle opens
+        //stalled request may be presented before its bus cycle opens. A
+        //single-address DMA write never drives D (fig 11.10a): take it at
+        //the accept and delay the sample until the device's DACK window
         if(MEM_BUS.req_valid && MEM_BUS.req_ready && mem_owned &&
-           (!MEM_BUS.req_write || d_oe)) begin
+           (!MEM_BUS.req_write || d_oe || u_dut.BSC_I_BUS.req_saddr)) begin
             mem_pending  <= 1'b1;
             mem_addr     <= MEM_BUS.req_addr;
             mem_is_data  <= req_is_data;
             mem_is_write <= MEM_BUS.req_write;
+            mem_is_sgw   <= MEM_BUS.req_write && u_dut.BSC_I_BUS.req_saddr;
+            mem_is_dack  <= u_dut.BSC_I_BUS.req_dack;
             mem_wstrb_q  <= MEM_BUS.req_wstrb;
             if(req_is_data) begin
                 mem_is_fault <= d_fault_en && (MEM_BUS.req_addr[9:2] == d_fault_widx);
-                mem_wait_cnt <= d_latency;
+                mem_wait_cnt <= (MEM_BUS.req_write && u_dut.BSC_I_BUS.req_saddr)
+                                ? 6 : d_latency;    //wait for the grid-aligned CS window
             end
             else begin
                 mem_is_fault <= if_fault_en && (MEM_BUS.req_addr[11:1] == if_fault_widx);
@@ -666,17 +678,25 @@ always_ff @(posedge clk or negedge sys_rst_n) begin
             if(mem_wait_cnt == 0) begin
                 mem_pending       <= 1'b0;
                 MEM_BUS.rsp_valid <= 1'b1;
-                //write data sampled off the physical D bus (held bus cycle)
+                //write data sampled off the physical D bus (held bus cycle);
+                //a single-address write reads the RESOLVED bus - the external
+                //DACK device is driving, not the chip
                 if(mem_is_write && mem_is_data && !mem_is_fault) begin
-                    if(mem_wstrb_q[0]) dmem[mem_addr[9:2]][7:0]   <= d_o[7:0];
-                    if(mem_wstrb_q[1]) dmem[mem_addr[9:2]][15:8]  <= d_o[15:8];
-                    if(mem_wstrb_q[2]) dmem[mem_addr[9:2]][23:16] <= d_o[23:16];
-                    if(mem_wstrb_q[3]) dmem[mem_addr[9:2]][31:24] <= d_o[31:24];
+                    if(mem_wstrb_q[0]) dmem[mem_addr[9:2]][7:0]   <= mem_is_sgw ? d_bus[7:0]   : d_o[7:0];
+                    if(mem_wstrb_q[1]) dmem[mem_addr[9:2]][15:8]  <= mem_is_sgw ? d_bus[15:8]  : d_o[15:8];
+                    if(mem_wstrb_q[2]) dmem[mem_addr[9:2]][23:16] <= mem_is_sgw ? d_bus[23:16] : d_o[23:16];
+                    if(mem_wstrb_q[3]) dmem[mem_addr[9:2]][31:24] <= mem_is_sgw ? d_bus[31:24] : d_o[31:24];
                 end
                 MEM_BUS.rsp_rdata <= mem_is_data ? dmem[mem_addr[9:2]]
                                                  : {imem[{mem_addr[11:2], 1'b0}],
                                                     imem[{mem_addr[11:2], 1'b1}]};
                 MEM_BUS.rsp_fault <= mem_is_fault;
+                //DMAC single-address device: take a DACK-tagged read's datum
+                //at its completion (dmem reads never ride the physical D pins
+                //and early-complete before the pin window opens, so the pin-
+                //level model can't see them; single writer - see sgdev_clr)
+                if(sgdev_en && mem_is_data && !mem_is_write && mem_is_dack)
+                    sgdev_latch <= dmem[mem_addr[9:2]];
             end
             else begin
                 mem_wait_cnt <= mem_wait_cnt - 1;
@@ -685,8 +705,67 @@ always_ff @(posedge clk or negedge sys_rst_n) begin
         if(MEM_BUS.rsp_valid && MEM_BUS.rsp_ready) begin
             MEM_BUS.rsp_valid <= 1'b0;
         end
+        if(sgdev_clr) sgdev_latch <= 32'd0;     //knob clear (tasks must not write
+    end                                         //an always_ff variable directly)
+end
+
+
+///////////////////////////////////////////////////////////
+//////  DMAC External Device Model + DACK Monitor (section 11)
+////
+
+/*
+    Single-address "external device with DACK" (figs 11.9-11.10): on a
+    DACK-tagged WRITE cycle the device drives D31-0 (the chip's o_D_OE
+    stays low - fig 11.10a) and bumps its pattern at each window close;
+    on a DACK-tagged READ it latches the memory's data off the bus.
+    The monitor locks the DACK-window laws: the window sits inside the
+    CS0 assertion ("same duration as CSn", p.363) and lands on the
+    read or write cycle per AM. Counters clear when a test enables it.
+*/
+
+logic           dackmon_en;             //DACK-law counters run
+integer         dackw_cnt;              //DACK0 window cycles observed
+integer         dack_naked;             //window cycles with CS0 NEGATED = violation
+integer         dack_on_rd, dack_on_wr; //window cycles in read vs write bus cycles
+integer         drak0_lo, drak0_hi;     //DRAK0 pad low/high cycles (RL polarity proof)
+
+wire            dack0_win = u_dut.u_bsc.o_DACK_WIN[0];
+assign  d_bus = (sgdev_en && dack0_win && !rd_wr) ? sgdev_data : 32'hzzzz_zzzz;
+
+logic           dack0_z, dack0_waswr;
+always @(posedge clk) begin
+    dack0_z <= dack0_win;
+    if(dack0_win) dack0_waswr <= !rd_wr;
+    //device pattern advances as each driven (write) window closes
+    if(sgdev_en && dack0_z && !dack0_win && dack0_waswr)
+        sgdev_data <= sgdev_data + 32'd1;
+    //(the device's read-side latch lives in the memory model's completion
+    //arm: dmem reads early-complete before the pin-level DACK window opens)
+
+    if(dackmon_en) begin
+        if(dack0_win) begin
+            dackw_cnt <= dackw_cnt + 1;
+            if(cs0_n)   dack_naked <= dack_naked + 1;
+            if(rd_wr)   dack_on_rd <= dack_on_rd + 1;
+            else        dack_on_wr <= dack_on_wr + 1;
+        end
+        if(!ptd_o[1]) drak0_lo <= drak0_lo + 1;
+        if( ptd_o[1]) drak0_hi <= drak0_hi + 1;
     end
 end
+
+task automatic dackmon_clear;
+    begin
+        dackw_cnt  = 0;
+        dack_naked = 0;
+        dack_on_rd = 0;
+        dack_on_wr = 0;
+        drak0_lo   = 0;
+        drak0_hi   = 0;
+    end
+endtask
+
 
 
 ///////////////////////////////////////////////////////////
@@ -890,6 +969,10 @@ task automatic init_knobs;
         sdram_en       = 1'b1;      //Micron model populated
         md4_pin        = 1'b1;      //area 0 back to the 32-bit boot straps
         md3_pin        = 1'b1;
+        ptd_pin        = 8'h00;     //port D pads (the historic tie; DREQ tests
+        sgdev_en       = 1'b0;      //raise PTD4/6 to the negated-high idle)
+        sgdev_clr      = 1'b0;
+        dackmon_en     = 1'b0;
     end
 endtask
 
@@ -4794,6 +4877,165 @@ endtask
 
 
 ///////////////////////////////////////////////////////////
+//////  DMAC External Request + Single Address (session 5, phase 4)
+////
+
+/*
+    Section 11.3.5 laws on the pins: DREQ sampled on the CKIO falling
+    edge, DS level/edge detection, DACK framed on CSn in the AM-selected
+    cycle with AL polarity, DRAK request-accepted pulse with RL polarity,
+    burst-edge runs to DMATCR=0 from ONE edge (fig 11.21), level stop/
+    resume. Port D pads granted by PDCR mode 00 (write 0xA080: PTD5/4/1
+    to their functions). DREQ tests idle PTD4 HIGH before enabling the
+    channel (11.6 note 10: keep the pin high while setting up).
+*/
+
+task automatic test_dmac_dreq_level_cs;
+    integer idx, sent, c, frozen;
+    begin
+        begin_test("DREQ0 level cycle-steal: latency law, stop/resume, DACK=CS read window, DRAK");
+        eidx = 0;
+        emit_wreg_w(32'hA400_0106, 16'hA080);        // PDCR: PTD5/4/1/0 mode 00 (fn grant)
+        emit_poke_l(32'hA000_0100, 32'hD0D0_0001);
+        emit_poke_l(32'hA000_0104, 32'hD0D0_0002);
+        emit_poke_l(32'hA400_0020, 32'h0000_0100);   // SAR0
+        emit_poke_l(32'hA400_0024, 32'h0000_0240);   // DAR0
+        emit_poke_l(32'hA400_0028, 32'h0000_0004);   // DMATCR0 = 4
+        emit_poke_l(32'hA400_002C, 32'h0000_5011);   // CHCR0: inc/inc ext-dual DS=0 AM=0 cs DE
+        emit_wreg_w(32'hA400_0060, 16'h0001);        // DMAOR: DME
+        emit_sentinel_loop(eidx, sent);
+        do_reset;
+        ptd_pin[4] = 1'b1;                           //DREQ0 negated during setup (11.6 note 10)
+        c = 0;
+        while(!u_dut.u_dmac.dme && c < 30000) begin @(posedge clk); c = c + 1; end
+        run_cycles(8);
+        dackmon_clear; dackmon_en = 1'b1;
+        ptd_pin[4] = 1'b0;                           //request
+        c = 0;
+        while(u_dut.u_dmac.seq == 3'd0 && c < 1000) begin @(posedge clk); c = c + 1; end
+        //DREQ assert -> grant law: 5 core cycles (2FF sync + CKIO-fall sample
+        //+ request resolve); the first PIN cycle lands several CKIO later,
+        //beyond the >=3-state minimum of p.363
+        chk("DREQ->grant latency law", c[31:0], 32'd5);
+        //level stop: negate after the first unit lands; the one-step-ahead
+        //sample may admit one more unit, then the count freezes
+        c = 0;
+        while(u_dut.u_dmac.u_ch0.tcr > 24'd3 && c < 5000) begin @(posedge clk); c = c + 1; end
+        ptd_pin[4] = 1'b1;
+        run_cycles(120);
+        frozen = {8'd0, u_dut.u_dmac.u_ch0.tcr};
+        run_cycles(256);
+        chk_true("level stop: mid-count",   frozen > 0 && frozen < 4);
+        chk("level stop: count frozen",     {8'd0, u_dut.u_dmac.u_ch0.tcr}, frozen[31:0]);
+        ptd_pin[4] = 1'b0;                           //resume to completion
+        c = 0;
+        while(!u_dut.u_dmac.u_ch0.te && c < 30000) begin @(posedge clk); c = c + 1; end
+        ptd_pin[4] = 1'b1;
+        run_cycles(20);
+        dackmon_en = 1'b0;
+        chk("dst[0]",                       dmem[16'h90], 32'hD0D0_0001);
+        chk("dst[1]",                       dmem[16'h91], 32'hD0D0_0002);
+        chk("SAR0 end",  u_dut.u_dmac.u_ch0.sar, 32'h0000_0110);
+        chk("DAR0 end",  u_dut.u_dmac.u_ch0.dar, 32'h0000_0250);
+        chk_true("DACK0 windows observed",  dackw_cnt > 0);
+        chk("DACK window inside CS0",       dack_naked[31:0], 32'd0);
+        chk("AM=0: no DACK on write cycles", dack_on_wr[31:0], 32'd0);
+        chk_true("DRAK0 pulses (RL=0: low)", drak0_lo > 0);
+        end_test;
+    end
+endtask
+
+task automatic test_dmac_dreq_edge_burst;
+    integer idx, sent, c;
+    begin
+        begin_test("DREQ0 edge burst: one edge runs to DMATCR=0 (fig 11.21), AM=1/AL=1 DACK, RL=1 DRAK");
+        eidx = 0;
+        emit_wreg_w(32'hA400_0106, 16'hA080);        // PDCR fn grant
+        emit_poke_l(32'hA000_0100, 32'hE0E0_0001);
+        emit_poke_l(32'hA000_0104, 32'hE0E0_0002);
+        emit_poke_l(32'hA000_0108, 32'hE0E0_0003);
+        emit_poke_l(32'hA000_010C, 32'hE0E0_0004);
+        emit_poke_l(32'hA400_0020, 32'h0000_0100);   // SAR0
+        emit_poke_l(32'hA400_0024, 32'h0000_0240);   // DAR0
+        emit_poke_l(32'hA400_0028, 32'h0000_0004);   // DMATCR0 = 4
+        emit_poke_l(32'hA400_002C, 32'h0007_5071);   // CHCR0: RL AM AL, DS=1 edge, burst
+        emit_wreg_w(32'hA400_0060, 16'h0001);        // DMAOR: DME
+        emit_sentinel_loop(eidx, sent);
+        do_reset;
+        ptd_pin[4] = 1'b1;
+        c = 0;
+        while(!u_dut.u_dmac.dme && c < 30000) begin @(posedge clk); c = c + 1; end
+        run_cycles(8);
+        dackmon_clear; dackmon_en = 1'b1;
+        ptd_pin[4] = 1'b0;                           //ONE falling edge...
+        run_cycles(16);
+        ptd_pin[4] = 1'b1;                           //...negated again mid-run
+        c = 0;
+        while(!u_dut.u_dmac.u_ch0.te && c < 30000) begin @(posedge clk); c = c + 1; end
+        run_cycles(20);
+        dackmon_en = 1'b0;
+        chk("dst[0]",                       dmem[16'h90], 32'hE0E0_0001);
+        chk("dst[3]",                       dmem[16'h93], 32'hE0E0_0004);
+        chk("DMATCR0 ran to 0 off one edge", {8'd0, u_dut.u_dmac.u_ch0.tcr}, 32'd0);
+        chk_true("DACK0 windows observed",  dackw_cnt > 0);
+        chk("DACK window inside CS0",       dack_naked[31:0], 32'd0);
+        chk("AM=1: no DACK on read cycles", dack_on_rd[31:0], 32'd0);
+        //AL=1 pad polarity: PTD5 is active-HIGH = high exactly during windows
+        chk_true("DRAK0 pulses (RL=1: high)", drak0_hi > 0 && drak0_hi < 20);
+        end_test;
+    end
+endtask
+
+task automatic test_dmac_single_addr;
+    integer idx, sent, c;
+    begin
+        begin_test("Single-address: dev->DACK->mem write w/ external drive + mem->dev latch, side masks");
+        eidx = 0;
+        emit_wreg_w(32'hA400_0106, 16'hA080);        // PDCR fn grant
+        //phase A: device -> memory (RS=0011): lone WRITE cycles, device drives D
+        emit_poke_l(32'hA400_0020, 32'h0000_0000);   // SAR0 = 0: must NOT step (mask)
+        emit_poke_l(32'hA400_0024, 32'h0000_0260);   // DAR0
+        emit_poke_l(32'hA400_0028, 32'h0000_0002);   // DMATCR0 = 2
+        emit_poke_l(32'hA400_002C, 32'h0000_5311);   // CHCR0: dm/sm inc, RS=0011, cs, long
+        emit_wreg_w(32'hA400_0060, 16'h0001);        // DMAOR: DME
+        emit_poll_te(32'hA400_002C);
+        imem[eidx] = 16'hE240; eidx = eidx + 1;              // MOV #0x40,R2      ; mailbox base
+        emit_ldrn(1, 32'hA400_0020);
+        imem[eidx] = 16'h6012; eidx = eidx + 1;              // MOV.L @R1,R0
+        imem[eidx] = 16'h2202; eidx = eidx + 1;              // mb0 = SAR0 (stayed 0)
+        emit_poke_l(32'hA400_002C, 32'h0000_0000);   // CHCR0 off (TE read-1 then write-0)
+        //phase B: memory -> device (RS=0010): lone READ cycles, device latches
+        emit_poke_l(32'hA000_0140, 32'hBEEF_00AA);
+        emit_poke_l(32'hA400_0020, 32'h0000_0140);   // SAR0
+        emit_poke_l(32'hA400_0028, 32'h0000_0001);   // DMATCR0 = 1
+        emit_poke_l(32'hA400_002C, 32'h0000_5211);   // CHCR0: dm/sm inc, RS=0010, cs, long
+        emit_poll_te(32'hA400_002C);
+        emit_sentinel_loop(eidx, sent);
+        do_reset;
+        ptd_pin[4] = 1'b1;
+        sgdev_data = 32'hFEED_0001;
+        sgdev_clr  = 1'b1;                           //latch cleared by its own writer
+        c = 0;
+        while(!u_dut.u_dmac.dme && c < 30000) begin @(posedge clk); c = c + 1; end
+        run_cycles(8);
+        sgdev_clr  = 1'b0;
+        sgdev_en   = 1'b1;
+        ptd_pin[4] = 1'b0;                           //level request through both phases
+        run_until_retire(sent, 60000);
+        ptd_pin[4] = 1'b1;
+        sgdev_en   = 1'b0;
+        chk("dev->mem [0] (device pattern)", dmem[16'h98], 32'hFEED_0001);
+        chk("dev->mem [1] (pattern +1)",     dmem[16'h99], 32'hFEED_0002);
+        chk("SAR0 frozen in dev->mem",       dmem[16'h10], 32'h0000_0000);
+        chk("mem->dev: device latched",      sgdev_latch, 32'hBEEF_00AA);
+        chk("DAR0 frozen in mem->dev",       u_dut.u_dmac.u_ch0.dar, 32'h0000_0268);
+        chk("SAR0 end (mem->dev +4)",        u_dut.u_dmac.u_ch0.sar, 32'h0000_0144);
+        end_test;
+    end
+endtask
+
+
+///////////////////////////////////////////////////////////
 //////  Main Sequence
 ////
 
@@ -4923,7 +5165,12 @@ initial begin
     test_dmac_gating;
     test_dmac_bus_modes;
 
-    group("17. Board-bus shape monitors (whole run)");
+    group("17. DMAC external request + single address (session 5, phase 4)");
+    test_dmac_dreq_level_cs;
+    test_dmac_dreq_edge_burst;
+    test_dmac_single_addr;
+
+    group("18. Board-bus shape monitors (whole run)");
     test_bus_monitors;
 
     $display("");

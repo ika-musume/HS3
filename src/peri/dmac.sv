@@ -10,10 +10,22 @@
     of Fig 11.1). The engine masters IBus_1 through the on-chip arbiter
     and calls the BSC like a function - external bus cycles are shaped
     by the BSC "in the same way as when the CPU is the bus master"
-    (p.363). Phase 3 scope: auto-request + CMT-request dual-direct
-    transfers, byte/word/long, cycle-steal + burst, fixed priority.
-    External DREQ/DACK (phase 4), 16-byte/reload/indirect/round-robin
-    (phase 5), NMI/AE aborts (phase 6) follow.
+    (p.363). Scope: auto / CMT / external-DREQ requests, dual-direct +
+    single-address units, byte/word/long, cycle-steal + burst, fixed
+    priority, DACK/DRAK. 16-byte/reload/indirect/round-robin (phase 5)
+    and NMI/AE aborts (phase 6) follow.
+
+    External request (ch0/1, section 11.3.2): DREQ is sampled on the
+    CKIO falling edge (i_CKIO_NCEN); DS selects low-level or falling-
+    edge detection (edge needs DREQ high at the previous sample, fig
+    11.19). Cycle-steal withdraws the request at the FIRST transfer,
+    burst-edge holds it to the LAST (fig 11.21: sample once, run to
+    DMATCR=0); burst-level follows the live level per unit boundary.
+    Deviation: sampling runs every CKIO fall instead of the 2-cycle
+    one-step-ahead cadence - at least as responsive, laws locked in tb.
+    DACK rides the sideband (AM resolved here, window framed in the
+    BSC, AL pad polarity applied here); DRAK pulses one CKIO cycle at
+    the accepting grant, RL polarity (p.337).
 
     Register window (tables 11.2 + 11.7): channel quads at 0x04000020 +
     0x10*n {SAR, DAR, DMATCR, CHCR}, DMAOR at 0x60, CMT at 0x70-76. The
@@ -41,6 +53,7 @@ module dmac (
     input   wire            i_CLK,
     input   wire            i_CEN,
     input   wire            i_PCEN,         //P-phi enable (i_CEN-qualified) for the CMT prescaler
+    input   wire            i_CKIO_NCEN,    //CKIO falling-edge enable: DREQ sample phase (p.363)
 
     /* INTERFACES */
     IBus_2.slave            REG_BUS,        //P bus window 0x04000020-77 (behind the BSC)
@@ -48,6 +61,12 @@ module dmac (
 
     /* BUS ARBITER HOOK */
     output  wire            o_BUS_HOLD,     //transfer-unit / burst bus hold (arb i_DMA_HOLD)
+
+    /* DREQ/DACK/DRAK - Port D pads (table 18.1); DACK windows from the BSC */
+    input   wire    [1:0]   i_DREQ_n,       //DREQ0/1 pad levels (PTD4/PTD6, active-low)
+    input   wire    [1:0]   i_DACK_WIN,     //BSC: CSn-framed active-high DACK windows
+    output  wire    [1:0]   o_DACK,         //DACK0/1 pads (PTD5/PTD7, AL polarity)
+    output  wire    [1:0]   o_DRAK,         //DRAK0/1 pads (PTD1/PTD0, RL polarity)
 
     /* INTERRUPT REQUESTS - levels, table 6.4 order */
     output  wire    [3:0]   o_DEI           //{DEI3, DEI2, DEI1, DEI0} = per-channel TE & IE
@@ -144,28 +163,28 @@ dmac_channel #(.CH_ID(0), .HAS_EXT(1'b1)) u_ch0 (
     .i_RST_n(i_RST_n), .i_CLK(i_CLK), .i_CEN(i_CEN),
     .i_WR_SAR(wr_sar[0]), .i_WR_DAR(wr_dar[0]), .i_WR_TCR(wr_tcr[0]), .i_WR_CHCR(wr_chcr[0]),
     .i_WDATA(wd_lane), .i_WMASK(wm_lane),
-    .i_UPD(ch_upd[0]),
+    .i_UPD(ch_upd[0]), .i_UPD_MASK(upd_mask),
     .o_SAR(ch_sar[0]), .o_DAR(ch_dar[0]), .o_TCR(ch_tcr[0]), .o_CHCR(ch_chcr[0])
 );
 dmac_channel #(.CH_ID(1), .HAS_EXT(1'b1)) u_ch1 (
     .i_RST_n(i_RST_n), .i_CLK(i_CLK), .i_CEN(i_CEN),
     .i_WR_SAR(wr_sar[1]), .i_WR_DAR(wr_dar[1]), .i_WR_TCR(wr_tcr[1]), .i_WR_CHCR(wr_chcr[1]),
     .i_WDATA(wd_lane), .i_WMASK(wm_lane),
-    .i_UPD(ch_upd[1]),
+    .i_UPD(ch_upd[1]), .i_UPD_MASK(upd_mask),
     .o_SAR(ch_sar[1]), .o_DAR(ch_dar[1]), .o_TCR(ch_tcr[1]), .o_CHCR(ch_chcr[1])
 );
 dmac_channel #(.CH_ID(2), .HAS_RELOAD(1'b1)) u_ch2 (
     .i_RST_n(i_RST_n), .i_CLK(i_CLK), .i_CEN(i_CEN),
     .i_WR_SAR(wr_sar[2]), .i_WR_DAR(wr_dar[2]), .i_WR_TCR(wr_tcr[2]), .i_WR_CHCR(wr_chcr[2]),
     .i_WDATA(wd_lane), .i_WMASK(wm_lane),
-    .i_UPD(ch_upd[2]),
+    .i_UPD(ch_upd[2]), .i_UPD_MASK(upd_mask),
     .o_SAR(ch_sar[2]), .o_DAR(ch_dar[2]), .o_TCR(ch_tcr[2]), .o_CHCR(ch_chcr[2])
 );
 dmac_channel #(.CH_ID(3), .HAS_INDIRECT(1'b1)) u_ch3 (
     .i_RST_n(i_RST_n), .i_CLK(i_CLK), .i_CEN(i_CEN),
     .i_WR_SAR(wr_sar[3]), .i_WR_DAR(wr_dar[3]), .i_WR_TCR(wr_tcr[3]), .i_WR_CHCR(wr_chcr[3]),
     .i_WDATA(wd_lane), .i_WMASK(wm_lane),
-    .i_UPD(ch_upd[3]),
+    .i_UPD(ch_upd[3]), .i_UPD_MASK(upd_mask),
     .o_SAR(ch_sar[3]), .o_DAR(ch_dar[3]), .o_TCR(ch_tcr[3]), .o_CHCR(ch_chcr[3])
 );
 
@@ -297,18 +316,45 @@ end
     in phase 6; rsp_fault is ignored until then.
 */
 
-//request sources (phase 3): auto = level while enabled (p.347); CMT = the
-//compare-match pulse latched until served (p.348). Other RS codes inert.
+//DREQ pin sampler: 2FF sync at core rate, then the CKIO-falling-edge sample
+//(p.363). Edge detection compares the new sample against the previous one,
+//so a falling edge needs DREQ high at the prior sample point (fig 11.19).
+logic   [1:0]   dreq_ff, dreq_sync, dreq_smp;
+always_ff @(posedge i_CLK or negedge i_RST_n) begin
+    if(!i_RST_n) begin
+        dreq_ff   <= 2'b11;                 //negated idle (active-low pins)
+        dreq_sync <= 2'b11;
+        dreq_smp  <= 2'b11;
+    end
+    else begin if(i_CEN) begin
+        dreq_ff   <= i_DREQ_n;
+        dreq_sync <= dreq_ff;
+        if(i_CKIO_NCEN) dreq_smp <= dreq_sync;
+    end end
+end
+wire    [1:0]   dreq_lvl = ~dreq_smp;       //DS=0: low-level detection (p.347)
+
+//request sources: auto = level while enabled (p.347); CMT = compare-match
+//pulse latched until served (p.348); external (ch0/1 only) = DREQ level or
+//the pend_ext edge latch per DS. Unimplemented RS codes (IrDA/SCIF/A-D) inert.
 logic   [3:0]   pend;                       //CMT request latch per channel
-logic   [3:0]   ch_en, ch_req, ch_tm_v, ch_rs_cmt;
+logic   [1:0]   pend_ext;                   //DREQ falling-edge latch (DS=1)
+logic   [3:0]   ch_en, ch_req, ch_tm_v, ch_rs_cmt, ch_rs_ext, ch_rs_sgr, ch_rs_sgw;
 always_comb begin
     for(int c = 0; c < 4; c++) begin
-        logic rs_auto;
+        logic rs_auto, ext_line;
         rs_auto      = (ch_chcr[c][11:8] == 4'b0100);
         ch_rs_cmt[c] = (ch_chcr[c][11:8] == 4'b1111);
+        ch_rs_sgr[c] = (ch_chcr[c][11:8] == 4'b0010);   //single: memory -> device w/ DACK
+        ch_rs_sgw[c] = (ch_chcr[c][11:8] == 4'b0011);   //single: device w/ DACK -> memory
+        //external request exists on ch0/1 only (table 11.3)
+        ch_rs_ext[c] = ((ch_chcr[c][11:8] == 4'b0000) | ch_rs_sgr[c] | ch_rs_sgw[c])
+                       && (c < 2);
+        ext_line     = ch_chcr[c][6] ? pend_ext[c[0]] : dreq_lvl[c[0]];     //DS edge/level
         //enable = DE & ~TE & DME & ~NMIF & ~AE (p.342)
         ch_en[c]     = ch_chcr[c][0] & ~ch_chcr[c][1] & dme & ~nmif & ~ae;
-        ch_req[c]    = ch_en[c] & (rs_auto | (ch_rs_cmt[c] & pend[c]));
+        ch_req[c]    = ch_en[c] & (rs_auto | (ch_rs_cmt[c] & pend[c]) |
+                                   (ch_rs_ext[c] & ext_line));
         ch_tm_v[c]   = ch_chcr[c][5];       //TM: burst flag per channel
     end
 end
@@ -328,13 +374,21 @@ wire            win_v = |ch_req;
 //sequencer state ("seq"): the unit pipeline above
 localparam logic [2:0] S_IDLE = 3'd0, S_RD_REQ = 3'd1, S_RD_WAIT = 3'd2,
                        S_WR_REQ = 3'd3, S_WR_WAIT = 3'd4, S_GAP = 3'd5;
+//unit shape: dual R->W, or ONE single-address cycle (read for mem->dev,
+//write-with-external-drive for dev->mem, figs 11.9-11.10); bit1 = single
+localparam logic [1:0] M_DUAL = 2'b00, M_SGR = 2'b10, M_SGW = 2'b11;
 logic   [2:0]   seq;
+logic   [1:0]   mode_q;                     //granted unit shape (M_*)
 logic   [1:0]   grant_q;                    //granted channel (registered mux select)
 logic   [1:0]   sarlo_q;                    //granted SAR[1:0]: read-lane pick
 logic   [1:0]   size_q;                     //granted TS size
 logic   [31:0]  addr_q;                     //read address, then write address
 logic   [31:0]  wdata_q;                    //lane-replicated write data
 logic   [3:0]   wstrb_q;                    //DAR-lane strobes
+logic           dack_en_q;                  //granted unit outputs DACK (ext-request ch0/1)
+logic           dack_rd_q;                  //DACK on the read(1)/write(0) access - AM
+                                            //resolved at grant; single always on its access
+logic   [1:0]   drak_q, drak_vis;           //DRAK pulse + its seen-one-CKIO-fall marker
 
 //granted-channel views (4:1 muxes, registered grant_q select)
 wire    [31:0]  dar_g = ch_dar[grant_q];
@@ -363,37 +417,76 @@ always_comb begin
     endcase
 end
 
-wire            unit_done = (seq == S_WR_WAIT) && I_BUS.rsp_valid;
+//single-write strobes need the DAR lane at grant time (size_q registers on
+//the same edge): a small win-muxed duplicate of the wr_stb cone
+wire    [1:0]   ts_w = {ch_chcr[win][4], ch_chcr[win][3]};
+logic   [3:0]   sgw_stb;
+always_comb begin
+    unique case(ts_w)
+        2'd0:    sgw_stb = 4'b1000 >> ch_dar[win][1:0];
+        2'd1:    sgw_stb = ch_dar[win][1] ? 4'b0011 : 4'b1100;
+        default: sgw_stb = 4'b1111;
+    endcase
+end
+
+wire            unit_done = (I_BUS.rsp_valid) &&
+                            ((seq == S_WR_WAIT) ||
+                             (seq == S_RD_WAIT && mode_q == M_SGR));
+wire            grant_fire = (seq == S_IDLE) && win_v;
 
 always_ff @(posedge i_CLK or negedge i_RST_n) begin
     if(!i_RST_n) begin
-        seq     <= S_IDLE;
-        grant_q <= 2'd0;
-        sarlo_q <= 2'd0;
-        size_q  <= 2'd0;
-        addr_q  <= 32'd0;
-        wdata_q <= 32'd0;
-        wstrb_q <= 4'd0;
-        pend    <= 4'd0;
+        seq      <= S_IDLE;
+        mode_q   <= M_DUAL;
+        grant_q  <= 2'd0;
+        sarlo_q  <= 2'd0;
+        size_q   <= 2'd0;
+        addr_q   <= 32'd0;
+        wdata_q  <= 32'd0;
+        wstrb_q  <= 4'd0;
+        dack_en_q<= 1'b0;
+        dack_rd_q<= 1'b0;
+        pend     <= 4'd0;
+        pend_ext <= 2'd0;
+        drak_q   <= 2'd0;
+        drak_vis <= 2'd0;
     end
     else begin if(i_CEN) begin
         unique case(seq)
             S_IDLE: begin
                 if(win_v) begin             //start-up: latch the winner's unit
                     grant_q <= win;
-                    addr_q  <= ch_sar[win];
-                    sarlo_q <= ch_sar[win][1:0];
-                    size_q  <= {ch_chcr[win][4], ch_chcr[win][3]};
-                    seq     <= S_RD_REQ;
+                    size_q  <= ts_w;
+                    //DACK tag: dual-ext per AM's cycle (p.337); single always
+                    dack_en_q <= ch_rs_ext[win];
+                    dack_rd_q <= ch_rs_sgr[win] |
+                                 (~ch_rs_sgw[win] & ~ch_chcr[win][17]);     //AM=0: read cycle
+                    if(ch_rs_sgw[win]) begin            //dev->mem: lone external-drive WRITE
+                        mode_q  <= M_SGW;
+                        addr_q  <= ch_dar[win];
+                        wstrb_q <= sgw_stb;
+                        wdata_q <= 32'd0;               //don't-care: D left undriven
+                        seq     <= S_WR_REQ;
+                    end
+                    else begin                          //dual, or single mem->dev (lone read)
+                        mode_q  <= ch_rs_sgr[win] ? M_SGR : M_DUAL;
+                        addr_q  <= ch_sar[win];
+                        sarlo_q <= ch_sar[win][1:0];
+                        seq     <= S_RD_REQ;
+                    end
                 end
             end
             S_RD_REQ:  if(I_BUS.req_ready) seq <= S_RD_WAIT;
             S_RD_WAIT: begin
-                if(I_BUS.rsp_valid) begin   //buffer the datum, turn the pair around
-                    wdata_q <= wr_rep;
-                    wstrb_q <= wr_stb;
-                    addr_q  <= dar_g;
-                    seq     <= S_WR_REQ;
+                if(I_BUS.rsp_valid) begin
+                    if(mode_q == M_SGR)     //single-read unit: the device latched off the bus
+                        seq <= tm_g ? S_IDLE : S_GAP;
+                    else begin              //dual: buffer the datum, turn the pair around
+                        wdata_q <= wr_rep;
+                        wstrb_q <= wr_stb;
+                        addr_q  <= dar_g;
+                        seq     <= S_WR_REQ;
+                    end
                 end
             end
             S_WR_REQ:  if(I_BUS.req_ready) seq <= S_WR_WAIT;
@@ -408,13 +501,36 @@ always_ff @(posedge i_CLK or negedge i_RST_n) begin
         //withdraws at the FIRST transfer, burst at the LAST (p.348)
         for(int c = 0; c < 4; c++) begin
             if(cmt_fire && ch_rs_cmt[c])                             pend[c] <= 1'b1;
-            else if(seq == S_IDLE && win_v && win == c[1:0] && !ch_tm_v[c]) pend[c] <= 1'b0;
+            else if(grant_fire && win == c[1:0] && !ch_tm_v[c])      pend[c] <= 1'b0;
             else if(ch_upd[c] && ch_tcr[c] == 24'd1)                 pend[c] <= 1'b0;
+        end
+
+        //DREQ edge pending: same withdraw laws (first transfer / fig 11.21
+        //burst-edge runs to DMATCR=0); set needs DREQ high at the prior sample
+        for(int k = 0; k < 2; k++) begin
+            if(i_CKIO_NCEN && dreq_smp[k] && !dreq_sync[k])          pend_ext[k] <= 1'b1;
+            else if(grant_fire && win == k[1:0] && !ch_tm_v[k])      pend_ext[k] <= 1'b0;
+            else if(ch_upd[k] && ch_tcr[k] == 24'd1)                 pend_ext[k] <= 1'b0;
+        end
+
+        //DRAK: one-CKIO-cycle request-accepted pulse at an external grant
+        for(int k = 0; k < 2; k++) begin
+            if(grant_fire && win == k[1:0] && ch_rs_ext[k]) begin
+                drak_q[k]   <= 1'b1;
+                drak_vis[k] <= 1'b0;
+            end
+            else if(i_CKIO_NCEN && drak_q[k]) begin
+                if(drak_vis[k]) drak_q[k] <= 1'b0;      //seen one full CKIO fall
+                else            drak_vis[k] <= 1'b1;
+            end
         end
     end end
 end
 
-//unit-completion strobes into the channel iteration datapaths
+//unit-completion strobes into the channel iteration datapaths; single-address
+//units step only their memory-side register ({DAR, SAR} mask, fig 11.10)
+wire    [1:0]   upd_mask = (mode_q == M_SGR) ? 2'b01 :
+                           (mode_q == M_SGW) ? 2'b10 : 2'b11;
 always_comb begin
     for(int c = 0; c < 4; c++) ch_upd[c] = unit_done && (grant_q == c[1:0]);
 end
@@ -429,11 +545,20 @@ assign  I_BUS.req_addr    = addr_q;
 assign  I_BUS.req_wdata   = wdata_q;
 assign  I_BUS.req_wstrb   = (seq == S_WR_REQ) ? wstrb_q : 4'd0;
 assign  I_BUS.req_lock    = 1'b0;
-assign  I_BUS.req_dack    = 1'b0;           //DACK/single-address tags arrive in phase 4
-assign  I_BUS.req_dack_ch = 1'b0;
-assign  I_BUS.req_dack_al = 1'b0;
-assign  I_BUS.req_saddr   = 1'b0;
+//DACK/single-address tags: the read or write access per the grant-resolved
+//AM (dual) or the lone access (single); the BSC frames the CSn window
+assign  I_BUS.req_dack    = dack_en_q && ((seq == S_RD_REQ &&  dack_rd_q) ||
+                                          (seq == S_WR_REQ && !dack_rd_q));
+assign  I_BUS.req_dack_ch = grant_q[0];
+assign  I_BUS.req_saddr   = mode_q[1] && ((seq == S_RD_REQ) || (seq == S_WR_REQ));
 assign  I_BUS.rsp_ready   = (seq == S_RD_WAIT) || (seq == S_WR_WAIT);
+
+//pads: AL/RL polarity from the live CHCR bits (ch0/1 only, pp.337-338);
+//negated idle when active-low (the default)
+assign  o_DACK[0] = ch_chcr[0][16] ? i_DACK_WIN[0] : ~i_DACK_WIN[0];
+assign  o_DACK[1] = ch_chcr[1][16] ? i_DACK_WIN[1] : ~i_DACK_WIN[1];
+assign  o_DRAK[0] = ch_chcr[0][18] ? drak_q[0]     : ~drak_q[0];
+assign  o_DRAK[1] = ch_chcr[1][18] ? drak_q[1]     : ~drak_q[1];
 
 //bus hold: through the unit (the R->W pair is indivisible vs the CPU,
 //fig 11.12 tier 1) and across burst units (CPU locked out, fig 11.13/11.14)

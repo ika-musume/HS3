@@ -240,3 +240,23 @@ Levers that COULD move the plateau (all bigger / need a decision):
   functionally benign (bits sweep to GND) and fixed in-tree right after by
   gating the assigned VALUE instead of the assignment; next OOC should log clean.
 - Config note: the three new sources were added to eval_ooc/HS3/config*.json.
+
+### Re-baseline after DMAC phases 3-4 (2026-07-09, seeds 3/4/5) — NEUTRAL
+- RTL delta since the phases-1-2 re-baseline: the full DMAC transfer engine
+  (auto/CMT/external-DREQ requests, dual-direct + single-address units, fixed
+  priority, cycle-steal/burst, channel iteration datapaths), the arb rsp-done
+  owner-flip fix, BSC DACK windows + single-address D_OE gate, Port D pad
+  merges (o_PD_FN), DREQ samplers on the CKIO-fall cen. Suites 75/75 +
+  103/103, laws bit-exact throughout.
+- Worst slack (i_CLK): seed3 −3.03→−2.92 (dead on the frozen baseline),
+  seed4 −3.20→−2.23 (best HS3 fit recorded), seed5 −2.70→−3.79. Mean
+  −2.98 vs the −2.97 baseline: NEUTRAL. Per-seed spread widened to ±0.8 —
+  placement noise on the known plateau (seed5's worst path is the catalogued
+  int_pipe fwd_lane/address_error/early_d_req_valid cone; identical-RTL probe
+  runs have swung −2.61..−3.20 before). Restricted Fmax 79.87/81.74/72.54.
+- Cones: **zero dmac/arb logic in any seed's top-20** across all three seeds.
+  The engine's request/address muxes (registered grant selects, flat req
+  cones through the arb 2:1) are timing-invisible as designed.
+- Resources: registers 7,202/7,228/7,257 (phases-1-2: 7,018/6,985/7,002 —
+  the ~+230 is the sequencer, DREQ/DRAK samplers, and single-address paths),
+  memory bits identical (158,208).

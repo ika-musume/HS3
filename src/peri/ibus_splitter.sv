@@ -50,7 +50,6 @@ assign  BRG_BUS.req_wstrb = CORE_BUS.req_wstrb;
 assign  BRG_BUS.req_lock  = CORE_BUS.req_lock;
 assign  BRG_BUS.req_dack    = CORE_BUS.req_dack;    //DMAC sideband (BSC-only consumer;
 assign  BRG_BUS.req_dack_ch = CORE_BUS.req_dack_ch; //the bridge ignores it)
-assign  BRG_BUS.req_dack_al = CORE_BUS.req_dack_al;
 assign  BRG_BUS.req_saddr   = CORE_BUS.req_saddr;
 
 assign  EXT_BUS.req_valid = CORE_BUS.req_valid & ~hit_brg;
@@ -63,7 +62,6 @@ assign  EXT_BUS.req_wstrb = CORE_BUS.req_wstrb;
 assign  EXT_BUS.req_lock  = CORE_BUS.req_lock;
 assign  EXT_BUS.req_dack    = CORE_BUS.req_dack;
 assign  EXT_BUS.req_dack_ch = CORE_BUS.req_dack_ch;
-assign  EXT_BUS.req_dack_al = CORE_BUS.req_dack_al;
 assign  EXT_BUS.req_saddr   = CORE_BUS.req_saddr;
 
 assign  CORE_BUS.req_ready = hit_brg ? BRG_BUS.req_ready : EXT_BUS.req_ready;

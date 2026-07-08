@@ -119,7 +119,6 @@ assign  CORE_BUS.req_lock  = own_dma ? DMA_BUS.req_lock  : CPU_BUS.req_lock;
 //sideband is DMAC-only by construction (the cache ties it off)
 assign  CORE_BUS.req_dack    = own_dma ? DMA_BUS.req_dack    : CPU_BUS.req_dack;
 assign  CORE_BUS.req_dack_ch = own_dma ? DMA_BUS.req_dack_ch : CPU_BUS.req_dack_ch;
-assign  CORE_BUS.req_dack_al = own_dma ? DMA_BUS.req_dack_al : CPU_BUS.req_dack_al;
 assign  CORE_BUS.req_saddr   = own_dma ? DMA_BUS.req_saddr   : CPU_BUS.req_saddr;
 
 //CPU leg is a bare AND (zero-cost idle path; the cache self-serializes);

@@ -230,6 +230,7 @@ ibus_bridge u_bridge (
 
 wire            rcmi_req, rovi_req;
 wire            ref_pend;           //refresh request pending (IRQOUT, p.321)
+wire    [1:0]   dack_win;           //CSn-framed DACK windows (polarity in the DMAC)
 wire    [7:0]   mcs_n;              //MCS0-7 selects, merged onto the PTC/CS0 pads
 wire            mcs0_cs0;           //MCSCR0 decodes area 0: CS0 pad may switch
 wire            cs0_bsc;            //BSC's own CS0 view (pre-MCS0 pad merge)
@@ -292,6 +293,7 @@ bsc #(
 
     .o_MCS_n                (mcs_n                                  ),
     .o_MCS0_CS0             (mcs0_cs0                               ),
+    .o_DACK_WIN             (dack_win                               ),
     .o_REF_PEND             (ref_pend                               ),
 
     .o_RCMI_REQ             (rcmi_req                               ),
@@ -437,17 +439,26 @@ rtc u_rtc (
 ////
 
 wire    [3:0]   dmac_dei;           //DEI0-3 transfer-end levels (IPRE, codes 0x800-0x860)
+wire    [1:0]   dack_pad, drak_pad; //DACK/DRAK pad levels, merged onto Port D below
 
 dmac u_dmac (
     .i_RST_n                (rst_all_n                              ),  //CHCR/DMAOR/CMT clear on any reset (p.332)
     .i_CLK                  (i_CLK                                  ),
     .i_CEN                  (i_CEN                                  ),
     .i_PCEN                 (pcen                                   ),
+    .i_CKIO_NCEN            (o_CKIO_NCEN                            ),  //DREQ sample = CKIO falling edge (p.363)
 
     .REG_BUS                (PBUS_DMAC                              ),
     .I_BUS                  (DMA_I_BUS                              ),
 
     .o_BUS_HOLD             (dmac_hold                              ),
+
+    //DREQ pins ride the Port D pads as inputs (table 18.1; INTC tap idiom)
+    .i_DREQ_n               ({i_PTD_I[6], i_PTD_I[4]}               ),
+    .i_DACK_WIN             (dack_win                               ),
+    .o_DACK                 (dack_pad                               ),
+    .o_DRAK                 (drak_pad                               ),
+
     .o_DEI                  (dmac_dei                               )
 );
 
@@ -469,6 +480,24 @@ wire    [7:0]   ptc_o_port, ptc_oe_port;
 assign  o_PTC_O  = (pc_fn & mcs_n) | (~pc_fn & ptc_o_port);
 assign  o_PTC_OE = pc_fn | ptc_oe_port;
 
+//PTD pad merge (table 18.1): mode 00 output pads = PTD7 DACK1, PTD5 DACK0,
+//PTD1 DRAK0, PTD0 DRAK1 (note the swap); PTD6/PTD4 = DREQ inputs (tapped
+//raw at u_dmac, no drive - input-only pads)
+wire    [7:0]   ptd_o_port, ptd_oe_port;
+wire    [7:0]   pd_fn;
+assign  o_PTD_O  = {pd_fn[7] ? dack_pad[1] : ptd_o_port[7],
+                    ptd_o_port[6],
+                    pd_fn[5] ? dack_pad[0] : ptd_o_port[5],
+                    ptd_o_port[4:2],
+                    pd_fn[1] ? drak_pad[0] : ptd_o_port[1],
+                    pd_fn[0] ? drak_pad[1] : ptd_o_port[0]};
+assign  o_PTD_OE = {pd_fn[7] | ptd_oe_port[7],
+                    ptd_oe_port[6],
+                    pd_fn[5] | ptd_oe_port[5],
+                    ptd_oe_port[4:2],
+                    pd_fn[1] | ptd_oe_port[1],
+                    pd_fn[0] | ptd_oe_port[0]};
+
 ioport u_ioport (
     .i_POR_n                (rst_por_n                              ),  //regs hold through manual reset (p.570)
     .i_CLK                  (i_CLK                                  ),
@@ -489,8 +518,8 @@ ioport u_ioport (
     .o_PTC_OE               (ptc_oe_port                            ),
     .o_PTC_PU               (o_PTC_PU                               ),
     .i_PTD_I                (i_PTD_I                                ),
-    .o_PTD_O                (o_PTD_O                                ),
-    .o_PTD_OE               (o_PTD_OE                               ),
+    .o_PTD_O                (ptd_o_port                             ),
+    .o_PTD_OE               (ptd_oe_port                            ),
     .o_PTD_PU               (o_PTD_PU                               ),
     .i_PTE_I                (i_PTE_I                                ),
     .o_PTE_O                (o_PTE_O                                ),
@@ -519,7 +548,8 @@ ioport u_ioport (
     .o_SCPT_PU              (o_SCPT_PU                              ),
 
     .o_PH7_FN               (ph7_fn                                 ),
-    .o_PC_FN                (pc_fn                                  )
+    .o_PC_FN                (pc_fn                                  ),
+    .o_PD_FN                (pd_fn                                  )
 );
 
 
