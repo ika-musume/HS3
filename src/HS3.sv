@@ -183,6 +183,7 @@ IBus_2          REG_INTC_LO();      //bridge -> intc      (0xA4000000-1F)
 IBus_2          PBUS_TMU();         //P bus: BSC -> tmu    (0xFFFFFE90-B8)
 IBus_2          PBUS_RTC();         //P bus: BSC -> rtc    (0xFFFFFEC0-DE)
 IBus_2          PBUS_PORT();        //P bus: BSC -> ioport (0x04000100-137)
+IBus_2          PBUS_DMAC();        //P bus: BSC -> dmac   (0x04000020-77)
 
 ibus_splitter u_split (
     .i_RST_n                (rst_all_n                              ),
@@ -230,6 +231,7 @@ bsc #(
     .REG_TMU                (PBUS_TMU                               ),
     .REG_RTC                (PBUS_RTC                               ),
     .REG_PORT               (PBUS_PORT                              ),
+    .REG_DMAC               (PBUS_DMAC                              ),
 
     .o_MEM_REQ              (o_MEM_REQ                              ),
     .o_MEM_WRITE            (o_MEM_WRITE                            ),
@@ -415,6 +417,25 @@ rtc u_rtc (
 
 
 ///////////////////////////////////////////////////////////
+//////  DMAC (+ CMT)
+////
+
+wire    [3:0]   dmac_dei;           //DEI0-3 transfer-end levels (IPRE, codes 0x800-0x860)
+
+dmac u_dmac (
+    .i_RST_n                (rst_all_n                              ),  //CHCR/DMAOR/CMT clear on any reset (p.332)
+    .i_CLK                  (i_CLK                                  ),
+    .i_CEN                  (i_CEN                                  ),
+    .i_PCEN                 (pcen                                   ),
+
+    .REG_BUS                (PBUS_DMAC                              ),
+
+    .o_DEI                  (dmac_dei                               )
+);
+
+
+
+///////////////////////////////////////////////////////////
 //////  I/O Ports
 ////
 
@@ -505,15 +526,15 @@ intc u_intc (
     .i_IRLS                 (i_PTF_I[3:0]                           ),
     .i_PINT                 ({i_PTF_I, i_PTC_I}                     ),
 
-    //on-chip sources: WDT + BSC refresh + TMU + RTC exist; the rest arrive
-    //with their modules (SCI/SCIF/IrDA/DMAC/ADC later)
+    //on-chip sources: WDT + BSC refresh + TMU + RTC + DMAC exist; the rest
+    //arrive with their modules (SCI/SCIF/IrDA/ADC later)
     .i_ITI_REQ              (iti_req                                ),
     .i_TMU_REQ              (tmu_req                                ),
     .i_RTC_REQ              (rtc_req                                ),
     .i_SCI_REQ              (4'd0                                   ),
     .i_SCIF_REQ             (4'd0                                   ),
     .i_IRDA_REQ             (4'd0                                   ),
-    .i_DMAC_REQ             (4'd0                                   ),
+    .i_DMAC_REQ             (dmac_dei                               ),
     .i_REF_REQ              ({rovi_req, rcmi_req}                   ),
     .i_ADC_REQ              (1'b0                                   ),
     .i_UDI_REQ              (1'b0                                   ),

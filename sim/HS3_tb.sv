@@ -89,6 +89,7 @@ assign  d_bus = d_oe ? d_o : 32'hzzzz_zzzz;
 
 //clock pins: CKIO output (drives the SDRAM model below) and the RTC crystal
 wire            ckio;
+wire            ckio_pcen, ckio_ncen;       //CKIO edge enables (DREQ/WAIT phase checks)
 logic           extal2 = 1'b0;
 
 HS3 #(
@@ -100,6 +101,8 @@ HS3 #(
     .i_CLK                     (clk),
     .i_CEN                     (1'b1),
     .o_CKIO                    (ckio),
+    .o_CKIO_PCEN               (ckio_pcen),
+    .o_CKIO_NCEN               (ckio_ncen),
     .i_EXTAL2                  (extal2),
 
     .o_MEM_REQ                 (mem_req),
@@ -4349,6 +4352,174 @@ endtask
 
 
 ///////////////////////////////////////////////////////////
+//////  DMAC Register Block + CMT (session 5, phase 1)
+////
+
+/*
+    Section 11 register laws (tables 11.2/11.7, pp.331-344, 377-380).
+    Phase 1 covers only the register face + CMT counter; transfers, DEI
+    interrupts (need a hardware TE set) and DREQ pins arrive with the
+    engine phases. All accesses ride the P2 window 0xA4000020-77 through
+    the BSC's P-bus bridge (shadow-invariant area-1 decode).
+*/
+
+task automatic test_dmac_channel_regs;
+    integer idx, sent;
+    begin
+        begin_test("DMAC channel quads: lanes, DMATCR mask, per-channel CHCR bits, decode holes");
+        eidx = 0;
+        emit_ldrn(1, 32'hA400_0020);                 // SAR0
+        imem[eidx] = 16'h6312; eidx = eidx + 1;              // MOV.L @R1,R3      ; reset 0 (sim; arch undefined)
+        emit_ldr0(32'h1234_5678);
+        imem[eidx] = 16'h2102; eidx = eidx + 1;              // MOV.L R0,@R1
+        imem[eidx] = 16'h6412; eidx = eidx + 1;              // MOV.L @R1,R4      ; long readback
+        emit_ldr0(32'h0000_AAAA);
+        imem[eidx] = 16'h2101; eidx = eidx + 1;              // MOV.W R0,@R1      ; upper half (big-endian)
+        imem[eidx] = 16'h6512; eidx = eidx + 1;              // MOV.L @R1,R5      ; lower half retained
+        emit_ldrn(1, 32'hA400_0022);                 // SAR0 lower half
+        emit_ldr0(32'h0000_BBBB);
+        imem[eidx] = 16'h2101; eidx = eidx + 1;              // MOV.W R0,@R1
+        emit_ldrn(1, 32'hA400_0020);
+        imem[eidx] = 16'h6712; eidx = eidx + 1;              // MOV.L @R1,R7      ; both halves written
+        imem[eidx] = 16'hE240; eidx = eidx + 1;              // MOV   #0x40,R2    ; mailbox base
+        emit_ldrn(1, 32'hA400_0028);                 // DMATCR0
+        imem[eidx] = 16'hE0FF; eidx = eidx + 1;              // MOV   #-1,R0      ; 0xFFFFFFFF
+        imem[eidx] = 16'h2102; eidx = eidx + 1;              // MOV.L R0,@R1
+        imem[eidx] = 16'h6012; eidx = eidx + 1;              // MOV.L @R1,R0
+        imem[eidx] = 16'h2202; eidx = eidx + 1;              // MOV.L R0,@R2      ; mb0: bits 31:24 masked
+        emit_ldrn(1, 32'hA400_002C);                 // CHCR0
+        imem[eidx] = 16'hE0FF; eidx = eidx + 1;              // MOV   #-1,R0
+        imem[eidx] = 16'h2102; eidx = eidx + 1;              // MOV.L R0,@R1
+        imem[eidx] = 16'h6012; eidx = eidx + 1;              // MOV.L @R1,R0
+        imem[eidx] = 16'h1201; eidx = eidx + 1;              // MOV.L R0,@(4,R2)  ; mb1: RL/AM/AL/DS live, no TE
+        imem[eidx] = 16'hE000; eidx = eidx + 1;              // MOV   #0,R0
+        imem[eidx] = 16'h8013; eidx = eidx + 1;              // MOV.B R0,@(3,R1)  ; byte lane clears CHCR0[7:0]
+        imem[eidx] = 16'h6012; eidx = eidx + 1;              // MOV.L @R1,R0
+        imem[eidx] = 16'h1202; eidx = eidx + 1;              // MOV.L R0,@(8,R2)  ; mb2: upper bytes retained
+        emit_ldrn(1, 32'hA400_003C);                 // CHCR1
+        imem[eidx] = 16'hE0FF; eidx = eidx + 1;              // MOV   #-1,R0
+        imem[eidx] = 16'h2102; eidx = eidx + 1;              // MOV.L R0,@R1
+        imem[eidx] = 16'h6012; eidx = eidx + 1;              // MOV.L @R1,R0
+        imem[eidx] = 16'h1203; eidx = eidx + 1;              // MOV.L R0,@(12,R2) ; mb3
+        emit_ldrn(1, 32'hA400_004C);                 // CHCR2
+        imem[eidx] = 16'hE0FF; eidx = eidx + 1;              // MOV   #-1,R0
+        imem[eidx] = 16'h2102; eidx = eidx + 1;              // MOV.L R0,@R1
+        imem[eidx] = 16'h6012; eidx = eidx + 1;              // MOV.L @R1,R0
+        imem[eidx] = 16'h1204; eidx = eidx + 1;              // MOV.L R0,@(16,R2) ; mb4: RO only
+        emit_ldrn(1, 32'hA400_005C);                 // CHCR3
+        imem[eidx] = 16'hE0FF; eidx = eidx + 1;              // MOV   #-1,R0
+        imem[eidx] = 16'h2102; eidx = eidx + 1;              // MOV.L R0,@R1
+        imem[eidx] = 16'h6012; eidx = eidx + 1;              // MOV.L @R1,R0
+        imem[eidx] = 16'h1205; eidx = eidx + 1;              // MOV.L R0,@(20,R2) ; mb5: DI only
+        emit_ldrn(1, 32'hA400_0068);                 // 0x62-6F hole: undecoded (11.6 note 11)
+        imem[eidx] = 16'h6012; eidx = eidx + 1;              // MOV.L @R1,R0
+        imem[eidx] = 16'h1206; eidx = eidx + 1;              // MOV.L R0,@(24,R2) ; mb6 = 0
+        emit_ldrn(1, 32'hA400_0078);                 // fringe just past the CMT
+        imem[eidx] = 16'h6012; eidx = eidx + 1;              // MOV.L @R1,R0
+        imem[eidx] = 16'h1207; eidx = eidx + 1;              // MOV.L R0,@(28,R2) ; mb7 = 0
+        emit_sentinel_loop(eidx, sent);
+        do_reset;
+        run_until_retire(sent, 30000);
+        chk("SAR0 reset 0 (sim; arch undefined)",  gpr(3), 32'h0000_0000);
+        chk("SAR0 long R/W",                       gpr(4), 32'h1234_5678);
+        chk("SAR0 word @+0: lower half retained",  gpr(5), 32'hAAAA_5678);
+        chk("SAR0 word @+2: upper half retained",  gpr(7), 32'hAAAA_BBBB);
+        chk("DMATCR0 bits 31:24 read 0 / WI",      dmem[16'h10], 32'h00FF_FFFF);
+        chk("CHCR0 all-ones: RL/AM/AL/DS, no TE",  dmem[16'h11], 32'h0007_FF7D);
+        chk("CHCR0 byte lane: 7:0 clear only",     dmem[16'h12], 32'h0007_FF00);
+        chk("CHCR1 all-ones mask == CHCR0",        dmem[16'h13], 32'h0007_FF7D);
+        chk("CHCR2 all-ones: RO only",             dmem[16'h14], 32'h0008_FF3D);
+        chk("CHCR3 all-ones: DI only",             dmem[16'h15], 32'h0010_FF3D);
+        chk("0x62-6F hole reads 0",                dmem[16'h16], 32'h0000_0000);
+        chk("0x78 fringe reads 0",                 dmem[16'h17], 32'h0000_0000);
+        end_test;
+    end
+endtask
+
+task automatic test_dmac_dmaor_cmt_regs;
+    integer idx, sent, c0;
+    begin
+        begin_test("DMAOR flag/lane laws + CMT reset values + CMCNT0 tick rate (P-phi/8)");
+        eidx = 0;
+        emit_ldrn(1, 32'hA400_0060);                 // DMAOR
+        imem[eidx] = 16'h6311; eidx = eidx + 1;              // MOV.W @R1,R3      ; reset 0x0000
+        imem[eidx] = 16'hE0FF; eidx = eidx + 1;              // MOV   #-1,R0
+        imem[eidx] = 16'h2101; eidx = eidx + 1;              // MOV.W R0,@R1      ; all-ones word
+        imem[eidx] = 16'h6411; eidx = eidx + 1;              // MOV.W @R1,R4      ; AE/NMIF refuse write-1
+        emit_ldrn(1, 32'hA400_0061);
+        imem[eidx] = 16'hE000; eidx = eidx + 1;              // MOV   #0,R0
+        imem[eidx] = 16'h2100; eidx = eidx + 1;              // MOV.B R0,@R1      ; low byte: DME clears
+        emit_ldrn(1, 32'hA400_0060);
+        imem[eidx] = 16'h6511; eidx = eidx + 1;              // MOV.W @R1,R5      ; PR retained
+        imem[eidx] = 16'hE000; eidx = eidx + 1;              // MOV   #0,R0
+        imem[eidx] = 16'h2100; eidx = eidx + 1;              // MOV.B R0,@R1      ; high byte: PR clears
+        imem[eidx] = 16'hE240; eidx = eidx + 1;              // MOV   #0x40,R2    ; mailbox base
+        imem[eidx] = 16'h6011; eidx = eidx + 1;              // MOV.W @R1,R0
+        imem[eidx] = 16'h2202; eidx = eidx + 1;              // MOV.L R0,@R2      ; mb0 = 0
+        emit_ldrn(1, 32'hA400_0076);                 // CMCOR0
+        imem[eidx] = 16'h6711; eidx = eidx + 1;              // MOV.W @R1,R7      ; reset 0xFFFF (sign-ext)
+        emit_wreg_w(32'hA400_0072, 16'h0041);        // CMCSR0: spare bit 6 + CKS=01 (P-phi/8)
+        emit_ldrn(1, 32'hA400_0072);
+        imem[eidx] = 16'h6011; eidx = eidx + 1;              // MOV.W @R1,R0
+        imem[eidx] = 16'h1201; eidx = eidx + 1;              // MOV.L R0,@(4,R2)  ; mb1 = 0x0041
+        emit_wreg_w(32'hA400_0070, 16'h0001);        // CMSTR: STR0
+        emit_sentinel_loop(eidx, sent);
+        do_reset;
+        run_until_retire(sent, 30000);
+        chk("DMAOR reset 0x0000",                  gpr(3), 32'h0000_0000);
+        chk("DMAOR all-ones: PR+DME only stick",   gpr(4), 32'h0000_0301);
+        chk("DMAOR byte @+1: DME clears, PR held", gpr(5), 32'h0000_0300);
+        chk("DMAOR byte @+0: PR clears",           dmem[16'h10], 32'h0000_0000);
+        chk("CMCOR0 reset 0xFFFF",                 gpr(7), 32'hFFFF_FFFF);
+        chk("CMCSR0 spare+CKS readback",           dmem[16'h11], 32'h0000_0041);
+        //tick-rate law: P-phi/8 = one count / 32 core cycles at the FRQCR
+        //reset ratio; 4096 is a multiple, so the delta is exact
+        c0 = u_dut.u_dmac.cmcnt;
+        run_cycles(4096);
+        chk("CMCNT0 P-phi/8: 128 counts / 4096 cycles", u_dut.u_dmac.cmcnt - c0, 32'd128);
+        end_test;
+    end
+endtask
+
+task automatic test_dmac_cmt_match;
+    integer idx, sent, c0;
+    begin
+        begin_test("CMT compare match: CMCNT0 wrap, CMF set + write-0 clear protocol, STR0 halt");
+        eidx = 0;
+        emit_wreg_w(32'hA400_0076, 16'h001F);        // CMCOR0 = 31: match / 512 cycles (P-phi/4)
+        emit_wreg_w(32'hA400_0072, 16'h0000);        // CMCSR0: CKS=00 (P-phi/4)
+        emit_wreg_w(32'hA400_0070, 16'h0001);        // CMSTR: STR0
+        emit_ldrn(3, 32'd400);                       // delay > one match period (~4 cyc/iter)
+        imem[eidx] = 16'h4310; eidx = eidx + 1;              // DT    R3
+        imem[eidx] = 16'h8BFD; eidx = eidx + 1;              // BF    .-1 (loop)
+        imem[eidx] = 16'hE240; eidx = eidx + 1;              // MOV   #0x40,R2    ; mailbox base
+        emit_ldrn(1, 32'hA400_0072);                 // CMCSR0
+        imem[eidx] = 16'h6011; eidx = eidx + 1;              // MOV.W @R1,R0
+        imem[eidx] = 16'h2202; eidx = eidx + 1;              // MOV.L R0,@R2      ; mb0 = CMF set
+        imem[eidx] = 16'hE000; eidx = eidx + 1;              // MOV   #0,R0
+        imem[eidx] = 16'h2101; eidx = eidx + 1;              // MOV.W R0,@R1      ; CMF write-0 clear
+        imem[eidx] = 16'h6011; eidx = eidx + 1;              // MOV.W @R1,R0
+        imem[eidx] = 16'h1201; eidx = eidx + 1;              // MOV.L R0,@(4,R2)  ; mb1 = cleared
+        emit_ldrn(1, 32'hA400_0074);                 // CMCNT0
+        imem[eidx] = 16'h6011; eidx = eidx + 1;              // MOV.W @R1,R0
+        imem[eidx] = 16'h1202; eidx = eidx + 1;              // MOV.L R0,@(8,R2)  ; mb2 = wrapped count
+        emit_wreg_w(32'hA400_0070, 16'h0000);        // CMSTR: STR0 off
+        emit_sentinel_loop(eidx, sent);
+        do_reset;
+        run_until_retire(sent, 30000);
+        chk("CMF set after a match period",     dmem[16'h10], 32'h0000_0080);
+        chk("CMF write-0 clears",               dmem[16'h11], 32'h0000_0000);
+        chk_true("CMCNT0 wrapped below CMCOR0", dmem[16'h12] <= 32'h0000_001F);
+        //STR0 = 0 freezes the counter dead
+        c0 = u_dut.u_dmac.cmcnt;
+        run_cycles(1024);
+        chk("STR0 off: CMCNT0 frozen", u_dut.u_dmac.cmcnt, c0[15:0]);
+        end_test;
+    end
+endtask
+
+
+///////////////////////////////////////////////////////////
 //////  Main Sequence
 ////
 
@@ -4466,7 +4637,12 @@ initial begin
     test_bs_td_dqm;
     test_release_pads;
 
-    group("15. Board-bus shape monitors (whole run)");
+    group("15. DMAC register block + CMT (session 5, phase 1)");
+    test_dmac_channel_regs;
+    test_dmac_dmaor_cmt_regs;
+    test_dmac_cmt_match;
+
+    group("16. Board-bus shape monitors (whole run)");
     test_bus_monitors;
 
     $display("");

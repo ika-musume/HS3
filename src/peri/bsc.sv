@@ -97,6 +97,7 @@ module bsc #(
     IBus_2.master           REG_TMU,    //P bus: TMU window 0xFFFFFE90-B8
     IBus_2.master           REG_RTC,    //P bus: RTC window 0xFFFFFEC0-DE
     IBus_2.master           REG_PORT,   //P bus: PFC/port window 0x04000100-137
+    IBus_2.master           REG_DMAC,   //P bus: DMAC+CMT window 0x04000020-77
 
     /* BSC PHYSICAL PINS - the real chip's external bus, table 10.1
        (pp.226-227). Ordinary memory / burst ROM and SDRAM SHARE these,
@@ -235,11 +236,19 @@ wire            fe_tmu   = (fa[31:8] == 24'hFFFF_FE) &&
 wire            fe_rtc   = (fa[31:8] == 24'hFFFF_FE) &&
                            (fa[7:4] == 4'hC || fa[7:4] == 4'hD);
 wire            fe_port  = !fe_p4 && (fe_area == 3'd1) && (fa[25:6] == 20'h0_0004);
-wire            fe_pbus  = fe_tmu || fe_rtc || fe_port;
+//DMAC window (tables 11.2 + 11.7): quads+DMAOR 0x20-61, CMT 0x70-77; the
+//0x62-6F hole stays undecoded (section 11.6 note 11) and 0x00-1F is the
+//INTC-low page (bridge-owned P2 alias) - both fall to fe_dummy here
+wire            fe_dma_pg = !fe_p4 && (fe_area == 3'd1) && (fa[25:7] == 19'h0_0000);
+wire            fe_dmac  = fe_dma_pg && ((fa[6:5] == 2'b01) || (fa[6:5] == 2'b10) ||  //0x20-5F
+                                         (fa[6:1] == 6'b11_0000) ||                   //0x60 DMAOR
+                                         (fa[6:3] == 4'b1110));                       //0x70-77 CMT
+wire            fe_pbus  = fe_tmu || fe_rtc || fe_port || fe_dmac;
 wire            fe_dummy = (fe_p4 && !fe_reg && !fe_sdmr && !fe_tmu && !fe_rtc) ||
-                           (!fe_p4 && ((fe_area == 3'd1 && !fe_port) || fe_area == 3'd7));
+                           (!fe_p4 && ((fe_area == 3'd1 && !fe_port && !fe_dmac) ||
+                                       fe_area == 3'd7));
 wire            fe_local = fe_reg || fe_dummy;
-wire            fe_gen   = !fe_p4 && !fe_sdram && !fe_dummy && !fe_port;
+wire            fe_gen   = !fe_p4 && !fe_sdram && !fe_dummy && !fe_port && !fe_dmac;
 wire            fe_eng   = fe_sdram || fe_sdmr;         //engine-owned classes
 
 wire            bus_held;           //BREQ requested or granted (defined below)
@@ -875,7 +884,7 @@ end
 */
 
 localparam logic [1:0] P_IDLE = 2'd0, P_ACC = 2'd1, P_RSP = 2'd2;
-localparam logic [1:0] PW_TMU = 2'd0, PW_RTC = 2'd1, PW_PRT = 2'd2;
+localparam logic [1:0] PW_TMU = 2'd0, PW_RTC = 2'd1, PW_PRT = 2'd2, PW_DMA = 2'd3;
 
 logic   [1:0]   pbs_state;
 logic   [1:0]   pbs_win_q;          //captured window select (PW_*)
@@ -905,7 +914,8 @@ end
 //selected slave read, replicated onto the lanes so the pipe's load aligner
 //picks the correct byte/halfword from any naturally aligned offset
 wire    [31:0]  pbs_sel_rdata = (pbs_win_q == PW_TMU) ? REG_TMU.rdata :
-                                (pbs_win_q == PW_RTC) ? REG_RTC.rdata : REG_PORT.rdata;
+                                (pbs_win_q == PW_RTC) ? REG_RTC.rdata :
+                                (pbs_win_q == PW_DMA) ? REG_DMAC.rdata : REG_PORT.rdata;
 logic   [31:0]  pbs_rdata_rep;
 always_comb begin
     unique case(pbs_size_q)
@@ -929,7 +939,8 @@ always_ff @(posedge i_CLK or negedge i_RST_n) begin
         unique case(pbs_state)
             P_IDLE: begin
                 if(fe_acc && fe_pbus) begin                     //accept edge: latch everything
-                    pbs_win_q   <= fe_tmu ? PW_TMU : fe_rtc ? PW_RTC : PW_PRT;
+                    pbs_win_q   <= fe_tmu  ? PW_TMU : fe_rtc ? PW_RTC :
+                                   fe_dmac ? PW_DMA : PW_PRT;
                     pbs_addr_q  <= fa[7:0];
                     pbs_we_q    <= I_BUS.req_write;
                     pbs_size_q  <= I_BUS.req_size;
@@ -953,6 +964,7 @@ end
 assign  REG_TMU.stb    = (pbs_state == P_ACC) && (pbs_win_q == PW_TMU);
 assign  REG_RTC.stb    = (pbs_state == P_ACC) && (pbs_win_q == PW_RTC);
 assign  REG_PORT.stb   = (pbs_state == P_ACC) && (pbs_win_q == PW_PRT);
+assign  REG_DMAC.stb   = (pbs_state == P_ACC) && (pbs_win_q == PW_DMA);
 
 assign  REG_TMU.we     = pbs_we_q;
 assign  REG_TMU.size   = pbs_size_q;
@@ -966,6 +978,10 @@ assign  REG_PORT.we    = pbs_we_q;
 assign  REG_PORT.size  = pbs_size_q;
 assign  REG_PORT.addr  = pbs_addr_q;
 assign  REG_PORT.wdata = pbs_wdata_q;
+assign  REG_DMAC.we    = pbs_we_q;
+assign  REG_DMAC.size  = pbs_size_q;
+assign  REG_DMAC.addr  = pbs_addr_q;
+assign  REG_DMAC.wdata = pbs_wdata_q;
 
 
 
