@@ -13,10 +13,14 @@
     (p.363). Scope: auto / CMT / external-DREQ requests, dual-direct +
     dual-indirect (ch3) + single-address units, byte/word/long + 16-byte
     (4-longword) sizes, cycle-steal + burst, fixed + round-robin
-    priority, ch2 source reload, DACK/DRAK. NMI/AE aborts (phase 6)
-    follow. Illegal setups (section 11.6: 16-byte combined with dec/
-    indirect/reload/on-chip RS, non-16n-aligned 16-byte addresses) are
-    NOT guarded - silicon says "operation not guaranteed".
+    priority, ch2 source reload, DACK/DRAK, NMIF/AE aborts (NMI edge
+    from the INTC; alignment checks + bus faults). Illegal setups
+    (section 11.6: 16-byte combined with dec/indirect/reload/on-chip
+    RS) are NOT guarded - silicon says "operation not guaranteed".
+    Deviations: 11.6 note 12 (WAIT ignored on 16-byte dual writes and
+    single dev->mem) is NOT implemented, the BSC honors WAIT everywhere;
+    11.6 notes 4/13 (standby/sleep restrictions) are software rules -
+    no standby machinery exists in this SoC yet.
 
     External request (ch0/1, section 11.3.2): DREQ is sampled on the
     CKIO falling edge (i_CKIO_NCEN); DS selects low-level or falling-
@@ -64,6 +68,9 @@ module dmac (
 
     /* BUS ARBITER HOOK */
     output  wire            o_BUS_HOLD,     //transfer-unit / burst bus hold (arb i_DMA_HOLD)
+
+    /* ABORT HOOK - INTC NMI edge sets NMIF even while idle (11.6 note 3) */
+    input   wire            i_NMI_SET,
 
     /* DREQ/DACK/DRAK - Port D pads (table 18.1); DACK windows from the BSC */
     input   wire    [1:0]   i_DREQ_n,       //DREQ0/1 pad levels (PTD4/PTD6, active-low)
@@ -202,8 +209,8 @@ dmac_channel #(.CH_ID(3), .HAS_INDIRECT(1'b1)) u_ch3 (
 /*
     DMAOR lives in word-view lanes 3:2 (16-bit register at 0x60, big-
     endian): PR = view bits 25:24, AE/NMIF/DME = view bits 18:16. AE and
-    NMIF are write-0-only; their set conditions (DMAC address error, NMI
-    edge from the INTC) arrive with the transfer/abort phases.
+    NMIF are write-0-only; NMIF sets on the INTC's NMI edge (i_NMI_SET),
+    AE on the engine's address-error checks (ae_set, engine section).
 
     CMT (section 11.4): CMCNT0 counts up on the CKS-selected P-phi tap
     while STR0 = 1; at CMCNT0 == CMCOR0 the counter clears and CMF sets
@@ -236,6 +243,8 @@ wire            wr_cmcnt = wr_cmt_b && (wm_lane[3] || wm_lane[2]);  //CMCNT0 = v
 wire            cmt_match = cmstr_str0 && cmt_tick && (cmcnt == cmcor);
 wire            cmt_fire  = cmt_match && !wr_cmcnt; //CMF set + DMA request (fig 11.27)
 
+logic           ae_set;                     //engine: address-error abort (defined below)
+
 always_ff @(posedge i_CLK or negedge i_RST_n) begin
     if(!i_RST_n) begin
         pr    <= 2'd0;
@@ -253,12 +262,15 @@ always_ff @(posedge i_CLK or negedge i_RST_n) begin
     else begin if(i_CEN) begin
         if(wr_dmaor) begin
             if(wm_lane[3]) pr <= wd_lane[25:24];
-            if(wm_lane[2]) begin
-                dme  <= wd_lane[16];
-                ae   <= ae   & wd_lane[18];     //write-0-only flags (p.343)
-                nmif <= nmif & wd_lane[17];
-            end
+            if(wm_lane[2]) dme <= wd_lane[16];
         end
+
+        //write-0-only flags (p.343): the hardware set outranks a same-edge
+        //clear; either flag high drops every ch_en = all channels suspend
+        if(i_NMI_SET)                   nmif <= 1'b1;
+        else if(wr_dmaor && wm_lane[2]) nmif <= nmif & wd_lane[17];
+        if(ae_set)                      ae   <= 1'b1;
+        else if(wr_dmaor && wm_lane[2]) ae   <= ae & wd_lane[18];
 
         if(wr_cmt_a && wm_lane[2]) begin        //CMSTR = view lanes 3:2
             cmstr_rsv  <= wd_lane[17];
@@ -324,9 +336,10 @@ end
                (the fig 11.12 cycle-steal boundary), then IDLE
 
     Ending laws (p.374): enables are checked at grant only - clearing
-    DE/DME mid-unit lets the WRITE of the pair complete (law d), the
-    channel then stops with TE unset. DMAC address error / NMIF arrive
-    in phase 6; rsp_fault is ignored until then.
+    DE/DME (or an NMI setting NMIF) mid-unit lets the unit complete
+    with registers updated (law d + p.375), the channel then stops with
+    TE unset. A DMAC address error instead sets AE and never runs (or
+    abandons) the offending unit - the block before unit_done below.
 */
 
 //DREQ pin sampler: 2FF sync at core rate, then the CKIO-falling-edge sample
@@ -453,11 +466,48 @@ always_comb begin
     endcase
 end
 
+/*
+    DMAC address error -> AE (fig 11.2 p.346, p.343): a misaligned
+    SAR/DAR (word=2n, long=4n, 16-byte=16n) is caught at grant BEFORE
+    the offending bus cycle fires; the ch3 pointer TABLE needs 4n (the
+    pointer fetch is LONG) and the FETCHED pointer is re-checked against
+    the data size at its return. A bus-reported fault (rsp_fault, e.g. a
+    reserved region) abandons the unit in flight with NO register step.
+    AE high drops every ch_en (all channels suspended), TE stays clear
+    (p.374); the handler clears AE by write-0 after read-1.
+*/
+
+logic   [3:0]   amask_w, amask_g;           //offending low addr bits per TS
+always_comb begin
+    unique case(ts_w)
+        2'd1:    amask_w = 4'b0001;
+        2'd2:    amask_w = 4'b0011;
+        2'd3:    amask_w = 4'b1111;
+        default: amask_w = 4'b0000;         //byte never misaligns
+    endcase
+    unique case(ts_g)
+        2'd1:    amask_g = 4'b0001;
+        2'd2:    amask_g = 4'b0011;
+        2'd3:    amask_g = 4'b1111;
+        default: amask_g = 4'b0000;
+    endcase
+end
+//single-address units only own their memory-side address (fig 11.10)
+wire    [3:0]   amask_s   = ch_chcr[win][20] ? 4'b0011 : amask_w;
+wire            align_bad = (~ch_rs_sgw[win] & |(ch_sar[win][3:0] & amask_s)) |
+                            (~ch_rs_sgr[win] & |(ch_dar[win][3:0] & amask_w));
+wire            ptr_bad   = |(I_BUS.rsp_rdata[3:0] & amask_g);
+
+wire            ae_fault  = I_BUS.rsp_valid && I_BUS.rsp_fault &&
+                            ((seq == S_RD_WAIT) || (seq == S_WR_WAIT) || (seq == S_PT_WAIT));
+assign  ae_set = ((seq == S_IDLE) && win_v && align_bad) || ae_fault ||
+                 ((seq == S_PT_WAIT) && I_BUS.rsp_valid && !I_BUS.rsp_fault && ptr_bad);
+
 wire            beat_last  = !sz16_q || (beat_q == 2'd3);   //16-byte: 4th beat ends the unit
-wire            unit_done  = (I_BUS.rsp_valid) && beat_last &&
+wire            unit_done  = (I_BUS.rsp_valid) && !I_BUS.rsp_fault && beat_last &&
                              ((seq == S_WR_WAIT) ||
                               (seq == S_RD_WAIT && mode_q == M_SGR));
-wire            grant_fire = (seq == S_IDLE) && win_v;
+wire            grant_fire = (seq == S_IDLE) && win_v && !align_bad;
 
 always_ff @(posedge i_CLK or negedge i_RST_n) begin
     if(!i_RST_n) begin
@@ -486,7 +536,9 @@ always_ff @(posedge i_CLK or negedge i_RST_n) begin
     else begin if(i_CEN) begin
         unique case(seq)
             S_IDLE: begin
-                if(win_v) begin             //start-up: latch the winner's unit
+                //a misaligned winner never launches: ae_set raises AE on this
+                //edge, ch_en (and win_v) drop on the next - no bus cycle fires
+                if(win_v && !align_bad) begin   //start-up: latch the winner's unit
                     grant_q <= win;
                     size_q  <= (ts_w == 2'b11) ? 2'd2 : ts_w;
                     sz16_q  <= (ts_w == 2'b11);
@@ -521,16 +573,22 @@ always_ff @(posedge i_CLK or negedge i_RST_n) begin
             S_PT_REQ:  if(I_BUS.req_ready) seq <= S_PT_WAIT;
             S_PT_WAIT: begin
                 if(I_BUS.rsp_valid) begin   //the fetched pointer IS the data read address
-                    addr_q  <= I_BUS.rsp_rdata;
-                    sarlo_q <= I_BUS.rsp_rdata[1:0];
-                    size_q  <= (ts_g == 2'b11) ? 2'd2 : ts_g;   //back to the data size
-                    seq     <= S_RD_REQ;
+                    if(I_BUS.rsp_fault || ptr_bad)  //address error: abandon the unit
+                        seq <= S_IDLE;
+                    else begin
+                        addr_q  <= I_BUS.rsp_rdata;
+                        sarlo_q <= I_BUS.rsp_rdata[1:0];
+                        size_q  <= (ts_g == 2'b11) ? 2'd2 : ts_g;   //back to the data size
+                        seq     <= S_RD_REQ;
+                    end
                 end
             end
             S_RD_REQ:  if(I_BUS.req_ready) seq <= S_RD_WAIT;
             S_RD_WAIT: begin
                 if(I_BUS.rsp_valid) begin
-                    if(sz16_q) begin        //16-byte: gather 4 longwords, then turn
+                    if(I_BUS.rsp_fault)     //bus fault: abandon, no write, no step
+                        seq <= S_IDLE;
+                    else if(sz16_q) begin   //16-byte: gather 4 longwords, then turn
                         buf_q[beat_q] <= I_BUS.rsp_rdata;
                         if(beat_q != 2'd3) begin
                             addr_q <= addr_q + 32'd4;   //source, +4, +8, +12 (fig 11.11)
@@ -560,7 +618,9 @@ always_ff @(posedge i_CLK or negedge i_RST_n) begin
             S_WR_REQ:  if(I_BUS.req_ready) seq <= S_WR_WAIT;
             S_WR_WAIT: begin
                 if(I_BUS.rsp_valid) begin
-                    if(sz16_q && beat_q != 2'd3) begin  //next longword of the 16-byte unit
+                    if(I_BUS.rsp_fault)     //bus fault: abandon, no step
+                        seq <= S_IDLE;
+                    else if(sz16_q && beat_q != 2'd3) begin  //next longword of the 16-byte unit
                         addr_q  <= addr_q + 32'd4;
                         wdata_q <= buf_q[beat_q + 2'd1];
                         beat_q  <= beat_q + 2'd1;

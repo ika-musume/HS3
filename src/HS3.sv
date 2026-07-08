@@ -440,6 +440,7 @@ rtc u_rtc (
 
 wire    [3:0]   dmac_dei;           //DEI0-3 transfer-end levels (IPRE, codes 0x800-0x860)
 wire    [1:0]   dack_pad, drak_pad; //DACK/DRAK pad levels, merged onto Port D below
+wire            dmac_nmi_set;       //INTC NMI edge -> DMAOR.NMIF (11.6 note 3)
 
 dmac u_dmac (
     .i_RST_n                (rst_all_n                              ),  //CHCR/DMAOR/CMT clear on any reset (p.332)
@@ -452,6 +453,8 @@ dmac u_dmac (
     .I_BUS                  (DMA_I_BUS                              ),
 
     .o_BUS_HOLD             (dmac_hold                              ),
+
+    .i_NMI_SET              (dmac_nmi_set                           ),
 
     //DREQ pins ride the Port D pads as inputs (table 18.1; INTC tap idiom)
     .i_DREQ_n               ({i_PTD_I[6], i_PTD_I[4]}               ),
@@ -589,6 +592,7 @@ intc u_intc (
 
     .o_NMI_VALID            (nmi_valid                              ),
     .o_NMI_BLMSK            (nmi_blmsk                              ),
+    .o_NMI_EDGE             (dmac_nmi_set                           ),
     .o_INT_VALID            (int_valid                              ),
     .o_INT_LEVEL            (int_level                              ),
     .o_INT_CODE             (int_code                               ),

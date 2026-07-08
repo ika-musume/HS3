@@ -260,3 +260,32 @@ Levers that COULD move the plateau (all bigger / need a decision):
 - Resources: registers 7,202/7,228/7,257 (phases-1-2: 7,018/6,985/7,002 —
   the ~+230 is the sequencer, DREQ/DRAK samplers, and single-address paths),
   memory bits identical (158,208).
+
+### Final re-baseline after DMAC phases 5-6 (2026-07-09, seeds 3/4/5) — NEUTRAL
+- RTL delta since phases 3-4: 16-byte 4-beat units (4x32 gather buffer,
+  registered +4 address stepping), ch3 indirect pointer-fetch states, ch2
+  source reload (SAR shadow + 4-counter in the channel), round-robin
+  priority (2-bit rr_head rotation), NMIF from the INTC's qualified NMI
+  edge (new intc o_NMI_EDGE port), AE address errors (grant-time alignment
+  masks + in-flight rsp_fault abandonment). Suites 83/83 + 103/103, all
+  laws bit-exact throughout.
+- Worst slack (i_CLK): seed3 −2.92 (dead on the frozen baseline again),
+  seed4 −3.98, seed5 −2.30. Mean −3.07 vs the −2.97/−2.98 historical
+  means: NEUTRAL within the documented plateau spread (identical-RTL
+  probes have swung −2.2..−3.9). Restricted Fmax 79.58/71.55/81.27 —
+  seed5's 81.27 is the best HS3 fit recorded.
+- Headlines are all the catalogued CPU advance-loop family: seed3
+  bram_addr→M10K address capture, seed4 fwd_lane_b_agu→AGU→M10K address
+  capture, seed5 fwd_dep_a_agu→AGU→exc-MMIO o_TEA decode.
+- Cones: **zero dmac/arb logic in any seed's top-20**. The specials
+  (16-byte beats, pointer states, rotation mux) and abort checks
+  (alignment masks off registered CHCR/SAR/DAR, flag set-priority) all
+  landed off the walls; the alignment cone feeds only the grant enable,
+  which was already a multi-level IDLE-only qualifier.
+- Resources: registers 7,430/7,343/7,402 (phases 3-4: 7,202/7,228/7,257 —
+  the ~+180 is the 4x32 buffer, rr_head/beat/sz16 state, sar_init shadow
+  + ro_cnt on ch2, and the AE/NMIF plumbing), memory bits identical
+  (158,208). Latch-inference log clean (the phases-1-2 10240 note stays
+  fixed).
+- DMAC campaign CLOSED: all six plan phases landed with per-phase OOC
+  gates; the DMAC never entered a top-20 path at any phase.

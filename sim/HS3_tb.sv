@@ -5262,6 +5262,333 @@ endtask
 
 
 ///////////////////////////////////////////////////////////
+//////  DMAC Aborts + Hardening (session 5, phase 6)
+////
+
+/*
+    NMIF (INTC NMI edge -> DMAOR, 11.6 note 3 + p.375 resume protocol),
+    AE (alignment at grant + bus fault in flight, p.343), a randomized
+    legal-config differential against a tb golden model under random
+    bus latency, and BREQ cutting a burst at the bus-cycle tier.
+*/
+
+task automatic test_dmac_nmi_abort;
+    integer idx, sent, c;
+    begin
+        begin_test("NMI->NMIF: sets while DMAC idle (11.6 note 3), aborts a burst w/o TE, resumes");
+        //phase A: DMAC fully idle AND the CPU vector blocked (reset SR.BL=1
+        //is left in place) - the NMI edge must still set NMIF, proving the
+        //hook is independent of both the engine and the CPU accept
+        eidx = 0;
+        emit_ldrn(1, 32'hA400_0060);                 // DMAOR
+        imem[eidx] = 16'h6011; eidx = eidx + 1;              // MOV.W @R1,R0
+        imem[eidx] = 16'hC802; eidx = eidx + 1;              // TST   #2,R0       ; T = !NMIF
+        imem[eidx] = 16'h89FC; eidx = eidx + 1;              // BT    .-2 (poll)
+        imem[eidx] = 16'hE240; eidx = eidx + 1;              // MOV   #0x40,R2
+        imem[eidx] = 16'h6011; eidx = eidx + 1;              // MOV.W @R1,R0
+        imem[eidx] = 16'h1203; eidx = eidx + 1;              // mb3 = DMAOR (NMIF, DME=0)
+        imem[eidx] = 16'hE000; eidx = eidx + 1;              // MOV   #0,R0
+        imem[eidx] = 16'h2101; eidx = eidx + 1;              // MOV.W R0,@R1      ; write-0 clear
+        imem[eidx] = 16'h6011; eidx = eidx + 1;              // MOV.W @R1,R0
+        imem[eidx] = 16'h1204; eidx = eidx + 1;              // mb4 = cleared readback
+        emit_sentinel_loop(eidx, sent);
+        do_reset;
+        nmi_pin = 1'b1;                              //pre-charge for the falling edge
+        run_cycles(400);
+        nmi_pin = 1'b0;                              //NMI while the DMAC is idle
+        run_until_retire(sent, 30000);
+        chk("NMIF set while idle",          dmem[16'h13], 32'h0000_0002);
+        chk("NMIF write-0 cleared",         dmem[16'h14], 32'h0000_0000);
+        chk("BL held the CPU out entirely", entry_count, 32'd0);
+        //phase B: NMI mid-burst - all channels suspend at the unit boundary
+        //(registers stay stepped, TE unset); handler clears NMIF -> resume
+        eidx = 0;
+        emit_sr_imask(eidx, 4'h0);
+        for(idx = 0; idx < 16; idx = idx + 1)
+            emit_poke_l(32'hA000_0100 + 32'(idx*4), 32'hB6B6_0001 + 32'(idx));
+        emit_poke_l(32'hA400_0020, 32'h0000_0100);   // SAR0
+        emit_poke_l(32'hA400_0024, 32'h0000_0200);   // DAR0
+        emit_poke_l(32'hA400_0028, 32'h0000_0010);   // DMATCR0 = 16
+        emit_poke_l(32'hA400_002C, 32'h0000_5431);   // CHCR0: inc/inc auto long BURST DE
+        emit_wreg_w(32'hA400_0060, 16'h0001);        // DMAOR: DME
+        emit_poll_te(32'hA400_002C);
+        emit_sentinel_loop(eidx, sent);
+        //dedicated handler: mb0 = INTEVT2, mb1 = DMAOR (NMIF|DME), clear NMIF
+        idx = 'h300;
+        imem[idx] = 16'hE240; idx = idx + 1;              // MOV   #0x40,R2
+        emit_a4_base(idx, 3);                             // R3 = 0xA4000000
+        imem[idx] = 16'h6432; idx = idx + 1;              // MOV.L @R3,R4      ; INTEVT2
+        imem[idx] = 16'h2242; idx = idx + 1;              // mb0
+        imem[idx] = 16'h6033; idx = idx + 1;              // MOV   R3,R0
+        imem[idx] = 16'hCB60; idx = idx + 1;              // OR    #0x60,R0    ; DMAOR
+        imem[idx] = 16'h6103; idx = idx + 1;              // MOV   R0,R1
+        imem[idx] = 16'h6011; idx = idx + 1;              // MOV.W @R1,R0
+        imem[idx] = 16'h1201; idx = idx + 1;              // mb1 = DMAOR (0x0003)
+        imem[idx] = 16'hE001; idx = idx + 1;              // MOV   #1,R0
+        imem[idx] = 16'h2101; idx = idx + 1;              // DMAOR = 1: NMIF clear, DME kept
+        for(c = 0; c < 8; c = c + 1) begin
+            imem[idx] = 16'h0009; idx = idx + 1;          // grace NOPs
+        end
+        imem[idx] = 16'h002B; idx = idx + 1;              // RTE
+        imem[idx] = 16'h0009; idx = idx + 1;              // NOP (delay slot)
+        do_reset;
+        c = 0;                                       //config lands, burst begins...
+        while(u_dut.u_dmac.u_ch0.tcr != 24'd16 && c < 30000) begin @(posedge clk); c = c + 1; end
+        c = 0;
+        while(u_dut.u_dmac.u_ch0.tcr > 24'd10 && c < 30000) begin @(posedge clk); c = c + 1; end
+        nmi_pin = 1'b1;                              //...NMI lands mid-count
+        run_cycles(8);
+        nmi_pin = 1'b0;
+        run_until_retire(sent, 60000);
+        chk("handler INTEVT2 = 0x1C0",      dmem[16'h10], 32'h0000_01C0);
+        chk("DMAOR in handler: NMIF|DME",   dmem[16'h11], 32'h0000_0003);
+        chk("resumed image [0]",            dmem[16'h80], 32'hB6B6_0001);
+        chk("resumed image [15]",           dmem[16'h8F], 32'hB6B6_0010);
+        chk("SAR0 end", u_dut.u_dmac.u_ch0.sar, 32'h0000_0140);
+        chk("DAR0 end", u_dut.u_dmac.u_ch0.dar, 32'h0000_0240);
+        chk("DMATCR0 end", {8'd0, u_dut.u_dmac.u_ch0.tcr}, 32'd0);
+        chk_true("TE set only at true completion", u_dut.u_dmac.u_ch0.te === 1'b1);
+        end_test;
+    end
+endtask
+
+task automatic test_dmac_addr_error;
+    integer idx, sent;
+    begin
+        begin_test("AE: misaligned SAR at grant (re-arms until fixed) + bus fault abandons in flight");
+        //phase A: long transfer with SAR = 4n+2 - AE before any bus cycle
+        eidx = 0;
+        emit_poke_l(32'hA000_0100, 32'hAE00_0001);   //src seed (used after the fix)
+        emit_poke_l(32'hA000_0104, 32'hAE00_0002);
+        emit_poke_l(32'hA400_0030, 32'h0000_0102);   // SAR1: misaligned for long
+        emit_poke_l(32'hA400_0034, 32'h0000_0200);   // DAR1
+        emit_poke_l(32'hA400_0038, 32'h0000_0002);   // DMATCR1 = 2
+        emit_poke_l(32'hA400_003C, 32'h0000_5411);   // CHCR1: inc/inc auto long cs DE
+        emit_wreg_w(32'hA400_0060, 16'h0001);        // DMAOR: DME
+        emit_ldrn(1, 32'hA400_0060);
+        imem[eidx] = 16'h6011; eidx = eidx + 1;              // MOV.W @R1,R0
+        imem[eidx] = 16'hC804; eidx = eidx + 1;              // TST   #4,R0       ; T = !AE
+        imem[eidx] = 16'h89FC; eidx = eidx + 1;              // BT    .-2 (poll AE)
+        imem[eidx] = 16'hE240; eidx = eidx + 1;              // MOV   #0x40,R2
+        imem[eidx] = 16'h6011; eidx = eidx + 1;              // MOV.W @R1,R0
+        imem[eidx] = 16'h2202; eidx = eidx + 1;              // mb0 = DMAOR (AE|DME)
+        emit_ldrn(1, 32'hA400_0038);
+        imem[eidx] = 16'h6012; eidx = eidx + 1;              // MOV.L @R1,R0
+        imem[eidx] = 16'h1201; eidx = eidx + 1;              // mb1 = DMATCR1 untouched
+        emit_wreg_w(32'hA400_0060, 16'h0001);        // clear AE, config still bad...
+        emit_ldrn(1, 32'hA400_0060);
+        imem[eidx] = 16'h6011; eidx = eidx + 1;              // MOV.W @R1,R0
+        imem[eidx] = 16'hC804; eidx = eidx + 1;              // TST   #4,R0
+        imem[eidx] = 16'h89FC; eidx = eidx + 1;              // BT    .-2 (...AE re-arms)
+        imem[eidx] = 16'h6011; eidx = eidx + 1;              // MOV.W @R1,R0
+        imem[eidx] = 16'h1202; eidx = eidx + 1;              // mb2 = DMAOR (AE|DME again)
+        emit_poke_l(32'hA400_003C, 32'h0000_0000);   // fix: DE off first
+        emit_poke_l(32'hA400_0030, 32'h0000_0100);   // SAR1 aligned
+        emit_poke_l(32'hA400_003C, 32'h0000_5411);   // DE on
+        emit_wreg_w(32'hA400_0060, 16'h0001);        // AE clear LAST (11.6 note 6)
+        emit_poll_te(32'hA400_003C);
+        emit_ldrn(1, 32'hA400_0030);
+        imem[eidx] = 16'h6012; eidx = eidx + 1;              // MOV.L @R1,R0
+        imem[eidx] = 16'h1203; eidx = eidx + 1;              // mb3 = SAR1 end
+        emit_sentinel_loop(eidx, sent);
+        do_reset;
+        run_until_retire(sent, 60000);
+        chk("AE set, no transfer ran",      dmem[16'h10], 32'h0000_0005);
+        chk("DMATCR1 untouched under AE",   dmem[16'h11], 32'h0000_0002);
+        chk("AE re-arms while config bad",  dmem[16'h12], 32'h0000_0005);
+        chk("SAR1 end after fix",           dmem[16'h13], 32'h0000_0108);
+        chk("post-fix image [0]",           dmem[16'h80], 32'hAE00_0001);
+        chk("post-fix image [1]",           dmem[16'h81], 32'hAE00_0002);
+        //phase B: aligned addresses, but the bus faults the read - the unit
+        //is abandoned in flight: no write, no register step, TE unset
+        eidx = 0;
+        emit_poke_l(32'hA000_0280, 32'hDEAD_BEEF);   //dst sentinel: must survive
+        emit_poke_l(32'hA400_0020, 32'h0000_0180);   // SAR0 = the faulted word
+        emit_poke_l(32'hA400_0024, 32'h0000_0280);   // DAR0
+        emit_poke_l(32'hA400_0028, 32'h0000_0002);   // DMATCR0 = 2
+        emit_poke_l(32'hA400_002C, 32'h0000_5411);   // CHCR0: inc/inc auto long cs DE
+        emit_wreg_w(32'hA400_0060, 16'h0001);        // DMAOR: DME
+        emit_ldrn(1, 32'hA400_0060);
+        imem[eidx] = 16'h6011; eidx = eidx + 1;              // MOV.W @R1,R0
+        imem[eidx] = 16'hC804; eidx = eidx + 1;              // TST   #4,R0
+        imem[eidx] = 16'h89FC; eidx = eidx + 1;              // BT    .-2 (poll AE)
+        imem[eidx] = 16'hE240; eidx = eidx + 1;              // MOV   #0x40,R2
+        imem[eidx] = 16'h6011; eidx = eidx + 1;              // MOV.W @R1,R0
+        imem[eidx] = 16'h2202; eidx = eidx + 1;              // mb0 = DMAOR (AE|DME)
+        emit_ldrn(1, 32'hA400_0028);
+        imem[eidx] = 16'h6012; eidx = eidx + 1;              // MOV.L @R1,R0
+        imem[eidx] = 16'h1201; eidx = eidx + 1;              // mb1 = DMATCR0 (no step)
+        emit_ldrn(1, 32'hA400_0020);
+        imem[eidx] = 16'h6012; eidx = eidx + 1;              // MOV.L @R1,R0
+        imem[eidx] = 16'h1202; eidx = eidx + 1;              // mb2 = SAR0 (no step)
+        emit_poke_l(32'hA400_002C, 32'h0000_0000);   // DE off
+        emit_wreg_w(32'hA400_0060, 16'h0000);        // AE clear + DME off (leave idle)
+        emit_sentinel_loop(eidx, sent);
+        d_fault_en   = 1'b1;                         //fault the DMA read target only
+        d_fault_widx = 8'h60;                        //word 0x60 = byte address 0x180
+        do_reset;
+        run_until_retire(sent, 60000);
+        d_fault_en   = 1'b0;
+        d_fault_widx = 8'd0;
+        chk("bus fault set AE",             dmem[16'h10], 32'h0000_0005);
+        chk("DMATCR0 not stepped",          dmem[16'h11], 32'h0000_0002);
+        chk("SAR0 not stepped",             dmem[16'h12], 32'h0000_0180);
+        chk("abandoned unit wrote nothing", dmem[16'hA0], 32'hDEAD_BEEF);
+        chk_true("TE unset on AE abort",    u_dut.u_dmac.u_ch0.te === 1'b0);
+        end_test;
+    end
+endtask
+
+//big-endian lane helpers for the randomized differential's golden model
+function automatic logic [31:0] lane_get(input logic [31:0] l, input logic [1:0] a,
+                                         input logic [1:0] ts);
+    begin
+        case(ts)
+            2'd0:    lane_get = {24'd0, l[(3 - a)*8 +: 8]};
+            2'd1:    lane_get = {16'd0, a[1] ? l[15:0] : l[31:16]};
+            default: lane_get = l;
+        endcase
+    end
+endfunction
+
+function automatic logic [31:0] lane_put(input logic [31:0] old, input logic [31:0] d,
+                                         input logic [1:0] a, input logic [1:0] ts);
+    begin
+        lane_put = old;
+        case(ts)
+            2'd0:    lane_put[(3 - a)*8 +: 8] = d[7:0];
+            2'd1:    if(a[1]) lane_put[15:0] = d[15:0]; else lane_put[31:16] = d[15:0];
+            default: lane_put = d;
+        endcase
+    end
+endfunction
+
+task automatic test_dmac_random_diff;
+    integer r, i, k, sent, mism, ch, ts, sm, dm, tm, cnt, s, maxu, slot_s, slot_d;
+    logic   [31:0]  sar0, dar0, sa, da, datum, regbase;
+    logic   [31:0]  exp_dst [0:15];
+    logic   [31:0]  pool_l  [0:15];
+    begin
+        begin_test("Randomized differential: 12 legal configs vs golden model, random bus latency");
+        //seed a 16-long source pool once; every round re-snapshots it and the
+        //destination window from dmem, so rounds compose without re-seeding
+        eidx = 0;
+        for(i = 0; i < 16; i = i + 1)
+            emit_poke_l(32'hA000_0080 + 32'(i*4), $urandom);
+        emit_sentinel_loop(eidx, sent);
+        do_reset;
+        run_until_retire(sent, 30000);
+        for(r = 0; r < 12; r = r + 1) begin
+            //draw a legal config: every 4th round is 16-byte (inc/fixed only,
+            //16n addresses); dec walks start at the window's high end
+            ch = $urandom % 4;
+            ts = (r % 4 == 3) ? 3 : ($urandom % 3);
+            if(ts == 3) begin
+                sm = $urandom % 2;   dm = $urandom % 2;
+                cnt = 1 + ($urandom % 2);
+                s = 16;
+            end
+            else begin
+                sm = $urandom % 3;   dm = $urandom % 3;
+                cnt = 1 + ($urandom % 6);
+                s = 1 << ts;
+            end
+            maxu   = 64 / s;
+            slot_s = $urandom % (maxu - cnt + 1);
+            slot_d = $urandom % (maxu - cnt + 1);
+            sar0 = 32'h0000_0080 + 32'(((sm == 2) ? (slot_s + cnt - 1) : slot_s) * s);
+            dar0 = 32'h0000_0200 + 32'(((dm == 2) ? (slot_d + cnt - 1) : slot_d) * s);
+            tm = $urandom % 2;
+            d_latency = $urandom % 4;                //the invariance oracle: the golden
+                                                     //model never sees the latency
+            //golden model over tb snapshots
+            for(i = 0; i < 16; i = i + 1) pool_l[i]  = dmem[16'h20 + 16'(i)];
+            for(i = 0; i < 16; i = i + 1) exp_dst[i] = dmem[16'h80 + 16'(i)];
+            sa = sar0;  da = dar0;
+            for(i = 0; i < cnt; i = i + 1) begin
+                if(ts == 3) begin
+                    for(k = 0; k < 4; k = k + 1)
+                        exp_dst[integer'(da[5:2]) + k] = pool_l[integer'(sa[5:2]) + k];
+                end
+                else begin
+                    datum = lane_get(pool_l[sa[5:2]], sa[1:0], ts[1:0]);
+                    exp_dst[da[5:2]] = lane_put(exp_dst[da[5:2]], datum, da[1:0], ts[1:0]);
+                end
+                if(sm == 1) sa = sa + 32'(s); else if(sm == 2) sa = sa - 32'(s);
+                if(dm == 1) da = da + 32'(s); else if(dm == 2) da = da - 32'(s);
+            end
+            //program the drawn channel and run to TE
+            eidx = 0;
+            regbase = 32'hA400_0020 + 32'(ch * 16);
+            emit_poke_l(regbase + 32'd0,  sar0);
+            emit_poke_l(regbase + 32'd4,  dar0);
+            emit_poke_l(regbase + 32'd8,  32'(cnt));
+            emit_poke_l(regbase + 32'd12, (32'(dm) << 14) | (32'(sm) << 12) | 32'h0000_0400 |
+                                          (32'(tm) << 5)  | (32'(ts) << 3)  | 32'h0000_0001);
+            emit_wreg_w(32'hA400_0060, 16'h0001);    // DMAOR: DME
+            emit_poll_te(regbase + 32'd12);
+            emit_poke_l(regbase + 32'd12, 32'd0);    // DE off + TE clear for the next round
+            emit_sentinel_loop(eidx, sent);
+            do_reset;
+            run_until_retire(sent, 60000);
+            mism = 0;
+            for(i = 0; i < 16; i = i + 1)
+                if(dmem[16'h80 + 16'(i)] !== exp_dst[i]) mism = mism + 1;
+            if(mism != 0)
+                $display("      [rnd %0d] ch%0d ts%0d sm%0d dm%0d tm%0d cnt%0d sar %08x dar %08x lat %0d",
+                         r, ch, ts, sm, dm, tm, cnt, sar0, dar0, d_latency);
+            chk_true($sformatf("round %0d image (ch%0d ts%0d cnt%0d)", r, ch, ts, cnt), mism == 0);
+            chk_true($sformatf("round %0d SAR end", r), u_dut.u_dmac.ch_sar[ch] === sa);
+            chk_true($sformatf("round %0d DAR end", r), u_dut.u_dmac.ch_dar[ch] === da);
+            chk_true($sformatf("round %0d TCR end", r), u_dut.u_dmac.ch_tcr[ch] === 24'd0);
+        end
+        d_latency = 0;
+        end_test;
+    end
+endtask
+
+task automatic test_dmac_breq_cut;
+    integer idx, sent, c, saw_back;
+    begin
+        begin_test("BREQ cuts a burst: pair split at the bus-cycle tier, unit results intact");
+        eidx = 0;
+        for(idx = 0; idx < 8; idx = idx + 1)
+            emit_poke_l(32'hA000_0100 + 32'(idx*4), 32'hB4B4_0001 + 32'(idx));
+        emit_poke_l(32'hA400_0020, 32'h0000_0100);   // SAR0
+        emit_poke_l(32'hA400_0024, 32'h0000_0200);   // DAR0
+        emit_poke_l(32'hA400_0028, 32'h0000_0008);   // DMATCR0 = 8
+        emit_poke_l(32'hA400_002C, 32'h0000_5431);   // CHCR0: inc/inc auto long BURST DE
+        emit_wreg_w(32'hA400_0060, 16'h0001);        // DMAOR: DME
+        emit_poll_te(32'hA400_002C);
+        emit_sentinel_loop(eidx, sent);
+        do_reset;
+        c = 0;                                       //burst begins...
+        while(u_dut.u_dmac.u_ch0.tcr != 24'd8 && c < 30000) begin @(posedge clk); c = c + 1; end
+        c = 0;
+        while(u_dut.u_dmac.u_ch0.tcr > 24'd6 && c < 30000) begin @(posedge clk); c = c + 1; end
+        saw_back = 0;                                //...six board-bus grabs walk across it
+        for(idx = 0; idx < 6; idx = idx + 1) begin
+            breq_n = 1'b0;
+            c = 0;
+            while(back_n !== 1'b0 && c < 2000) begin @(posedge clk); c = c + 1; end
+            if(back_n === 1'b0) saw_back = saw_back + 1;
+            run_cycles(4);
+            breq_n = 1'b1;
+            run_cycles(9);                           //odd spacing: pulses walk the R/W pair
+        end
+        run_until_retire(sent, 60000);
+        chk_true("bus granted 6x during the burst", saw_back == 6);
+        for(idx = 0; idx < 8; idx = idx + 1)
+            chk("image long", dmem[16'h80 + 16'(idx)], 32'hB4B4_0001 + 32'(idx));
+        chk("SAR0 end", u_dut.u_dmac.u_ch0.sar, 32'h0000_0120);
+        chk("DAR0 end", u_dut.u_dmac.u_ch0.dar, 32'h0000_0220);
+        chk("DMATCR0 end", {8'd0, u_dut.u_dmac.u_ch0.tcr}, 32'd0);
+        end_test;
+    end
+endtask
+
+
+///////////////////////////////////////////////////////////
 //////  Main Sequence
 ////
 
@@ -5402,7 +5729,13 @@ initial begin
     test_dmac_ch3_indirect;
     test_dmac_round_robin;
 
-    group("19. Board-bus shape monitors (whole run)");
+    group("19. DMAC aborts + hardening (session 5, phase 6)");
+    test_dmac_nmi_abort;
+    test_dmac_addr_error;
+    test_dmac_random_diff;
+    test_dmac_breq_cut;
+
+    group("20. Board-bus shape monitors (whole run)");
     test_bus_monitors;
 
     $display("");
