@@ -216,3 +216,27 @@ Levers that COULD move the plateau (all bigger / need a decision):
 - Resources: 8,363/8,340/8,346 ALMs (20%), registers 6,516/6,520/6,509
   (baseline 6,531/6,608/6,567 — fitter duplication noise swallows the ~60
   new flops), block memory bits identical (158,208).
+
+### Re-baseline after DMAC phases 1-2 (2026-07-08, seeds 3/4/5) — NEUTRAL
+- RTL delta since the BSC Group C re-baseline: DMAC register block (`dmac.sv` +
+  `dmac_channel.sv` x4: SAR/DAR/DMATCR/CHCR quads, DMAOR, full CMT counter) on a
+  new BSC P-bus window 0x04000020-77, DEI->INTC wiring, the IBus_1 DMAC sideband
+  (req_dack/_ch/_al, req_saddr; cache ties off), and `ibus_arb` inserted between
+  the cache master and the splitter (owner flop parked on CPU, single 2:1 mux
+  with registered select, DMAC leg tied off). Suites 67/67 + 103/103, laws
+  bit-exact (the arb's zero-cost idle path held).
+- Worst slack (i_CLK): seed3 −2.92→−3.03 (−0.11), seed4 −3.22→−3.20 (+0.02),
+  seed5 −2.78→−2.70 (+0.08). Mean −2.97→−2.98; every delta deep inside the
+  ±0.4 ns fit-noise band. Restricted Fmax 76.78 / 75.76 / 78.76 MHz.
+- Cones: **zero arb/dmac logic in any seed's top-20** — the plateau is the same
+  int_pipe forwarding/pair + AGU set (u_agu_d, fwd_lane_b_agu, pair_pc/
+  pair_capture, gpr_2r2w, nx_read0). The 2:1 arb mux on the reqn/addr class is
+  timing-invisible at this fit; the frozen cache-wall verdict stands.
+- Resources: registers 7,018/6,985/7,002 (baseline 6,516/6,520/6,509 — the
+  ~+490 is the DMAC regfile + CMT + arb owner/track flops), memory bits
+  identical (158,208).
+- Note: these runs flagged Quartus 10240 latch-inference on the parameter-absent
+  CHCR bits (reset-only assignment when the feature param is false) —
+  functionally benign (bits sweep to GND) and fixed in-tree right after by
+  gating the assigned VALUE instead of the assignment; next OOC should log clean.
+- Config note: the three new sources were added to eval_ooc/HS3/config*.json.

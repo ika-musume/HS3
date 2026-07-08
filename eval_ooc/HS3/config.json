@@ -23,6 +23,9 @@
     "../../src/peri/tmu.sv",
     "../../src/peri/rtc.sv",
     "../../src/peri/ioport.sv",
+    "../../src/peri/ibus_arb.sv",
+    "../../src/peri/dmac_channel.sv",
+    "../../src/peri/dmac.sv",
     "../../src/HS3.sv",
     "HS3_ooc_top.sv"
   ],

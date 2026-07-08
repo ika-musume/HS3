@@ -99,15 +99,16 @@ always_ff @(posedge i_CLK or negedge i_RST_n) begin
             if(i_WR_TCR && i_WMASK[b]) tcr[b*8 +: 8] <= i_WDATA[b*8 +: 8];
         end
 
+        //absent-feature bits load constant 0 (write invalid, read 0, p.336):
+        //gating the VALUE, not the assignment, keeps a real flop D input -
+        //an if(PARAM)-guarded assign makes Quartus infer a reset-only latch
         if(i_WR_CHCR) begin
             if(i_WMASK[2]) begin            //bits 23:16 - the channel-exclusive controls
-                if(HAS_INDIRECT) di <= i_WDATA[20];
-                if(HAS_RELOAD)   ro <= i_WDATA[19];
-                if(HAS_EXT) begin
-                    rl <= i_WDATA[18];
-                    am <= i_WDATA[17];
-                    al <= i_WDATA[16];
-                end
+                di <= HAS_INDIRECT ? i_WDATA[20] : 1'b0;
+                ro <= HAS_RELOAD   ? i_WDATA[19] : 1'b0;
+                rl <= HAS_EXT      ? i_WDATA[18] : 1'b0;
+                am <= HAS_EXT      ? i_WDATA[17] : 1'b0;
+                al <= HAS_EXT      ? i_WDATA[16] : 1'b0;
             end
             if(i_WMASK[1]) begin            //bits 15:8
                 dm <= i_WDATA[15:14];
@@ -115,7 +116,7 @@ always_ff @(posedge i_CLK or negedge i_RST_n) begin
                 rs <= i_WDATA[11:8];
             end
             if(i_WMASK[0]) begin            //bits 7:0 (TE handled below)
-                if(HAS_EXT) ds <= i_WDATA[6];
+                ds <= HAS_EXT ? i_WDATA[6] : 1'b0;
                 tm <= i_WDATA[5];
                 ts <= i_WDATA[4:3];
                 ie <= i_WDATA[2];
