@@ -11,9 +11,12 @@
     and calls the BSC like a function - external bus cycles are shaped
     by the BSC "in the same way as when the CPU is the bus master"
     (p.363). Scope: auto / CMT / external-DREQ requests, dual-direct +
-    single-address units, byte/word/long, cycle-steal + burst, fixed
-    priority, DACK/DRAK. 16-byte/reload/indirect/round-robin (phase 5)
-    and NMI/AE aborts (phase 6) follow.
+    dual-indirect (ch3) + single-address units, byte/word/long + 16-byte
+    (4-longword) sizes, cycle-steal + burst, fixed + round-robin
+    priority, ch2 source reload, DACK/DRAK. NMI/AE aborts (phase 6)
+    follow. Illegal setups (section 11.6: 16-byte combined with dec/
+    indirect/reload/on-chip RS, non-16n-aligned 16-byte addresses) are
+    NOT guarded - silicon says "operation not guaranteed".
 
     External request (ch0/1, section 11.3.2): DREQ is sampled on the
     CKIO falling edge (i_CKIO_NCEN); DS selects low-level or falling-
@@ -156,6 +159,8 @@ wire    [23:0]  ch_tcr  [0:3];
 wire    [31:0]  ch_chcr [0:3];
 
 logic   [3:0]   ch_upd;                     //sequencer: unit completed on channel c
+logic   [3:0]   ch_en;                      //live channel enables (request comb below);
+                                            //fed back as i_EN for the ch2 reload counter
 
 //feature asymmetry per pp.336-342: DREQ/DACK bits on ch0/1, reload on
 //ch2, indirect on ch3; i_UPD drives each channel's iteration datapath
@@ -163,28 +168,28 @@ dmac_channel #(.CH_ID(0), .HAS_EXT(1'b1)) u_ch0 (
     .i_RST_n(i_RST_n), .i_CLK(i_CLK), .i_CEN(i_CEN),
     .i_WR_SAR(wr_sar[0]), .i_WR_DAR(wr_dar[0]), .i_WR_TCR(wr_tcr[0]), .i_WR_CHCR(wr_chcr[0]),
     .i_WDATA(wd_lane), .i_WMASK(wm_lane),
-    .i_UPD(ch_upd[0]), .i_UPD_MASK(upd_mask),
+    .i_UPD(ch_upd[0]), .i_UPD_MASK(upd_mask), .i_EN(ch_en[0]),
     .o_SAR(ch_sar[0]), .o_DAR(ch_dar[0]), .o_TCR(ch_tcr[0]), .o_CHCR(ch_chcr[0])
 );
 dmac_channel #(.CH_ID(1), .HAS_EXT(1'b1)) u_ch1 (
     .i_RST_n(i_RST_n), .i_CLK(i_CLK), .i_CEN(i_CEN),
     .i_WR_SAR(wr_sar[1]), .i_WR_DAR(wr_dar[1]), .i_WR_TCR(wr_tcr[1]), .i_WR_CHCR(wr_chcr[1]),
     .i_WDATA(wd_lane), .i_WMASK(wm_lane),
-    .i_UPD(ch_upd[1]), .i_UPD_MASK(upd_mask),
+    .i_UPD(ch_upd[1]), .i_UPD_MASK(upd_mask), .i_EN(ch_en[1]),
     .o_SAR(ch_sar[1]), .o_DAR(ch_dar[1]), .o_TCR(ch_tcr[1]), .o_CHCR(ch_chcr[1])
 );
 dmac_channel #(.CH_ID(2), .HAS_RELOAD(1'b1)) u_ch2 (
     .i_RST_n(i_RST_n), .i_CLK(i_CLK), .i_CEN(i_CEN),
     .i_WR_SAR(wr_sar[2]), .i_WR_DAR(wr_dar[2]), .i_WR_TCR(wr_tcr[2]), .i_WR_CHCR(wr_chcr[2]),
     .i_WDATA(wd_lane), .i_WMASK(wm_lane),
-    .i_UPD(ch_upd[2]), .i_UPD_MASK(upd_mask),
+    .i_UPD(ch_upd[2]), .i_UPD_MASK(upd_mask), .i_EN(ch_en[2]),
     .o_SAR(ch_sar[2]), .o_DAR(ch_dar[2]), .o_TCR(ch_tcr[2]), .o_CHCR(ch_chcr[2])
 );
 dmac_channel #(.CH_ID(3), .HAS_INDIRECT(1'b1)) u_ch3 (
     .i_RST_n(i_RST_n), .i_CLK(i_CLK), .i_CEN(i_CEN),
     .i_WR_SAR(wr_sar[3]), .i_WR_DAR(wr_dar[3]), .i_WR_TCR(wr_tcr[3]), .i_WR_CHCR(wr_chcr[3]),
     .i_WDATA(wd_lane), .i_WMASK(wm_lane),
-    .i_UPD(ch_upd[3]), .i_UPD_MASK(upd_mask),
+    .i_UPD(ch_upd[3]), .i_UPD_MASK(upd_mask), .i_EN(ch_en[3]),
     .o_SAR(ch_sar[3]), .o_DAR(ch_dar[3]), .o_TCR(ch_tcr[3]), .o_CHCR(ch_chcr[3])
 );
 
@@ -292,21 +297,29 @@ end
     One transfer unit at a time: the dual-direct pair = read at SAR then
     write at DAR (figs 11.5/11.6). Per-edge dataflow (core clock, i_CEN):
 
-      IDLE     ch_req (pending&enable regs, ~2 lvl) -> fixed-priority win
-               (~2 lvl, p.349) -> latch grant_q/addr_q(=SAR)/sarlo_q/size_q,
-               clear a cycle-steal pending (request withdrawn at the FIRST
-               transfer, p.348), go RD_REQ
+      IDLE     ch_req (pending&enable regs, ~2 lvl) -> priority win (~2
+               lvl: fixed orders p.349, round-robin rotation fig 11.3) ->
+               latch grant_q/addr_q(=SAR)/sarlo_q/size_q/beat_q=0, clear
+               a cycle-steal pending (request withdrawn at the FIRST
+               transfer, p.348); ch3-DI -> PT_REQ, dev->mem single ->
+               WR_REQ, else RD_REQ
+      PT_REQ/  ch3 indirect pointer fetch at SAR3, always LONG (p.339);
+      PT_WAIT  rsp: addr_q <= the pointer = the data read address, size_q
+               <= TS, go RD_REQ (fig 11.7; 32-bit bus, so no split reads
+               and no NOP alignment cycle of the 16-bit fig 11.8 case)
       RD_REQ   req_valid high, addr/size straight from regs (flat cone
                through the arb 2:1); accept -> RD_WAIT
       RD_WAIT  rsp_valid: extract the SAR-lane datum (shift ~2 lvl),
                replicate onto lanes, latch wdata_q/wstrb_q(DAR lane)/
-               addr_q(=DAR), go WR_REQ
+               addr_q(=DAR), go WR_REQ; a 16-byte unit gathers 4 longword
+               beats into buf_q first (addr +4 per beat, fig 11.11)
       WR_REQ   req_valid+write; accept -> WR_WAIT
-      WR_WAIT  rsp_valid (posted-write ack): ch_upd strobe (channel steps
-               SAR/DAR/DMATCR, sets TE on the last unit); burst -> IDLE
-               (priority re-resolved EVERY unit boundary: a higher-priority
-               channel preempts between units, fig 11.14, but o_BUS_HOLD
-               keeps the CPU off); cycle-steal -> GAP
+      WR_WAIT  rsp_valid (posted-write ack): 16-byte plays 4 beats from
+               buf_q, then ch_upd strobe (channel steps SAR/DAR/DMATCR,
+               sets TE on the last unit); burst -> IDLE (priority re-
+               resolved EVERY unit boundary: a higher-priority channel
+               preempts between units, fig 11.14, but o_BUS_HOLD keeps
+               the CPU off); cycle-steal -> GAP
       GAP      one request-free cycle so the arb owner returns to the CPU
                (the fig 11.12 cycle-steal boundary), then IDLE
 
@@ -339,7 +352,7 @@ wire    [1:0]   dreq_lvl = ~dreq_smp;       //DS=0: low-level detection (p.347)
 //the pend_ext edge latch per DS. Unimplemented RS codes (IrDA/SCIF/A-D) inert.
 logic   [3:0]   pend;                       //CMT request latch per channel
 logic   [1:0]   pend_ext;                   //DREQ falling-edge latch (DS=1)
-logic   [3:0]   ch_en, ch_req, ch_tm_v, ch_rs_cmt, ch_rs_ext, ch_rs_sgr, ch_rs_sgw;
+logic   [3:0]   ch_req, ch_tm_v, ch_rs_cmt, ch_rs_ext, ch_rs_sgr, ch_rs_sgw;
 always_comb begin
     for(int c = 0; c < 4; c++) begin
         logic rs_auto, ext_line;
@@ -359,21 +372,28 @@ always_comb begin
     end
 end
 
-//fixed channel priority (p.349); PR=11 is round-robin (phase 5) - until
-//then it resolves like the reset order
+//channel priority (p.349): three fixed orders, or PR=11 round-robin. The
+//served channel dropping to the bottom keeps the order a PURE ROTATION
+//(check fig 11.3's worked cases) - rr_head names the current top channel
+logic   [1:0]   rr_head;                    //round-robin top = last served + 1
 logic   [1:0]   win;
 always_comb begin
     unique case(pr)
         2'b01:   win = ch_req[0] ? 2'd0 : ch_req[2] ? 2'd2 : ch_req[3] ? 2'd3 : 2'd1;
         2'b10:   win = ch_req[2] ? 2'd2 : ch_req[0] ? 2'd0 : ch_req[1] ? 2'd1 : 2'd3;
+        2'b11:   win = ch_req[rr_head        ] ? rr_head :
+                       ch_req[rr_head + 2'd1] ? rr_head + 2'd1 :
+                       ch_req[rr_head + 2'd2] ? rr_head + 2'd2 : rr_head + 2'd3;
         default: win = ch_req[0] ? 2'd0 : ch_req[1] ? 2'd1 : ch_req[2] ? 2'd2 : 2'd3;
     endcase
 end
 wire            win_v = |ch_req;
 
-//sequencer state ("seq"): the unit pipeline above
+//sequencer state ("seq"): the unit pipeline above; PT = the ch3 indirect
+//pointer fetch prologue (fig 11.7)
 localparam logic [2:0] S_IDLE = 3'd0, S_RD_REQ = 3'd1, S_RD_WAIT = 3'd2,
-                       S_WR_REQ = 3'd3, S_WR_WAIT = 3'd4, S_GAP = 3'd5;
+                       S_WR_REQ = 3'd3, S_WR_WAIT = 3'd4, S_GAP = 3'd5,
+                       S_PT_REQ = 3'd6, S_PT_WAIT = 3'd7;
 //unit shape: dual R->W, or ONE single-address cycle (read for mem->dev,
 //write-with-external-drive for dev->mem, figs 11.9-11.10); bit1 = single
 localparam logic [1:0] M_DUAL = 2'b00, M_SGR = 2'b10, M_SGW = 2'b11;
@@ -381,7 +401,10 @@ logic   [2:0]   seq;
 logic   [1:0]   mode_q;                     //granted unit shape (M_*)
 logic   [1:0]   grant_q;                    //granted channel (registered mux select)
 logic   [1:0]   sarlo_q;                    //granted SAR[1:0]: read-lane pick
-logic   [1:0]   size_q;                     //granted TS size
+logic   [1:0]   size_q;                     //bus access size (16-byte moves as long beats)
+logic           sz16_q;                     //granted unit is 16-byte: 4 longword beats
+logic   [1:0]   beat_q;                     //longword beat index within a 16-byte unit
+logic   [31:0]  buf_q [0:3];                //16-byte unit gather buffer (fig 11.11)
 logic   [31:0]  addr_q;                     //read address, then write address
 logic   [31:0]  wdata_q;                    //lane-replicated write data
 logic   [3:0]   wstrb_q;                    //DAR-lane strobes
@@ -393,6 +416,7 @@ logic   [1:0]   drak_q, drak_vis;           //DRAK pulse + its seen-one-CKIO-fal
 //granted-channel views (4:1 muxes, registered grant_q select)
 wire    [31:0]  dar_g = ch_dar[grant_q];
 wire            tm_g  = ch_tm_v[grant_q];
+wire    [1:0]   ts_g  = {ch_chcr[grant_q][4], ch_chcr[grant_q][3]};
 
 //read-lane extract: right-justify the SAR-addressed datum (big-endian,
 //(3-a)*8 = {~a,000}), then replicate - wstrb picks the DAR lane, so no
@@ -429,9 +453,10 @@ always_comb begin
     endcase
 end
 
-wire            unit_done = (I_BUS.rsp_valid) &&
-                            ((seq == S_WR_WAIT) ||
-                             (seq == S_RD_WAIT && mode_q == M_SGR));
+wire            beat_last  = !sz16_q || (beat_q == 2'd3);   //16-byte: 4th beat ends the unit
+wire            unit_done  = (I_BUS.rsp_valid) && beat_last &&
+                             ((seq == S_WR_WAIT) ||
+                              (seq == S_RD_WAIT && mode_q == M_SGR));
 wire            grant_fire = (seq == S_IDLE) && win_v;
 
 always_ff @(posedge i_CLK or negedge i_RST_n) begin
@@ -441,6 +466,9 @@ always_ff @(posedge i_CLK or negedge i_RST_n) begin
         grant_q  <= 2'd0;
         sarlo_q  <= 2'd0;
         size_q   <= 2'd0;
+        sz16_q   <= 1'b0;
+        beat_q   <= 2'd0;
+        rr_head  <= 2'd0;                   //round-robin reset order 0>1>2>3 (p.349)
         addr_q   <= 32'd0;
         wdata_q  <= 32'd0;
         wstrb_q  <= 4'd0;
@@ -450,13 +478,20 @@ always_ff @(posedge i_CLK or negedge i_RST_n) begin
         pend_ext <= 2'd0;
         drak_q   <= 2'd0;
         drak_vis <= 2'd0;
+        buf_q[0] <= 32'd0;
+        buf_q[1] <= 32'd0;
+        buf_q[2] <= 32'd0;
+        buf_q[3] <= 32'd0;
     end
     else begin if(i_CEN) begin
         unique case(seq)
             S_IDLE: begin
                 if(win_v) begin             //start-up: latch the winner's unit
                     grant_q <= win;
-                    size_q  <= ts_w;
+                    size_q  <= (ts_w == 2'b11) ? 2'd2 : ts_w;
+                    sz16_q  <= (ts_w == 2'b11);
+                    beat_q  <= 2'd0;
+                    rr_head <= win + 2'd1;  //served channel to the bottom (fig 11.3)
                     //DACK tag: dual-ext per AM's cycle (p.337); single always
                     dack_en_q <= ch_rs_ext[win];
                     dack_rd_q <= ch_rs_sgr[win] |
@@ -468,6 +503,13 @@ always_ff @(posedge i_CLK or negedge i_RST_n) begin
                         wdata_q <= 32'd0;               //don't-care: D left undriven
                         seq     <= S_WR_REQ;
                     end
+                    else if(ch_chcr[win][20]) begin     //ch3 DI: pointer fetch prologue
+                        mode_q  <= M_DUAL;
+                        addr_q  <= ch_sar[win];
+                        size_q  <= 2'd2;                //pointer is always LONG (p.339)
+                        sz16_q  <= 1'b0;
+                        seq     <= S_PT_REQ;
+                    end
                     else begin                          //dual, or single mem->dev (lone read)
                         mode_q  <= ch_rs_sgr[win] ? M_SGR : M_DUAL;
                         addr_q  <= ch_sar[win];
@@ -476,10 +518,36 @@ always_ff @(posedge i_CLK or negedge i_RST_n) begin
                     end
                 end
             end
+            S_PT_REQ:  if(I_BUS.req_ready) seq <= S_PT_WAIT;
+            S_PT_WAIT: begin
+                if(I_BUS.rsp_valid) begin   //the fetched pointer IS the data read address
+                    addr_q  <= I_BUS.rsp_rdata;
+                    sarlo_q <= I_BUS.rsp_rdata[1:0];
+                    size_q  <= (ts_g == 2'b11) ? 2'd2 : ts_g;   //back to the data size
+                    seq     <= S_RD_REQ;
+                end
+            end
             S_RD_REQ:  if(I_BUS.req_ready) seq <= S_RD_WAIT;
             S_RD_WAIT: begin
                 if(I_BUS.rsp_valid) begin
-                    if(mode_q == M_SGR)     //single-read unit: the device latched off the bus
+                    if(sz16_q) begin        //16-byte: gather 4 longwords, then turn
+                        buf_q[beat_q] <= I_BUS.rsp_rdata;
+                        if(beat_q != 2'd3) begin
+                            addr_q <= addr_q + 32'd4;   //source, +4, +8, +12 (fig 11.11)
+                            beat_q <= beat_q + 2'd1;
+                            seq    <= S_RD_REQ;
+                        end
+                        else if(mode_q == M_SGR)        //single: 4 lone reads end the unit
+                            seq <= tm_g ? S_IDLE : S_GAP;
+                        else begin                      //dual: 4 write beats follow
+                            addr_q  <= dar_g;
+                            wdata_q <= buf_q[0];
+                            wstrb_q <= 4'b1111;
+                            beat_q  <= 2'd0;
+                            seq     <= S_WR_REQ;
+                        end
+                    end
+                    else if(mode_q == M_SGR)    //single-read unit: device latched off the bus
                         seq <= tm_g ? S_IDLE : S_GAP;
                     else begin              //dual: buffer the datum, turn the pair around
                         wdata_q <= wr_rep;
@@ -491,8 +559,16 @@ always_ff @(posedge i_CLK or negedge i_RST_n) begin
             end
             S_WR_REQ:  if(I_BUS.req_ready) seq <= S_WR_WAIT;
             S_WR_WAIT: begin
-                if(I_BUS.rsp_valid)         //burst re-arbitrates at once (fig 11.14);
-                    seq <= tm_g ? S_IDLE : S_GAP;   //cycle-steal yields a CPU boundary
+                if(I_BUS.rsp_valid) begin
+                    if(sz16_q && beat_q != 2'd3) begin  //next longword of the 16-byte unit
+                        addr_q  <= addr_q + 32'd4;
+                        wdata_q <= buf_q[beat_q + 2'd1];
+                        beat_q  <= beat_q + 2'd1;
+                        seq     <= S_WR_REQ;
+                    end
+                    else                    //burst re-arbitrates at once (fig 11.14);
+                        seq <= tm_g ? S_IDLE : S_GAP;   //cycle-steal yields a CPU boundary
+                end
             end
             default: seq <= S_IDLE;         //S_GAP: one request-free cycle
         endcase
@@ -537,7 +613,7 @@ end
 
 //bus master drive: request fields straight from registers - one flat level
 //into the arb's 2:1 (the reqn/addr 5 ns class stays shallow)
-assign  I_BUS.req_valid   = (seq == S_RD_REQ) || (seq == S_WR_REQ);
+assign  I_BUS.req_valid   = (seq == S_RD_REQ) || (seq == S_WR_REQ) || (seq == S_PT_REQ);
 assign  I_BUS.req_write   = (seq == S_WR_REQ);
 assign  I_BUS.req_size    = size_q;
 assign  I_BUS.req_burst   = 1'b0;
@@ -551,7 +627,7 @@ assign  I_BUS.req_dack    = dack_en_q && ((seq == S_RD_REQ &&  dack_rd_q) ||
                                           (seq == S_WR_REQ && !dack_rd_q));
 assign  I_BUS.req_dack_ch = grant_q[0];
 assign  I_BUS.req_saddr   = mode_q[1] && ((seq == S_RD_REQ) || (seq == S_WR_REQ));
-assign  I_BUS.rsp_ready   = (seq == S_RD_WAIT) || (seq == S_WR_WAIT);
+assign  I_BUS.rsp_ready   = (seq == S_RD_WAIT) || (seq == S_WR_WAIT) || (seq == S_PT_WAIT);
 
 //pads: AL/RL polarity from the live CHCR bits (ch0/1 only, pp.337-338);
 //negated idle when active-low (the default)

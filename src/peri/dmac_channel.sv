@@ -5,12 +5,13 @@
 
     One instance per channel: Fig 11.1's block repeated four times is
     SARn/DARn/DMATCRn/CHCRn plus its iteration datapath (address/count
-    update - arrives with the transfer phases). The channel feature
+    update, ch2's reload image + 4-counter). The channel feature
     asymmetry of pp.336-342 is parameterized:
       HAS_EXT      ch0/1: external request bits RL/AM/AL (18:16), DS (6)
       HAS_RELOAD   ch2:   source address reload bit RO (19)
       HAS_INDIRECT ch3:   indirect addressing bit DI (20)
-    Absent-feature bits: write invalid, read 0 (p.336).
+    Absent-feature bits: write invalid, read 0 (p.336) - which also
+    starves the reload/indirect datapaths where the bit can't set.
 
     Write rules (table 11.2 notes, p.332): TE (CHCR[1]) is write-0-only -
     a hardware set outranks a same-edge clear, write-1 holds; DMATCR
@@ -44,6 +45,8 @@ module dmac_channel #(
     input   wire            i_UPD,          //sequencer: one transfer unit completed
     input   wire    [1:0]   i_UPD_MASK,     //{DAR, SAR} step enables - single-address units
                                             //only step the memory-side register (fig 11.10)
+    input   wire            i_EN,           //this channel's live enable (ch2 reload counter:
+                                            //any enable drop resets the 4-count, p.373)
 
     /* REGISTER READ-BACK */
     output  wire    [31:0]  o_SAR,
@@ -59,6 +62,9 @@ module dmac_channel #(
 logic   [31:0]  sar;                        //next source address during transfer (p.333)
 logic   [31:0]  dar;                        //next destination address during transfer (p.334)
 logic   [23:0]  tcr;                        //remaining transfer count; 0 = 16M max (p.335)
+logic   [31:0]  sar_init;                   //SAR as last written: the ch2 reload image
+                                            //(fig 11.22; pruned where RO can never set)
+logic   [1:0]   ro_cnt;                     //ch2 reload 4-transfer counter (fig 11.22)
 //CHCR fields (pp.336-342); absent-feature bits stay 0 forever
 logic           di;                         //CHCR[20]: ch3 indirect address mode
 logic           ro;                         //CHCR[19]: ch2 source address reload
@@ -89,16 +95,24 @@ logic           ie, te, de;                 //interrupt enable / transfer end / 
     the TE set outranks everything.
 */
 
-//address step: byte/word/long -> 1/2/4 (16-byte unit arrives in phase 5)
-wire    [31:0]  step = ts[1] ? 32'd4 : ts[0] ? 32'd2 : 32'd1;
-wire    [31:0]  sar_nx = sm[1] ? sar - step : sm[0] ? sar + step : sar;
+//address step: byte/word/long/16-byte -> 1/2/4/16 (p.337); ch3 indirect
+//steps SAR (the pointer table) by 4 regardless of TS (p.339)
+wire    [31:0]  step = (ts == 2'b11) ? 32'd16 : ts[1] ? 32'd4 : ts[0] ? 32'd2 : 32'd1;
+wire    [31:0]  sar_step = di ? 32'd4 : step;
+wire    [31:0]  sar_nx = sm[1] ? sar - sar_step : sm[0] ? sar + sar_step : sar;
 wire    [31:0]  dar_nx = dm[1] ? dar - step : dm[0] ? dar + step : dar;
+
+//ch2 source reload (section 11.3.6): every 4th completed transfer returns
+//SAR to its written image instead of stepping; 8/16/32-bit sizes only
+wire            sar_reload = ro && (ro_cnt == 2'd3);
 
 always_ff @(posedge i_CLK or negedge i_RST_n) begin
     if(!i_RST_n) begin
         sar <= 32'd0;
         dar <= 32'd0;
         tcr <= 24'd0;
+        sar_init <= 32'd0;
+        ro_cnt   <= 2'd0;
         {di, ro, rl, am, al} <= 5'd0;
         dm  <= 2'd0;
         sm  <= 2'd0;
@@ -110,15 +124,23 @@ always_ff @(posedge i_CLK or negedge i_RST_n) begin
     else begin if(i_CEN) begin
         //unit completion first; a same-edge bus write below overrides per lane
         if(i_UPD) begin
-            if(i_UPD_MASK[0]) sar <= sar_nx;
+            if(i_UPD_MASK[0]) sar <= sar_reload ? sar_init : sar_nx;
             if(i_UPD_MASK[1]) dar <= dar_nx;
             tcr <= tcr - 24'd1;
         end
 
-        //byte-lane writes: a 16-bit access keeps the untouched half (p.332 note 2)
+        //reload 4-counter: any enable drop (DE/DME clear, TE set, NMI, AE,
+        //reset) clears the count but NOT SAR/DAR/DMATCR - the p.373 restriction
+        //(software must re-program all three before restarting a reload run)
+        if(!i_EN)            ro_cnt <= 2'd0;
+        else if(i_UPD && ro) ro_cnt <= ro_cnt + 2'd1;
+
+        //byte-lane writes: a 16-bit access keeps the untouched half (p.332 note 2);
+        //a SAR write refreshes the reload image alongside
         for(int b = 0; b < 4; b++) begin
-            if(i_WR_SAR && i_WMASK[b]) sar[b*8 +: 8] <= i_WDATA[b*8 +: 8];
-            if(i_WR_DAR && i_WMASK[b]) dar[b*8 +: 8] <= i_WDATA[b*8 +: 8];
+            if(i_WR_SAR && i_WMASK[b]) sar[b*8 +: 8]      <= i_WDATA[b*8 +: 8];
+            if(i_WR_SAR && i_WMASK[b]) sar_init[b*8 +: 8] <= i_WDATA[b*8 +: 8];
+            if(i_WR_DAR && i_WMASK[b]) dar[b*8 +: 8]      <= i_WDATA[b*8 +: 8];
         end
         for(int b = 0; b < 3; b++) begin    //DMATCR[31:24] write-ignored (p.332 note 3)
             if(i_WR_TCR && i_WMASK[b]) tcr[b*8 +: 8] <= i_WDATA[b*8 +: 8];
