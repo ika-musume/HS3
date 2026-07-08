@@ -87,8 +87,15 @@ always_ff @(posedge i_CLK or negedge i_RST_n) begin
         else if(rsp_done && !rsp_dma && CORE_BUS.rsp_fault)
             cpu_lock_hold <= 1'b0;
 
-        //4-beat fill/drain: count accepts, close on the 4th
-        if(req_acc && CORE_BUS.req_burst) begin
+        //4-beat fill/drain: count accepts, close on the 4th. A FAULT response
+        //aborts the run - both masters abandon the remaining beats (cache
+        //fill / DMAC unit p.343) - so the window must close or the other
+        //master starves at the idle boundary (and the count stays skewed)
+        if(rsp_done && CORE_BUS.rsp_fault) begin
+            burst_cnt  <= (req_acc && CORE_BUS.req_burst) ? 2'd1 : 2'd0;
+            burst_open <= (req_acc && CORE_BUS.req_burst);
+        end
+        else if(req_acc && CORE_BUS.req_burst) begin
             burst_cnt  <= burst_cnt + 2'd1;             //wraps 3 -> 0 on the last beat
             burst_open <= (burst_cnt != 2'd3);
         end

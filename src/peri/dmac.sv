@@ -17,10 +17,12 @@
     from the INTC; alignment checks + bus faults). Illegal setups
     (section 11.6: 16-byte combined with dec/indirect/reload/on-chip
     RS) are NOT guarded - silicon says "operation not guaranteed".
-    Deviations: 11.6 note 12 (WAIT ignored on 16-byte dual writes and
-    single dev->mem) is NOT implemented, the BSC honors WAIT everywhere;
-    11.6 notes 4/13 (standby/sleep restrictions) are software rules -
-    no standby machinery exists in this SoC yet.
+    16-byte units tag their beats req_burst: the BSC chains the 4
+    longwords as one back-to-back run (fig 11.11; burst-ROM envelope
+    fig 23.19; SDRAM line ops) and ignores WAIT on the write runs per
+    p.304 / 11.6 note 12 (dual 16-byte writes, single dev->mem).
+    Deviations: 11.6 notes 4/13 (standby/sleep restrictions) are
+    software rules - no standby machinery exists in this SoC yet.
 
     External request (ch0/1, section 11.3.2): DREQ is sampled on the
     CKIO falling edge (i_CKIO_NCEN); DS selects low-level or falling-
@@ -676,7 +678,11 @@ end
 assign  I_BUS.req_valid   = (seq == S_RD_REQ) || (seq == S_WR_REQ) || (seq == S_PT_REQ);
 assign  I_BUS.req_write   = (seq == S_WR_REQ);
 assign  I_BUS.req_size    = size_q;
-assign  I_BUS.req_burst   = 1'b0;
+//16-byte unit beats carry the line-burst tag (the cache's fill/drain
+//argument): the BSC chains the 4 longwords back-to-back - fig 11.11
+//shape on ordinary areas, CSn-held envelope on burst ROM (fig 23.19),
+//SDRAM engine line ops on areas 2/3 - and applies the p.304 WAIT-ignore
+assign  I_BUS.req_burst   = sz16_q && ((seq == S_RD_REQ) || (seq == S_WR_REQ));
 assign  I_BUS.req_addr    = addr_q;
 assign  I_BUS.req_wdata   = wdata_q;
 assign  I_BUS.req_wstrb   = (seq == S_WR_REQ) ? wstrb_q : 4'd0;

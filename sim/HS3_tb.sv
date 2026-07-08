@@ -725,10 +725,17 @@ end
 */
 
 logic           dackmon_en;             //DACK-law counters run
+logic           dackmon_rst = 1'b0;     //counter clear knob (single-writer law)
 integer         dackw_cnt;              //DACK0 window cycles observed
+integer         dackf_cnt;              //DACK0 window OPENINGS: envelope framing law
+                                        //(fig 11.11: 4 per plain 16-byte unit;
+                                        // fig 23.19: 1 per burst-ROM read unit)
 integer         dack_naked;             //window cycles with CS0 NEGATED = violation
 integer         dack_on_rd, dack_on_wr; //window cycles in read vs write bus cycles
 integer         drak0_lo, drak0_hi;     //DRAK0 pad low/high cycles (RL polarity proof)
+integer         dackmon_t;              //monitor timebase since clear
+integer         dack_t0, dack_t1;       //first opening / last close times: t1 - t0 =
+                                        //unit span, proving beats chain with no idle
 
 wire            dack0_win = u_dut.u_bsc.o_DACK_WIN[0];
 assign  d_bus = (sgdev_en && dack0_win && !rd_wr) ? sgdev_data : 32'hzzzz_zzzz;
@@ -743,13 +750,33 @@ always @(posedge clk) begin
     //(the device's read-side latch lives in the memory model's completion
     //arm: dmem reads early-complete before the pin-level DACK window opens)
 
-    if(dackmon_en) begin
+    //knob clear (tasks must not write an always_ff variable directly):
+    //every counter has ONE writer - this block
+    if(dackmon_rst) begin
+        dackw_cnt  <= 0;
+        dackf_cnt  <= 0;
+        dack_naked <= 0;
+        dack_on_rd <= 0;
+        dack_on_wr <= 0;
+        drak0_lo   <= 0;
+        drak0_hi   <= 0;
+        dackmon_t  <= 0;
+        dack_t0    <= -1;
+        dack_t1    <= 0;
+    end
+    else if(dackmon_en) begin
         if(dack0_win) begin
             dackw_cnt <= dackw_cnt + 1;
             if(cs0_n)   dack_naked <= dack_naked + 1;
             if(rd_wr)   dack_on_rd <= dack_on_rd + 1;
             else        dack_on_wr <= dack_on_wr + 1;
         end
+        if(!dack0_z && dack0_win) begin
+            dackf_cnt <= dackf_cnt + 1;
+            if(dack_t0 < 0) dack_t0 <= dackmon_t;
+        end
+        if(dack0_z && !dack0_win) dack_t1 <= dackmon_t;
+        dackmon_t <= dackmon_t + 1;
         if(!ptd_o[1]) drak0_lo <= drak0_lo + 1;
         if( ptd_o[1]) drak0_hi <= drak0_hi + 1;
     end
@@ -757,12 +784,9 @@ end
 
 task automatic dackmon_clear;
     begin
-        dackw_cnt  = 0;
-        dack_naked = 0;
-        dack_on_rd = 0;
-        dack_on_wr = 0;
-        drak0_lo   = 0;
-        drak0_hi   = 0;
+        dackmon_rst = 1'b1;
+        run_cycles(2);
+        dackmon_rst = 1'b0;
     end
 endtask
 
@@ -806,6 +830,8 @@ logic   [31:0]  entry_pc_l;
 logic           bench_arm = 1'b0;
 logic           bench_active, bench_started;
 integer         bench_arch_cycles, bench_retires;
+integer         bench_cs0f;             //CS0 assertion edges inside the window: a
+logic           bench_cs0_z;            //burst-ROM read run frames ONCE (fig 23.19)
 
 always_ff @(posedge clk or negedge sys_rst_n) begin
     if(!sys_rst_n) begin
@@ -838,6 +864,7 @@ always_ff @(posedge clk or negedge sys_rst_n) begin
             bench_started     <= 1'b0;
             bench_arch_cycles <= 0;
             bench_retires     <= 0;
+            bench_cs0f        <= 0;
         end
         else if(!bench_arm) begin
             bench_active <= 1'b0;
@@ -847,8 +874,14 @@ always_ff @(posedge clk or negedge sys_rst_n) begin
             if(bench_started) begin
                 bench_arch_cycles <= bench_arch_cycles + 1;
                 if(retire_valid) bench_retires <= bench_retires + 1;
+                //line-burst CS0 assertions only (fills), not the uncached
+                //preamble's single fetches - the envelope law counts frames
+                if(bench_cs0_z && !cs0_n &&
+                   u_dut.u_bsc.ord_busy && u_dut.u_bsc.ord_burst)
+                    bench_cs0f <= bench_cs0f + 1;
             end
         end
+        bench_cs0_z <= cs0_n;
     end
 end
 
@@ -2873,7 +2906,7 @@ task automatic test_ordinary_wait;
 endtask
 
 task automatic test_burst_rom;
-    integer sent, j, c_nb, c_bst, loop_e, bf_e, disp, ph;
+    integer sent, j, c_nb, c_bst, f_nb, f_bst, loop_e, bf_e, disp, ph;
     begin
         begin_test("Burst ROM: BCR1-enabled line fills use the WCR2 burst pitch (p.304)");
         for(ph = 0; ph < 2; ph = ph + 1) begin
@@ -2912,15 +2945,20 @@ task automatic test_burst_rom;
             run_until_retire(sent, 120000);
             bench_arm = 1'b0;
             @(posedge clk);
-            if(ph == 0) c_nb  = bench_arch_cycles;
-            else        c_bst = bench_arch_cycles;
+            if(ph == 0) begin c_nb  = bench_arch_cycles; f_nb  = bench_cs0f; end
+            else        begin c_bst = bench_arch_cycles; f_bst = bench_cs0f; end
             chk("cached loop result", gpr(3), 32'd16);
             chk("loop count consumed", gpr(5), 32'd0);
         end
-        $display("      [ROM] no-burst: %0d   burst pitch: %0d", c_nb, c_bst);
-        chk("no-burst fill cycles", c_nb,  32'd1005); //relocked 2026-07-07 (Group A + fill-forward)
-        chk("burst-ROM fill cycles", c_bst, 32'd969);
+        $display("      [ROM] no-burst: %0d (%0d CS falls)   burst pitch: %0d (%0d CS falls)",
+                 c_nb, f_nb, c_bst, f_bst);
+        chk("no-burst fill cycles", c_nb,  32'd987);  //relocked 2026-07-09 (burst envelope:
+        chk("burst-ROM fill cycles", c_bst, 32'd951); //beats chain w/ no idle state, fig 10.30 -
+                                                      //9 beat transitions x 2 cycles saved)
         chk_true("burst pitch is faster", c_bst < c_nb);
+        //envelope law (p.304/fig 23.19): a burst-ROM line fill asserts CS0 ONCE
+        //("CS0 is not negated"); a plain-area fill re-frames all 4 beats
+        chk_true("burst-ROM fills hold CS0 low", f_bst * 4 == f_nb);
         end_test;
     end
 endtask
@@ -5124,6 +5162,53 @@ task automatic test_dmac_16byte;
         chk_true("DACK windows on all 8 reads", dackw_cnt >= 8);
         chk("DACK window inside CS0",        dack_naked[31:0], 32'd0);
         chk("single: no DACK on write cycles", dack_on_wr[31:0], 32'd0);
+        //phase C: RAW pins - the fig 11.11 / fig 23.19 framing laws. Same
+        //single mem->dev 16-byte unit, 0-wait 32-bit area 0, one unit per
+        //sub-phase. Plain area: 4 back-to-back basic cycles, DACK re-framed
+        //per beat (4 openings x 3 cycles, T1 -> mid-T2, zero idle states).
+        //Burst ROM (A0BST=01): ONE envelope - DACK/CS0 low across all 4
+        //beats (1 opening x 15 cycles = 8 CKIO states minus the final half)
+        for(idx = 0; idx < 2; idx = idx + 1) begin
+            init_knobs;
+            clear_imem;
+            clear_dmem;
+            raw_mode = 1;
+            eidx = 0;
+            emit_wreg_w(32'hFFFF_FF66, 16'hFFF8);    // WCR2: A0W=000, 0-wait area 0
+            if(idx == 1) emit_wreg_w(32'hFFFF_FF60, 16'h0200);  // BCR1: A0BST=01
+            emit_wreg_w(32'hA400_0106, 16'hA080);    // PDCR: DACK/DRAK pads fn grant
+            emit_poke_l(32'hA400_0020, 32'h0000_0140);   // SAR0 (16n)
+            emit_poke_l(32'hA400_0028, 32'h0000_0001);   // DMATCR0 = 1 unit
+            emit_poke_l(32'hA400_002C, 32'h0000_5219);   // CHCR0: RS=0010 mem->dev, cs, 16-byte
+            emit_wreg_w(32'hA400_0060, 16'h0001);        // DMAOR: DME
+            emit_poll_te(32'hA400_002C);
+            emit_sentinel_loop(eidx, sent);
+            do_reset;
+            ptd_pin[4] = 1'b1;                           //DREQ0 negated during setup
+            c = 0;
+            while(!u_dut.u_dmac.dme && c < 60000) begin @(posedge clk); c = c + 1; end
+            run_cycles(8);
+            dackmon_clear; dackmon_en = 1'b1;
+            ptd_pin[4] = 1'b0;                           //level request to completion
+            run_until_retire(sent, 90000);
+            ptd_pin[4] = 1'b1;
+            dackmon_en = 1'b0;
+            $display("      [DACK16] %s: falls=%0d win=%0d t0=%0d t1=%0d",
+                     (idx == 0) ? "plain" : "burst", dackf_cnt, dackw_cnt, dack_t0, dack_t1);
+            chk("raw unit completed (TE path)", {8'd0, u_dut.u_dmac.u_ch0.tcr}, 32'd0);
+            chk("DACK window inside CS0", dack_naked[31:0], 32'd0);
+            if(idx == 0) begin
+                chk("plain 16-byte: DACK framed per beat (fig 11.11)", dackf_cnt[31:0], 32'd4);
+                chk("plain 16-byte: window cycles",                    dackw_cnt[31:0], 32'd12);
+            end
+            else begin
+                chk("burst ROM 16-byte: ONE DACK envelope (fig 23.19)", dackf_cnt[31:0], 32'd1);
+                chk("burst ROM 16-byte: CS0 held across the run",       dackw_cnt[31:0], 32'd15);
+            end
+            //fig 11.11 contiguity: first assertion to last release spans the
+            //unit's 8 CKIO states minus the final half - zero idle states
+            chk("16-byte unit span (no idle states)", (dack_t1 - dack_t0), 32'd15);
+        end
         end_test;
     end
 endtask
