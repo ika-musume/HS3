@@ -27,8 +27,9 @@ Cyclone V target.
 | **Integer pipeline** | [src/cpu_core/int_pipe.sv](src/cpu_core/int_pipe.sv), [int_pipe_pkg.sv](src/cpu_core/int_pipe_pkg.sv), [agu.sv](src/cpu_core/agu.sv) | Classic SH 5-stage in-order pipeline (IF/ID/EX/MA/WB), full forwarding, 2R2W GPR file, MAC, and a single time-shared address adder (no redirect mux). |
 | **Unified cache** | [src/cpu_core/cache.sv](src/cpu_core/cache.sv), [cache_mem.sv](src/cpu_core/cache_mem.sv), [cache_pkg.sv](src/cpu_core/cache_pkg.sv) | 16 KB, 4-way, 16-byte line, unified I+D, pseudo-LRU. The lookup is folded into the pipeline stage (no request/response handshake), so cache hits sustain IPC ≈ 1. |
 | **Exceptions / control** | [src/cpu_core/exc_handler.sv](src/cpu_core/exc_handler.sv), [ctrl_reg.sv](src/cpu_core/ctrl_reg.sv) | Exception/interrupt entry and the P4 exception MMIO registers; SR/GBR/VBR and friends. |
-| **Bus fabric** | [src/peri/ibus_splitter.sv](src/peri/ibus_splitter.sv), [ibus_bridge.sv](src/peri/ibus_bridge.sv) | The on-chip bus tiers (L / I bus 1 / I bus 2 / P bus) matching SH7709S Fig 1.1. |
+| **Bus fabric** | [src/peri/ibus_arb.sv](src/peri/ibus_arb.sv), [ibus_splitter.sv](src/peri/ibus_splitter.sv), [ibus_bridge.sv](src/peri/ibus_bridge.sv) | The on-chip bus tiers (L / I bus 1 / I bus 2 / P bus) matching SH7709S Fig 1.1, plus the CPU/DMAC arbiter onto I bus 1. |
 | **BSC** | [src/peri/bsc.sv](src/peri/bsc.sv) | External bus controller on the **real chip pin set** - SDRAM engine, ordinary/burst-ROM with wait-states, a generic mirror port for the surrounding SoC, and the BSC register file. |
+| **DMAC** | [src/peri/dmac.sv](src/peri/dmac.sv), [dmac_channel.sv](src/peri/dmac_channel.sv) | 4-channel DMA controller (section 11) plus the on-chip compare-match timer (CMT). Auto/CMT/external-DREQ requests, dual-direct/indirect/single-address transfers, 16-byte burst units, fixed + round-robin priority; masters I bus 1 as the second on-chip bus master via `ibus_arb`. |
 | **Peripherals** | [cpg_wdt.sv](src/peri/cpg_wdt.sv), [intc.sv](src/peri/intc.sv), [tmu.sv](src/peri/tmu.sv), [rtc.sv](src/peri/rtc.sv), [ioport.sv](src/peri/ioport.sv) | Clock-pulse generator + watchdog, interrupt controller, 3× timer unit, RTC (on its own 32.768 kHz domain), and the 12 I/O ports / PFC with real Table-18.1 pin sharing. |
 | **Chip top** | [src/HS3.sv](src/HS3.sv) | Ties the core, fabric, BSC, and peripherals into the `HS3` module with the SH7709S external pin set. |
 
@@ -36,6 +37,12 @@ Two elaboration targets are provided:
 
 - **`cpu_core`** - the CPU core alone (pipeline + cache + control/exception logic).
 - **`HS3`** - the full SoC top, including the BSC and all on-chip peripherals.
+
+| Parameter | Target(s) | Default | Meaning |
+|---|---|---|---|
+| `RESET_PC` | `cpu_core`, `HS3` | `32'hA000_0000` | Reset vector (P2, bypass) the PC takes out of reset. |
+| `BIG_ENDIAN` | `cpu_core`, `HS3` | `1'b1` | Endianness, per the SH7709S `MD5` strap. |
+| `DISABLE_CEN` | `HS3` only | `1'b1` | Ties the internal clock enable to `1` and ignores the `i_CEN` pin, so the whole chip free-runs at the full `i_CLK` rate. Set to `0` to gate every register on the real `i_CEN` pin instead (e.g. sub-rate bring-up/debug clocking). |
 
 ---
 
@@ -65,7 +72,7 @@ Extra arguments are forwarded to the simulation (e.g. `+verilator+seed+123`).
 ```bash
 sim/run_sim.sh src/cpu_core sim/cpu_core_tb.sv
 # ... expected tail:
-# cpu_core_tb: PASS (91 tests)
+# cpu_core_tb: PASS (103 tests)
 ```
 
 **Full SoC** (see the vendor-model note below):
@@ -73,7 +80,7 @@ sim/run_sim.sh src/cpu_core sim/cpu_core_tb.sv
 ```bash
 sim/run_sim.sh src sim/HS3_tb.sv
 # ... expected tail:
-# HS3_tb: PASS (57 tests)
+# HS3_tb: PASS (83 tests)
 ```
 
 Both suites also print an IPC micro-benchmark, e.g. from `cpu_core_tb`:
@@ -109,8 +116,8 @@ src/
   peri/               BSC, INTC, TMU, RTC, CPG/WDT, I/O ports, bus fabric
 sim/
   run_sim.sh          Verilator build+run wrapper
-  cpu_core_tb.sv      core-only testbench (91 tests + IPC bench)
-  HS3_tb.sv           full-SoC testbench (57 tests, vendor-model bus checks)
+  cpu_core_tb.sv      core-only testbench (103 tests + IPC bench)
+  HS3_tb.sv           full-SoC testbench (83 tests, vendor-model bus checks)
   models/             vendor memory-model patch recipes (models themselves untracked)
   verilator_waivers.vlt   lint waivers, scoped to tb/vendor files only
 docs/
