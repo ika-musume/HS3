@@ -633,17 +633,17 @@ final tree:
 | Seed | Worst multicorner slack @ 10 ns | Restricted Fmax | Top-20 headline class |
 |---|---|---|---|
 | 1 | −2.90 ns | 77.5 MHz | cache-tag `di_q` → GPR read-ahead M10K address capture (Wall A) |
-| 3 | −2.92 ns | 77.8 MHz | `fwd_dep_a_agu` → `fetch_pending_pc` (advance loop / AGU front) |
+| 3 | −2.85 ns | 77.8 MHz | `fwd_dep_a_agu` → `fetch_pending_pc` (advance loop / AGU front) |
 | 4 | **−2.67 ns** | **78.9 MHz** | `fwd_lane_b` → EX adder → `exma.gpr0_data` (operand → EX result) |
 | 5 | −2.72 ns | 78.6 MHz | `fwd_lane_b_agu` → AGU → exception-MMIO decode (`o_TEA`) |
 | 7 | −2.96 ns | 77.2 MHz | `second_access_agu` → cache write-through bypass (`byp_q`) |
 
-(Measured 2026-07-09 on `main` after the DMAC merge — the complete SoC including the
-full DMAC *through the phase-7 ordinary burst envelope*. Mean worst slack −2.83 ns,
-cluster spread 0.29 ns (inside fit noise); best-slack fit is seed 4 at −2.67 ns /
-78.9 MHz. **Zero dmac/arb/bsc cones appear in any seed's top-20** — every headline is
-the same CPU advance-loop family as before the DMAC existed, and the five seeds each
-pick a *different* one, which is the plateau signature.)
+(Measured 2026-07-09 on `main` — the complete SoC including the full DMAC *through
+the phase-7 ordinary burst envelope* and the `DISABLE_CEN` clock-enable tie-off.
+Mean worst slack −2.82 ns, cluster spread 0.29 ns (inside fit noise); best-slack
+fit is seed 4 at −2.67 ns / 78.9 MHz. **Zero dmac/arb/bsc cones appear in any
+seed's top-20** — every headline is the same CPU advance-loop family, and the
+five seeds each pick a *different* one, which is the plateau signature.)
 
 > **Read this as a plateau, not a ranking.** The design sits on a *flat cluster* of
 > single-cycle protected loops all within ~0.4 ns of each other; each seed's

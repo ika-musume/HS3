@@ -27,8 +27,9 @@
 */
 
 module HS3 #(
-    parameter [31:0] RESET_PC   = 32'hA000_0000,
-    parameter        BIG_ENDIAN = 1'b1
+    parameter [31:0] RESET_PC    = 32'hA000_0000,
+    parameter        BIG_ENDIAN  = 1'b1,
+    parameter        DISABLE_CEN = 1'b1
 ) (
     /* CLOCK AND RESET */
     input   wire            i_POR_n,    //RESETP pin (power-on reset)
@@ -162,11 +163,14 @@ wire            wdt_rst_por_n;
 wire            wdt_rst_man_n;
 wire            iti_req;
 wire            pcen;
-wire            bcen;               //bus clock enable (B-phi = CKIO rate) from the CPG
+wire            bcen; //bus clock enable (B-phi = CKIO rate) from the CPG
 
 wire            rst_por_n = i_POR_n & wdt_rst_por_n;
 wire            rst_man_n = i_RST_n & wdt_rst_man_n;
 wire            rst_all_n = rst_por_n & rst_man_n;
+
+//DISABLE_CEN=1: free-run every submodule at i_CLK, ignore the i_CEN pin
+wire            cen = DISABLE_CEN ? 1'b1 : i_CEN;
 
 
 
@@ -192,7 +196,7 @@ wire            dmac_hold;          //DMAC transfer-unit / burst bus hold
 ibus_arb u_arb (
     .i_RST_n                (rst_all_n                              ),
     .i_CLK                  (i_CLK                                  ),
-    .i_CEN                  (i_CEN                                  ),
+    .i_CEN                  (cen                                    ),
 
     .CPU_BUS                (CORE_I_BUS                             ),
     .DMA_BUS                (DMA_I_BUS                              ),
@@ -204,7 +208,7 @@ ibus_arb u_arb (
 ibus_splitter u_split (
     .i_RST_n                (rst_all_n                              ),
     .i_CLK                  (i_CLK                                  ),
-    .i_CEN                  (i_CEN                                  ),
+    .i_CEN                  (cen                                    ),
 
     .CORE_BUS               (ARB_I_BUS                              ),
     .BRG_BUS                (BRG_I_BUS                              ),
@@ -214,7 +218,7 @@ ibus_splitter u_split (
 ibus_bridge u_bridge (
     .i_RST_n                (rst_all_n                              ),
     .i_CLK                  (i_CLK                                  ),
-    .i_CEN                  (i_CEN                                  ),
+    .i_CEN                  (cen                                    ),
 
     .I_BUS                  (BRG_I_BUS                              ),
     .REG_CPG                (REG_CPG                                ),
@@ -241,7 +245,7 @@ bsc #(
     .i_POR_n                (rst_por_n                              ),  //regs/engine/refresh survive manual reset (p.297)
     .i_RST_n                (rst_all_n                              ),  //front-end handshake only
     .i_CLK                  (i_CLK                                  ),
-    .i_CEN                  (i_CEN                                  ),
+    .i_CEN                  (cen                                    ),
     .i_BCEN                 (bcen                                   ),
 
     .I_BUS                  (BSC_I_BUS                              ),
@@ -330,7 +334,7 @@ cpu_core #(
     .i_POR_n                (rst_por_n                              ),
     .i_RST_n                (rst_man_n                              ),
     .i_CLK                  (i_CLK                                  ),
-    .i_CEN                  (i_CEN                                  ),
+    .i_CEN                  (cen                                    ),
 
     .I_BUS                  (CORE_I_BUS                             ),
 
@@ -367,7 +371,7 @@ cpg_wdt u_cpg_wdt (
     .i_POR_n                (i_POR_n                                ),  //raw pins: p.215 retention
     .i_RST_n                (i_RST_n                                ),
     .i_CLK                  (i_CLK                                  ),
-    .i_CEN                  (i_CEN                                  ),
+    .i_CEN                  (cen                                    ),
 
     .REG_BUS                (REG_CPG                                ),
 
@@ -395,7 +399,7 @@ wire            rtcclk, rtc_tick;   //RTC divider output: pad level + bus-domain
 tmu u_tmu (
     .i_RST_n                (rst_all_n                              ),  //regs init on POR AND manual (p.391)
     .i_CLK                  (i_CLK                                  ),
-    .i_CEN                  (i_CEN                                  ),
+    .i_CEN                  (cen                                    ),
     .i_PCEN                 (pcen                                   ),
 
     .REG_BUS                (PBUS_TMU                               ),
@@ -421,7 +425,7 @@ rtc u_rtc (
     .i_POR_n                (rst_por_n                              ),  //alarm ENB + RTCEN/START (p.410)
     .i_RST_n                (rst_all_n                              ),  //RCR1 + PEF/PES clear on any reset
     .i_CLK                  (i_CLK                                  ),
-    .i_CEN                  (i_CEN                                  ),
+    .i_CEN                  (cen                                    ),
 
     .REG_BUS                (PBUS_RTC                               ),
 
@@ -445,7 +449,7 @@ wire            dmac_nmi_set;       //INTC NMI edge -> DMAOR.NMIF (11.6 note 3)
 dmac u_dmac (
     .i_RST_n                (rst_all_n                              ),  //CHCR/DMAOR/CMT clear on any reset (p.332)
     .i_CLK                  (i_CLK                                  ),
-    .i_CEN                  (i_CEN                                  ),
+    .i_CEN                  (cen                                    ),
     .i_PCEN                 (pcen                                   ),
     .i_CKIO_NCEN            (o_CKIO_NCEN                            ),  //DREQ sample = CKIO falling edge (p.363)
 
@@ -504,7 +508,7 @@ assign  o_PTD_OE = {pd_fn[7] | ptd_oe_port[7],
 ioport u_ioport (
     .i_POR_n                (rst_por_n                              ),  //regs hold through manual reset (p.570)
     .i_CLK                  (i_CLK                                  ),
-    .i_CEN                  (i_CEN                                  ),
+    .i_CEN                  (cen                                    ),
 
     .REG_BUS                (PBUS_PORT                              ),
 
@@ -564,7 +568,7 @@ ioport u_ioport (
 intc u_intc (
     .i_RST_n                (rst_all_n                              ),
     .i_CLK                  (i_CLK                                  ),
-    .i_CEN                  (i_CEN                                  ),
+    .i_CEN                  (cen                                    ),
     .i_PCEN                 (pcen                                   ),
 
     .REG_HI                 (REG_INTC_HI                            ),

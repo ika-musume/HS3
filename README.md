@@ -6,9 +6,9 @@ the pipeline, cache, bus controller, and on-chip peripherals reproduce the
 SH7709S hardware manual's timing behaviour, not just its instruction set.
 
 - **Target:** Low-cost/mainstream FPGAs
-- **Physical status:** Quartus out-of-context restricted Fmax ≈ **78-82 MHz**
-  today; the remaining gap to 100MHz is a small number of protected single-cycle
-  CPU datapath loops, not the cache, bus, or peripherals.
+- **Physical status:** Quartus out-of-context restricted Fmax ≈ **77-79 MHz**
+  across seeds today; the remaining gap to 100MHz is a small number of protected
+  single-cycle CPU datapath loops, not the cache, bus, or peripherals.
 
 > For the microarchitecture and timing rationale - *what the RTL actually does and
 > why it is shaped the way it is* - read **[docs/HS3_Core_Hardware.md](docs/HS3_Core_Hardware.md)**.

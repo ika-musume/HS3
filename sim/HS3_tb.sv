@@ -612,14 +612,20 @@ always @(posedge clk) begin
 end
 
 //WAIT auto-stretcher: holds i_WAIT_n low for wait_stretch bus cycles at the
-//start of every ordinary bus cycle (mem_req rising edge)
+//start of every ordinary bus cycle (mem_req rising edge). dackw_arm instead
+//arms at the FIRST DACK0 opening after a dackmon clear - a DMAC unit granted
+//back-to-back behind a CPU fetch never re-raises mem_req, so the WAIT-ignore
+//laws (p.304) need an arming keyed to the unit itself, not the request edge
 integer         wait_stretch;
+integer         dackw_arm;
 integer         ws_cnt = 0;
 logic           mem_req_z = 1'b0;
 always @(posedge clk) begin
     mem_req_z <= mem_req;
-    if(mem_req && !mem_req_z) ws_cnt <= wait_stretch * 2;
-    else if(ws_cnt > 0)       ws_cnt <= ws_cnt - 1;
+    if(dackw_arm > 0 && dackmon_en && !dack0_z && dack0_win && dack_t0 < 0)
+        ws_cnt <= dackw_arm * 2;
+    else if(mem_req && !mem_req_z) ws_cnt <= wait_stretch * 2;
+    else if(ws_cnt > 0)            ws_cnt <= ws_cnt - 1;
 end
 always_comb wait_n = (ws_cnt == 0);
 
@@ -1021,6 +1027,7 @@ task automatic init_knobs;
         d_latency      = 0;
         raw_mode       = 0;
         wait_stretch   = 0;
+        dackw_arm      = 0;
         flash_en       = 1'b0;
         raw8_en        = 1'b0;      //area 6 back to the 32-bit raw device
         sdram_en       = 1'b1;      //Micron model populated
@@ -5208,6 +5215,54 @@ task automatic test_dmac_16byte;
             //fig 11.11 contiguity: first assertion to last release spans the
             //unit's 8 CKIO states minus the final half - zero idle states
             chk("16-byte unit span (no idle states)", (dack_t1 - dack_t0), 32'd15);
+        end
+        //phase D: the p.304 / 11.6-note-12 WAIT-ignore law on RAW pins. Area 0
+        //wait-coded (A0W=001: 1 programmed wait, pin ENABLED); the tb stretcher
+        //holds i_WAIT_n low 12 cycles from the unit's head. A single dev->mem
+        //16-byte unit is a WRITE run: the pin is IGNORED, so its DACK span is
+        //the fixed 4 x (T1+Tw+T2) shape regardless of the stretch. The mem->dev
+        //twin is a READ run - NOT exempted - so the same stretch grows it.
+        for(idx = 0; idx < 3; idx = idx + 1) begin
+            init_knobs;
+            clear_imem;
+            clear_dmem;
+            raw_mode = 1;
+            eidx = 0;
+            emit_wreg_w(32'hFFFF_FF66, 16'hFFF9);        // WCR2: A0W=001, pin sampled
+            emit_wreg_w(32'hA400_0106, 16'hA080);        // PDCR: DACK/DRAK pads fn grant
+            if(idx < 2) begin                            //dev->mem: DAR only (fig 11.10a)
+                emit_poke_l(32'hA400_0024, 32'h0000_0200);   // DAR0 (16n)
+                emit_poke_l(32'hA400_002C, 32'h0000_5319);   // CHCR0: RS=0011 dev->mem, cs, 16-byte
+            end
+            else begin                                   //mem->dev control: SAR only
+                emit_poke_l(32'hA400_0020, 32'h0000_0140);   // SAR0 (16n)
+                emit_poke_l(32'hA400_002C, 32'h0000_5219);   // CHCR0: RS=0010 mem->dev, cs, 16-byte
+            end
+            emit_poke_l(32'hA400_0028, 32'h0000_0001);   // DMATCR0 = 1 unit
+            emit_wreg_w(32'hA400_0060, 16'h0001);        // DMAOR: DME
+            emit_poll_te(32'hA400_002C);
+            emit_sentinel_loop(eidx, sent);
+            do_reset;
+            ptd_pin[4] = 1'b1;                           //DREQ0 negated during setup
+            c = 0;
+            while(!u_dut.u_dmac.dme && c < 60000) begin @(posedge clk); c = c + 1; end
+            run_cycles(8);
+            dackw_arm = (idx == 0) ? 0 : 6;              //12 cycles of WAIT from the
+            dackmon_clear; dackmon_en = 1'b1;            //unit's first DACK opening
+            sgdev_en   = 1'b1;                           //device drives D in the windows
+            ptd_pin[4] = 1'b0;                           //level request to completion
+            run_until_retire(sent, 120000);
+            ptd_pin[4] = 1'b1;
+            sgdev_en   = 1'b0;
+            dackmon_en = 1'b0;
+            dackw_arm  = 0;
+            chk("raw unit completed (TE path)", {8'd0, u_dut.u_dmac.u_ch0.tcr}, 32'd0);
+            case(idx)
+                //4 write beats x (T1+Tw+T2): DACK low 5 of each 6 cycles
+                0: chk("dev->mem 16-byte baseline span",        (dack_t1 - dack_t0), 32'd23);
+                1: chk("dev->mem WRITE run ignores WAIT (p.304)", (dack_t1 - dack_t0), 32'd23);
+                default: chk_true("mem->dev READ run honors WAIT", (dack_t1 - dack_t0) > 23);
+            endcase
         end
         end_test;
     end
