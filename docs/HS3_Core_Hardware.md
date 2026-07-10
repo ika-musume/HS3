@@ -7,11 +7,12 @@ in this folder. Manual page citations (`p.NNN`) point at the SH7709S hardware
 manual or the SH-3 software manual unless noted.
 
 **Target:** Intel Cyclone V FPGA, 100 MHz deliverable. **Verification:** Verilator
-(`cpu_core_tb` = 103/103, `HS3_tb` = 57/57 — see §7). **Physical status:** Quartus
-out-of-context (OOC) restricted Fmax **≈ 77–79 MHz across seeds** on the full SoC
-(§6); the gap to 100 MHz is a flat plateau of protected single-cycle datapath loops
-(see §0 and §6), not the cache, bus, or peripherals — every OOC critical path is
-CPU-internal, and none passes through the interrupt/exception machinery.
+(`cpu_core_tb` = 103/103, `HS3_tb` = 83/83 — see §7). **Physical status:** Quartus
+out-of-context (OOC) restricted Fmax **≈ 75–82 MHz across seeds (best fit 82.0 MHz)**
+on the full SoC (§6); the gap to 100 MHz is a flat plateau of protected single-cycle
+datapath loops (see §0 and §6), not the cache, bus, or peripherals — every OOC
+critical path is CPU-internal, and none passes through the interrupt/exception
+machinery.
 
 ---
 
@@ -145,6 +146,14 @@ redirect mux is gone. PC-relative targets are precomputed in ID
   registered LVT select is one 2:1 mux after the RAM read. Same-edge write/read
   hazards are closed by one-cycle WB shadow lanes (`wb0z`/`wb1z`) in the operand
   early legs.
+- **Read-ahead address tail:** the RAM read addresses are computed one cycle ahead
+  from the "next-ifid" cone (what IF/ID will hold during the read-data cycle). The
+  three sources (held pair-slot sibling / live fetch response / current IF/ID) each
+  precompute their own bank-qualified addresses, and the late serve/insert selects
+  — which carry the whole pipeline-advance loop — cross exactly **one 3:1 mux
+  level** at the M10K address pin, driven by merge-blocked `(* keep *)` select
+  twins placed with the GPR cluster (the R3 tail late-select; a simulation
+  assertion pins the composition to the reference shared-mux form every cycle).
 - **Forwarding:** EX-result and MA-result forward into the ID/EX operand latches
   through per-port *registered lanes* patched at the head of EX (EX-head
   forwarding): every forward mux-select is a single FF and every data leg launches
@@ -632,26 +641,27 @@ final tree:
 
 | Seed | Worst multicorner slack @ 10 ns | Restricted Fmax | Top-20 headline class |
 |---|---|---|---|
-| 1 | −2.90 ns | 77.5 MHz | cache-tag `di_q` → GPR read-ahead M10K address capture (Wall A) |
-| 3 | −2.85 ns | 77.8 MHz | `fwd_dep_a_agu` → `fetch_pending_pc` (advance loop / AGU front) |
-| 4 | **−2.67 ns** | **78.9 MHz** | `fwd_lane_b` → EX adder → `exma.gpr0_data` (operand → EX result) |
-| 5 | −2.72 ns | 78.6 MHz | `fwd_lane_b_agu` → AGU → exception-MMIO decode (`o_TEA`) |
-| 7 | −2.96 ns | 77.2 MHz | `second_access_agu` → cache write-through bypass (`byp_q`) |
+| 1 | −2.57 ns | 79.5 MHz | cache `bram_addr` → response → GPR read-ahead M10K address (Wall A data leg) |
+| 3 | −2.63 ns | 79.2 MHz | `mawb.gpr0_data` → advance front → pair-slot capture (`pair_inst`/`pair_pc`) |
+| 4 | −3.24 ns | 75.5 MHz | `fwd_lane_b_agu` → AGU → cache miss-FSM state decode (Wall B, placement swing) |
+| 5 | −2.82 ns | 78.0 MHz | AGU request front → cache miss-FSM state decode (Wall B) |
+| 7 | **−2.19 ns** | **82.0 MHz** | mixed plateau residue (FSM, operand → EX, `byp_q`) — best HS3 fit recorded |
 
-(Measured 2026-07-09 on `main` — the complete SoC including the full DMAC *through
-the phase-7 ordinary burst envelope* and the `DISABLE_CEN` clock-enable tie-off.
-Mean worst slack −2.82 ns, cluster spread 0.29 ns (inside fit noise); best-slack
-fit is seed 4 at −2.67 ns / 78.9 MHz. **Zero dmac/arb/bsc cones appear in any
-seed's top-20** — every headline is the same CPU advance-loop family, and the
-five seeds each pick a *different* one, which is the plateau signature.)
+(Measured 2026-07-10 on `main` at `b70c15d` — the complete SoC including the full
+DMAC and the **R3 read-ahead tail late-select** (§1), the last catalogued RTL
+timing lever. Mean worst slack −2.69 ns vs −2.83 pre-R3; the decisive evidence is
+the cone panel: the old headline — the advance loop capturing at the GPR read-ahead
+M10K address registers — fell from 20/20 of seed 3's worst paths to 3/20, and those
+survivors route through the one-level select, i.e. they are now bound by the
+measured-full AGU front. **Zero dmac/arb/bsc cones appear in any seed's top-20.**)
 
 > **Read this as a plateau, not a ranking.** The design sits on a *flat cluster* of
-> single-cycle protected loops all within ~0.4 ns of each other; each seed's
-> placement picks a different one as the headline, and per-seed coarse Fmax moves
-> by more than real structural changes do. Judge any change by worst-slack trend
-> *and cone composition across seeds*, never by one fit. The 100 MHz deliverable
-> corresponds to worst slack ≥ 0; the measured gap is ~2.7–3.0 ns of mostly
-> interconnect (55–65 % of every failing path is routing).
+> single-cycle protected loops; each seed's placement picks a different one as the
+> headline, and per-seed coarse Fmax moves by more than real structural changes do
+> (identical-RTL fits of the Wall B/FSM cone have swung −2.2..−3.9). Judge any
+> change by worst-slack trend *and cone composition across seeds*, never by one
+> fit. The 100 MHz deliverable corresponds to worst slack ≥ 0; the measured gap is
+> ~2.2–3.2 ns of mostly interconnect (55–65 % of every failing path is routing).
 
 The recurring cone classes, all protected by the no-bubbles rule (each is a
 single-cycle loop that cannot take a register without costing an architectural
@@ -659,13 +669,15 @@ cycle):
 
 1. **Advance loop / request front** — `{mawb.gpr0_data, fwd_*_agu,
    second_access_agu}` → AGU adder → request valid/accept → `idex_allow`
-   (fanout ~350) → GPR read-ahead address capture. The oldest and deepest family;
-   its accept-side tail also captures the cache FSM next-state and the
-   write-through bypass registers (`byp_q`).
+   (fanout ~350) → capture. The oldest and deepest family. R3 cut its deepest
+   tail (the GPR read-ahead address, see §1); the residue captures at the
+   pair-slot clock enables (a 1-bit CE cone — no late-select applies), the cache
+   FSM next-state, and the write-through bypass registers (`byp_q`).
 2. **Wall A — I-response → predecode** — cache I-side response formation
-   (`bram_addr` → RAM `q` → way/word select → `rsp_inst`) → predecode → the same
-   GPR read-ahead capture. Shares the capture with class 1; any read-ahead
-   late-select helps both.
+   (`bram_addr` → RAM `q` → way/word select → `rsp_inst`) → predecode → the GPR
+   read-ahead capture. R3 removed the shared mux tail it used to cross; the
+   residue is the live-response data leg itself, which no restructure can
+   register without a fetch bubble.
 3. **Operand → EX flags** — forward-lane selects → operand mux → the EX adder
    carry chain → T/compare select tree → `exma.t_data` / `r_t`. ~9 levels, ~60 %
    interconnect; a placement-spread cone rather than a logic-depth one.
@@ -675,11 +687,13 @@ path**: the acceptance boundary, restart-PC register, bank/flag mirrors, and MA
 phase gate are all registered-launch, registered-capture structures placed off the
 walls — confirmed by name-search over every top-20 path across seeds.
 
-Levers still open toward 100 MHz: a late-select on the GPR read-ahead tail
-(classes 1+2 share it), shortening the I-response way/word select feeding
-predecode, or floorplanning the operand cluster (class 3 is wire-dominated).
-Fallbacks remain a LogicLock floorplan pin or a C6 speed grade — **not** an
-operand- or address-capture pipeline beat (that would break cycle accuracy).
+**The RTL lever catalog is exhausted** (R3 was the last entry; the full round
+history lives in `eval_ooc/cache_wall_campaign.md`). What remains toward 100 MHz
+is physical, not structural: a LogicLock floorplan pinning the AGU/request cluster
+next to the cache banks (unlicensed in the current docker Quartus flow), a C6
+speed grade, or wide seed/DSE harvesting (seed 7 shows what a lucky placement
+yields). Explicitly **not** on the table: an operand- or address-capture pipeline
+beat — that would break cycle accuracy (the no-bubbles rule, §0).
 
 *Flow note:* the OOC flow (`eval_ooc/tools/quartus_ooc.py all <config>`) reuses the
 run directory named in the config; the STA/summary regenerate on every run but the
