@@ -2323,7 +2323,8 @@ always_ff @(posedge i_CLK or negedge i_RST_n) begin
 end
 //NEXT-ifid instruction/predecode: what IF/ID will hold during the read-data cycle.
 //Pair-serve leads: pair_inst/pair_pd are REGISTERS, so that arm is shallower than
-//the live response arm (exclusive with ifid_ld by construction).
+//the live response arm (exclusive with ifid_ld by construction). Feeds the hz_*
+//captures; the GPR read ADDRESSES use the per-arm late-select tail below instead.
 wire    [15:0]  nx_inst = pair_serve ? pair_inst :
                           ifid_ld    ? i_rsp_inst : ifid.inst;
 pd_route_t      nx_pd;
@@ -2333,9 +2334,60 @@ wire    [4:0]   nx_n_id    = active_gpr_id(nx_inst[11:8], bank1_nx);
 wire    [4:0]   nx_m_id    = active_gpr_id(nx_inst[7:4],  bank1_nx);
 wire    [4:0]   nx_bank_id = inactive_bank_id(nx_inst[6:4], bank1_nx);
 wire    [4:0]   nx_r0_id   = active_gpr_id(4'd0, bank1_nx);
-wire    [4:0]   nx_read_b  = nx_pd.rib ? nx_bank_id : nx_m_id;
-assign  nx_read0 = nx_pd.need_a ? nx_n_id : nx_read_b;
-assign  nx_read1 = nx_read_b;
+
+//GPR read-address TAIL LATE-SELECT (advance-loop/Wall A headline class, see
+//eval_ooc/cache_wall_campaign.md): pair_serve/ifid_ld carry the whole advance loop
+//(idex_allow, fo 346) and the cache hit resolve (if_accept), yet used to cross the
+//id-map LUTs plus the rib/need_a muxes before the M10K address pin. Each arm's
+//addresses now come from its OWN inst/pd (pair/hold arms fully registered; rsp arm
+//is the live response = Wall A data leg, unavoidable), so the late selects cross
+//exactly ONE 3:1 mux level at the pin (2 sel + 3 data = 5 inputs/bit, one ALM).
+//readb = read port B (port 1) address; read0 = read port 0 (need_a folds port A).
+wire    [4:0]   nx_pair_readb = pair_pd.rib ? inactive_bank_id(pair_inst[6:4], bank1_nx) :
+                                              active_gpr_id(pair_inst[7:4], bank1_nx);
+wire    [4:0]   nx_pair_read0 = pair_pd.need_a ? active_gpr_id(pair_inst[11:8], bank1_nx) :
+                                                 nx_pair_readb;
+wire    [4:0]   nx_rsp_readb  = pd_fetch.rib ? inactive_bank_id(i_rsp_inst[6:4], bank1_nx) :
+                                               active_gpr_id(i_rsp_inst[7:4], bank1_nx);
+wire    [4:0]   nx_rsp_read0  = pd_fetch.need_a ? active_gpr_id(i_rsp_inst[11:8], bank1_nx) :
+                                                  nx_rsp_readb;
+wire    [4:0]   nx_hold_readb = ifid.pd.rib ? inactive_bank_id(ifid.inst[6:4], bank1_nx) :
+                                              active_gpr_id(ifid.inst[7:4], bank1_nx);
+wire    [4:0]   nx_hold_read0 = ifid.pd.need_a ? active_gpr_id(ifid.inst[11:8], bank1_nx) :
+                                                 nx_hold_readb;
+
+//Select twins for the GPR M10K cluster (merge-blocked, like idex_allow_opa/opb and
+//ifid_ld_dat): id_issue re-rooted on a private idex_allow copy; the ifid_ld twin
+//folds its own !drop/!redirect/!clr terms into i_rsp_ready, whose drop/redirect/
+//branch arms then drop out dead (!ifid_clr implies !branch_redirect). Sim-checked
+//against the shared-mux original below.
+(* keep *) wire idex_allow_gpr = !idex.valid || (ex_complete && exma_allow);
+(* keep *) wire id_issue_gpr   = ifid.valid && idex_allow_gpr && !id_hazard &&
+                                 !fault_hold && !wb_kill_issue &&
+                                 !(btbf_cancel_base && exma_allow);
+(* keep *) wire pair_serve_gpr = pair_ready && !i_REDIRECT_VALID && !wb_fault_kill &&
+                                 !ifid_clr && (!ifid.valid || id_issue_gpr);
+(* keep *) wire ifid_ld_gpr    = !i_REDIRECT_VALID && !wb_fault_kill && !ifid_clr &&
+                                 !fetch_drop && i_rsp_valid && fetch_pending &&
+                                 (!ifid.valid || id_issue_gpr) && !pair_ready;
+
+assign  nx_read0 = pair_serve_gpr ? nx_pair_read0 :
+                   ifid_ld_gpr    ? nx_rsp_read0  : nx_hold_read0;
+assign  nx_read1 = pair_serve_gpr ? nx_pair_readb :
+                   ifid_ld_gpr    ? nx_rsp_readb  : nx_hold_readb;
+
+// synthesis translate_off
+//Late-select equivalence: the per-arm composition must equal the shared-mux original
+//(nx_pd/nx_*_id above) every cycle - proves the twins and the dead-arm reduction.
+always_comb begin
+    logic [4:0] ref_readb, ref_read0;
+    ref_readb = nx_pd.rib ? nx_bank_id : nx_m_id;
+    ref_read0 = nx_pd.need_a ? nx_n_id : ref_readb;
+    if(nx_read0 !== ref_read0 || nx_read1 !== ref_readb)
+        $fatal(1, "nx_read late-select mismatch: r0=%02x ref=%02x r1=%02x refb=%02x",
+               nx_read0, ref_read0, nx_read1, ref_readb);
+end
+// synthesis translate_on
 
 //NEXT-cycle hazard identities, captured with the read addresses: every input's next
 //value is what this cone computes (nx_inst/nx_pd = the coming IF/ID data, bank1_nx =

@@ -23,11 +23,12 @@ attack. **A round that isn't logged didn't happen.**
 ## Class table (update every fit)
 | Class | Launch → capture | Best ever | Prev | Current | Status / next lever |
 |---|---|---|---|---|---|
-| Advance loop (SoC, NEW) | `{exma.gpr1_data,fwd_*_agu,second_access_agu}` → AGU adder → `early_d_req_valid` → `idex_allow`(fo 346) → `nx_read0` → GPR `portb_address_reg` | −2.920 | (below top-20 @ f9aae05) | **−2.920** (re-baseline, seed3) | only unspent lever: tail late-select (see re-baseline note) |
-| Wall A (SoC) | `cache\|bram_addr` → `hit_w/hit_rsp_i` → `rsp_inst` → predecode → `nx_read0` → GPR `portb_address_reg` | −2.728 | −2.461 (core) | −2.813 (SoC seed3) | same capture as advance loop; shares any nx_read0 tail fix |
-| o_TEA (SoC, NEW) | same AGU front → `idex_allow` → `i_req_fire` → `exc_handler\|o_TEA` | −2.737 | (below top-20) | −2.737 | enable-side of the same loop; not headline |
-| Wall B / FSM (SoC) | `int_pipe\|{second_access_agu,fwd_*_agu}` → `cache\|state.*` decode | −1.905 | −1.905 | −2.595 (re-triage, worst now elsewhere) | placement-coupled to byp_q; needs floorplan / front cut |
-| Wall B / byp_q (SoC) | `ma_seq\|second_access_agu` → `cache_data_bank_wt\|byp_q[3]` | −1.920 (re-baseline) | −2.220 | −1.920 | SHELVED: trades against FSM, can't move plateau (R1+R2) |
+| Advance loop (SoC) | `{exma.gpr1_data,fwd_*_agu,second_access_agu}` → AGU adder → `early_d_req_valid` → `idex_allow`(fo 346) → `nx_read0` → GPR `portb_address_reg` | −2.500 (R3) | −2.920 | **−2.589** (R3, 3/20 seed3, was 14/20) | tail late-select LANDED (R3); residue = AGU front, measured full |
+| Pair-slot enable (SoC, NEW headline) | `mawb.gpr0_data` → advance front → `pair_capture/ifid_ld` CE → `pair_inst/pair_pc` | −2.489 (R3) | (below top-20) | **−2.625** (R3 seed3 headline) | 1-bit CE cone — no late-select possible; needs front cut / floorplan |
+| Wall A (SoC) | `cache\|bram_addr` → `hit_w/hit_rsp_i` → `rsp_inst` → predecode → `nx_read0` → GPR `portb_address_reg` | −2.574 (R3) | −2.813 | **−2.574** (R3 seed1 headline) | R3 removed the shared mux tail; residue = live-response data leg |
+| o_TEA (SoC) | same AGU front → `idex_allow` → `i_req_fire` → `exc_handler\|o_TEA` | −2.737 | −2.737 | (below top-20 @ R3) | enable-side of the same loop; not headline |
+| Wall B / FSM (SoC) | `int_pipe\|{second_access_agu,fwd_*_agu}` → `cache\|state.*` decode | −1.905 | −2.595 | −3.243/−2.816 (R3 s4/s5 headliners, placement swing) | placement-coupled to byp_q; needs floorplan / front cut |
+| Wall B / byp_q (SoC) | `ma_seq\|second_access_agu` → `cache_data_bank_wt\|byp_q[3]` | −1.920 (re-baseline) | −2.220 | −1.913 (R3 s7) | SHELVED: trades against FSM, can't move plateau (R1+R2) |
 
 **Wall B has two capture flavors off one shared AGU-request front.** The expensive
 common cone is `{second_access_agu, mawb.gpr0_data, fwd_*_agu} → always20 (2nd-pending
@@ -95,6 +96,8 @@ panel (probes: byp_q −1.920, FSM −2.595 — re-triage around the new headlin
   not reachable on current evidence.
 - **Verdict: no definite headroom. RTL FROZEN at the current tree** unless the tail
   round is explicitly commissioned to recover the ~80 MHz number.
+  [2026-07-10: commissioned and LANDED as R3 — see the R3 entry at the tail of this log.
+  The freeze now applies to the post-R3 tree; the lever list is empty.]
 
 ## Standing walls (measured-full — do NOT re-attack without new information)
 - (none yet)
@@ -323,3 +326,45 @@ Levers that COULD move the plateau (all bigger / need a decision):
 - Verdict: NEUTRAL — the frozen cache-wall plateau is unchanged and the DMAC (all 7
   phases) remains timing-invisible. Best-slack fit **seed 4, −2.673 ns / 78.91 MHz** is
   the reference used to refresh docs/HS3_Core_Hardware.md §6.
+
+### R3 — nx_read0 tail late-select (2026-07-10, seeds 1/3/4/5/7) — **KEPT**
+- The commissioned "one unspent lever": the GPR read-address tail in `int_pipe.sv`.
+  Before, the late selects `pair_serve`/`ifid_ld` (both fold `id_issue`→`idex_allow`
+  fo 346, plus the cache hit resolve via `if_accept`) crossed the `nx_inst`/`nx_pd`
+  shared muxes, the `active_gpr_id` map LUTs, and the `rib`/`need_a` muxes before the
+  M10K `portb_address_reg` pin. Now each arm's addresses are precomputed from its OWN
+  inst/pd (`nx_pair_*`/`nx_rsp_*`/`nx_hold_*`; pair/hold arms fully registered, rsp arm
+  = the live response, Wall A's data leg) and the selects cross exactly ONE 3:1 mux
+  level at the pin (2 sel + 3 data = 5 inputs/bit). Selects are merge-blocked
+  `(* keep *)` twins for the GPR cluster (`pair_serve_gpr`/`ifid_ld_gpr` re-rooted on a
+  private `idex_allow_gpr`/`id_issue_gpr`; the ifid_ld twin folds its kill terms into
+  `i_rsp_ready`, whose drop/redirect/branch arms drop out dead). The shared `nx_inst`/
+  `nx_pd` muxes remain for the hz_* flop captures; a translate_off assertion pins the
+  late-select composition to the shared-mux original every cycle.
+- Verification: cpu_core_tb 103/103 + HS3_tb 83/83, cycle laws exact (in-suite),
+  equivalence assertion silent. No IPC change (pure combinational restructure).
+- Worst multicorner slack @ 10 ns / restricted Fmax:
+  seed1 −2.574 / 79.53, seed3 −2.625 / 79.21, seed4 −3.243 / 75.51,
+  seed5 −2.816 / 78.03, seed7 **−2.192 / 82.02 (best HS3 fit ever recorded)**.
+  Mean −2.690 vs the −2.833 post-merge baseline (+0.143 as a mean — inside noise;
+  the verdict is the cone evidence below, per the doc's own rule).
+- Cone verdict — the target class is structurally cut:
+  - seed3: `portb_address_reg` captures 20/20 → **3/20** (−2.589/−2.534/−2.504); the
+    survivors route through `ifid_ld_gpr` = the ONE-level select (8 hits in
+    critical_paths.rpt), so what remains is the measured-full advance FRONT, not the
+    tail. New seed3 headline = the same front re-capturing at the pair-slot CEs
+    (`pair_inst`/`pair_pc`, −2.625) — a previously-below-headline plateau member,
+    promoted exactly as the re-baseline note predicted ("does NOT beat the plateau").
+  - seed1: Wall A headline (`bram_addr`→`portb_address_reg`) −2.898 → −2.574: the
+    shared-mux tail it used to cross is gone; residue is the live-response data leg.
+  - seeds 4/5: Wall B/FSM headliners (−3.243/−2.816) — the documented
+    placement-coupled swing (identical-RTL probes −2.2..−3.9); zero R3 logic in cone.
+  - seed7: −2.192/82.02 with a diverse residue panel (FSM, operand forward, byp_q) —
+    the predicted "−2.2..−2.4 plateau (~80 MHz)" ceiling realized.
+- Resources (seed3): 9,927 ALMs (24%) vs 9,828 baseline (+~100 = 3-arm id-map
+  duplication + twins), registers 7,780 (fitter-duplication noise band), block memory
+  bits identical 158,336. Latch-inference log clean.
+- Verdict: **KEPT.** The advance-loop→nx_read0 tail and Wall A's shared tail are
+  eliminated as classes; the plateau successor is the pair-slot ENABLE cone (1-bit CE,
+  no late-select applies) + Wall B/FSM — both need a floorplan (LogicLock unlicensed
+  here) or an AGU-front cut. No RTL levers remain on the list; RTL RE-FROZEN post-R3.
