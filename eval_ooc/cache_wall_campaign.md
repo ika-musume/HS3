@@ -368,3 +368,66 @@ Levers that COULD move the plateau (all bigger / need a decision):
   eliminated as classes; the plateau successor is the pair-slot ENABLE cone (1-bit CE,
   no late-select applies) + Wall B/FSM — both need a floorplan (LogicLock unlicensed
   here) or an AGU-front cut. No RTL levers remain on the list; RTL RE-FROZEN post-R3.
+
+### CV1k sideband + re-anchor (2026-07-18, seeds 1/3/4/5/7, branch `sideband`) — NEUTRAL as designed
+- Context: ikacore_CV1k requested an early-transaction sideband (`o_SB_*`, spec at
+  `~/Desktop/ikacore_CV1k/docs/sh3_sideband.md`) — one registered pulse per committed
+  external transaction UNIT at its internal accept edge (bsc.sv `sb_fire =
+  (fe_eng_start && !fe_sdmr) | (fe_acc && fe_gen && !ord_bcont)`), fields latched at
+  fire. Observation-only; laws bit-exact (HS3_tb 84/84 incl. a NEW whole-run
+  match-queue oracle: 341,575 strobes matched 1:1 with pin units, measured
+  outstanding depth = 1, zero mismatches; cpu_core_tb 103/103).
+- Sweep A (wrapper did NOT yet connect o_SB — sideband swept; = an identical-RTL
+  re-probe of the post-R3 baseline on fresh CAD state):
+  s1 −2.574, s3 −2.609, s4 −2.912, s5 −2.766, s7 −2.032; mean −2.579. The +0.111
+  mean drift vs R3's logged −2.690 on identical logic re-measures the plateau noise.
+- Sweep A2 (o_SB connected through `HS3_ooc_top`, `sb_*` regs confirmed in fit):
+  s1 −2.912, s3 −2.758, s4 −2.253, s5 −2.502, s7 −2.883; mean −2.662. Δmean vs A
+  −0.083 (inside ±0.4); per-seed swings ±0.66/−0.85 in BOTH directions = plateau
+  placement noise. **Zero `sb_` cells in any seed top-20.** Headliners: bram_addr →
+  (BSC fe_* live decode) → req_ready → cache `state.S_IDLE` (the handshake-loop /
+  Wall B-FSM family) + S_FLUSH/S_DRAIN self-loops — all catalogued classes.
+- S1 audit (CV1k §10.2 suggestion 1): inferred altsyncram already carries
+  `MIXED_PORT_FEED_THROUGH_MODE = "dont_care"` for tag (`pgn1`), data (`lpo1`), LRU
+  (`vdn1`) — `no_rw_check` works in this flow. The CV1k STA's
+  `PORT_B_WRITE_ENABLE_REG` launch class does not exist in a faithful build; their
+  fits predate R3 (their §10.1 quotes the pre-R3 catalog). Action for CV1k: re-drop
+  current RTL, verify the map-report RAM parameter, keep the ramstyle string intact.
+
+### R4 — cache-index slice twin (2026-07-18, seeds 1/3/4/5/7, branch `sideband`) — **KEPT; best mean + best single fit ever**
+- The campaign's named "AGU-front cut", executed as a per-consumer duplicate (CV1k §10.2
+  suggestion 2's request-side cousin): a private 12-bit copy of the WHOLE u_agu_d cone
+  (base/addend forward muxes + adder, `l_addr_idx`), re-rooted on a third (* preserve *)
+  select/state set (`*_idx`: fwd lane/wbsel/dep a+b, idex_is_data, ma_seq second/req_sent).
+  Sole consumer: `LBus.req_addr_idx[11:2]` -> cache `grant_idx`/`grant_word` (tag/LRU/data
+  RAM read index + the WT-bypass compares). Sum bits [11:0] close under [11:0] operands, so
+  the twin == `ea_addr_sum[11:0]` every cycle (translate_off assertion). en mirror =
+  `agu_en_mode[0]` (exact: u_agu_d runs i_R_T=0). All other req_addr consumers unchanged.
+- Verification: cpu_core_tb 103/103 + HS3_tb 84/84 (incl. sideband oracle bit-identical:
+  341,575 strobes, depth 1), laws exact, equivalence assertion silent. Zero IPC change
+  (pure duplication).
+- Worst multicorner slack @ 10 ns / restricted Fmax (vs the A2 sideband anchor):
+  s1 −2.220/81.83 (+0.692), s3 −2.677/78.88 (+0.081), s4 **−2.149/80.32 (+0.104, BEST
+  SINGLE FIT EVER, prev −2.192)**, s5 −2.417/80.19 (+0.085), s7 −2.508/79.57 (+0.375).
+  Mean **−2.394** vs A2 −2.662 (+0.268) and vs the R3 logged mean −2.690 (+0.296) —
+  EVERY seed improved vs its A2 twin; three seeds fit ≥80 MHz restricted.
+- Cone verdict — the AGU->RAM-index class is structurally cut:
+  - `byp_q`/`Equal0`(cache)/`tag_raddr`/`data_raddr` appear in **0/20 paths on 4 of 5
+    seeds**; the `_idx` twin logic itself appears in **zero** top-20 (placed with the
+    RAMs, as designed). s5's surviving "Equal0" hits are `u_exc_handler|Equal0` — a
+    DIFFERENT class (below).
+  - New plateau headline family = **exc-MMIO live classification**: AGU adder carry →
+    the shared 4-address compare networks (`o_LMMIO_HIT_LIVE` == the case arms) → `o_TEA[*]|ena`
+    (s4 headline −2.149) and → cache dispatch/`state.S_IDLE` (s5). Plus the operand→EX
+    (s3/s7 `fwd_*`→`exma.gpr0_data`) and FSM/handshake-loop members rotating per seed.
+- CV1k §10.2 suggestion-3 verdict (measured): the cheap 2-bit case sub-decode in
+  exc_handler is a PROVABLE NO-OP — the four compare networks are shared with
+  HIT_LIVE (the o_TEA CE's WE gate), so the binding adder→compare→ena arc survives it.
+  The real lever for this family is SUM-ADDRESSED (carry-free) classification computed
+  in int_pipe off the operand muxes and shipped like req_addr_idx — designed, NOT
+  built (next session). Suggestion 4 (way-select duplicate): measured absent from all
+  panels — skipped.
+- Resources (s4): 10,093 ALMs (24 %; +~170 = 12-bit twin + sideband regs), 7,861
+  registers, block memory bits identical 158,336. Latch-inference log CLEAN.
+- Verdict: **KEPT.** RTL freeze lifted for this branch; post-R4 state = best 5-seed
+  mean and best single fit recorded for this design.

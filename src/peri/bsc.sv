@@ -178,6 +178,17 @@ module bsc #(
        cycles are NOT implemented (ordinary/burst-ROM areas only). */
     output  wire    [1:0]   o_DACK_WIN,     //[0]=DACK0 window, [1]=DACK1 window
 
+    /* EARLY-TRANSACTION SIDEBAND ("fast main", ikacore_CV1k sh3_sideband.md):
+       advisory-with-guarantees strobe for an external memory controller -
+       ONE registered pulse per committed external transaction UNIT at its
+       internal accept edge, fields valid only under the pulse. Nothing is
+       received back; the external protocol is the unchanged contract. */
+    output  wire            o_SB_REQ,       //1-cycle pulse, one per external unit
+    output  wire            o_SB_WR,        //1 = write
+    output  wire    [28:0]  o_SB_ADDR,      //physical, [28:26] = CS area (o_MEM_ADDR encoding)
+    output  wire    [1:0]   o_SB_SIZE,      //I_BUS size encoding
+    output  wire            o_SB_BURST,     //16-byte unit / burst-ROM envelope
+
     /* REFRESH TIMER INTERRUPTS (table 6.4 REF entries) */
     output  wire            o_RCMI_REQ,     //compare match  (INTEVT 0x580)
     output  wire            o_ROVI_REQ      //count overflow (INTEVT 0x5A0)
@@ -1072,6 +1083,55 @@ always_ff @(posedge i_CLK or negedge i_RST_n) begin
         else if(eng_wr_done)                          wr_v <= 4'd0;
     end end
 end
+
+
+
+///////////////////////////////////////////////////////////
+//////  Early-Transaction Sideband (CV1k fast main)
+////
+
+/*
+    One registered pulse per committed external transaction UNIT, launched
+    the core cycle after its accept edge (dedicated FFs: the port never
+    loads the accept cone with external routing). Unit mapping:
+      - SDRAM head/single op = fe_eng_start. A line fill strobes ONCE; a
+        write drain resumed after a mid-burst yield re-arms through a fresh
+        continuation accept, so the resumed op strobes AGAIN carrying the
+        first remaining beat's address (write envelopes may end early -
+        read fills never split, E_RD runs all beats).
+      - ordinary/burst-ROM = envelope head (continuation calls ride it).
+    Exemptions (consumer pin-decodes them, spec R2): CBR/self-refresh and
+    BRQ_PALL (no front-end request), MRS via the SDMR window (init class).
+    A manual reset drops an accepted-undispatched op (eng_go clears), so
+    the consumer flushes its match queue on any reset assertion (R10).
+*/
+
+logic           sb_req_q;
+logic           sb_wr_q, sb_burst_q;
+logic   [1:0]   sb_size_q;
+logic   [28:0]  sb_addr_q;
+
+wire            sb_fire = (fe_eng_start && !fe_sdmr) ||
+                          (fe_acc && fe_gen && !ord_bcont);
+
+always_ff @(posedge i_CLK or negedge i_RST_n) begin
+    if(!i_RST_n) sb_req_q <= 1'b0;
+    else begin if(i_CEN) begin
+        sb_req_q <= sb_fire;
+        if(sb_fire) begin                       //live request fields at the accept edge
+            sb_wr_q    <= I_BUS.req_write;
+            sb_burst_q <= I_BUS.req_burst;
+            sb_size_q  <= I_BUS.req_size;
+            sb_addr_q  <= fa[28:0];
+        end
+    end end
+end
+
+assign  o_SB_REQ   = sb_req_q;
+assign  o_SB_WR    = sb_wr_q;
+assign  o_SB_ADDR  = sb_addr_q;
+assign  o_SB_SIZE  = sb_size_q;
+assign  o_SB_BURST = sb_burst_q;
 
 
 

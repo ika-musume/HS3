@@ -72,6 +72,11 @@ wire    [28:0]  mem_addr_p;
 wire    [6:0]   mem_cs_n;
 wire    [3:0]   mem_wstrb;
 
+//early-transaction sideband (sh3_sideband.md) - oracle checks it whole-run
+wire            sb_req, sb_wr, sb_burst;
+wire    [1:0]   sb_size;
+wire    [28:0]  sb_addr;
+
 //the chip's physical external bus (table 10.1) + the one true bidirectional
 //net (controls stay unidirectional; the inout lives only at board level)
 wire    [25:0]  a_pin;
@@ -117,6 +122,12 @@ HS3 #(
     .i_MEM_RSP_VALID           (raw_mode ? 1'b0 : MEM_BUS.rsp_valid),
     .i_MEM_FAULT               (MEM_BUS.rsp_fault),
     .o_MEM_RSP_READY           (mem_rsp_ready),
+
+    .o_SB_REQ                  (sb_req),
+    .o_SB_WR                   (sb_wr),
+    .o_SB_ADDR                 (sb_addr),
+    .o_SB_SIZE                 (sb_size),
+    .o_SB_BURST                (sb_burst),
 
     .o_A                       (a_pin),
     .o_D_O                     (d_o),
@@ -817,6 +828,69 @@ always @(posedge clk) begin
             u_dut.u_dmac.seq == 3'd4) begin     //S_WR_WAIT completion
         dmaw_log <= {dmaw_log[59:0], u_dut.u_dmac.addr_q[11:8]};
         dmaw_cnt <= dmaw_cnt + 1;
+    end
+end
+
+/*
+    Sideband match-queue oracle (sh3_sideband.md R1-R3/R8): the pump's
+    matching algorithm as a passive whole-run checker. Every o_SB_REQ pulse
+    enqueues {addr, wr, size, burst}; every external transaction UNIT start
+    (SDRAM engine dispatch / ordinary envelope open, white-box) pops the
+    head and compares. Push runs before pop - the registered strobe and
+    the earliest grid dispatch land the same cycle. The BSC's own reset
+    (WDT flavors included) flushes the queue: a strobed-undispatched op is
+    legitimately dropped (spec R10). sb_qmax = the MEASURED R8 depth bound.
+    Single writer; results checked in test_bus_monitors.
+*/
+
+logic   [32:0]  sb_q [0:3];             //{addr[28:0], wr, size[1:0], burst}
+logic   [32:0]  sb_exp;
+logic           sb_ordbusy_z = 1'b0;    //ord_busy delay for the rise detect
+integer         sb_qn      = 0;         //queue occupancy
+integer         sb_qmax    = 0;         //occupancy high-water (measured R8)
+integer         sb_pushes  = 0;         //total strobes seen (coverage)
+integer         sb_flushed = 0;         //reset-dropped strobes (R10 path)
+integer         sb_err     = 0;         //oracle mismatches (must end 0)
+
+always @(posedge clk) begin
+    if(!u_dut.u_bsc.i_RST_n) begin              //any reset flavor: front-end dies
+        sb_flushed   = sb_flushed + sb_qn;
+        sb_qn        = 0;
+        sb_ordbusy_z = 1'b0;
+    end
+    else begin
+        if(sb_req) begin                        //push first (same-cycle pop is legal)
+            if(sb_qn == 4) begin
+                $display("      [FAIL] SB oracle: queue overflow");
+                sb_err = sb_err + 1;
+                sb_qn  = 0;
+            end
+            sb_q[sb_qn] = {sb_addr, sb_wr, sb_size, sb_burst};
+            sb_qn       = sb_qn + 1;
+            sb_pushes   = sb_pushes + 1;
+            if(sb_qn > sb_qmax) sb_qmax = sb_qn;
+        end
+        if((u_dut.u_bsc.eng_start_tk && !u_dut.u_bsc.eng_op_mrs) ||
+           (u_dut.u_bsc.ord_busy && !sb_ordbusy_z)) begin
+            sb_exp = u_dut.u_bsc.eng_start_tk ?
+                {u_dut.u_bsc.eng_addr[28:0], u_dut.u_bsc.eng_op_write,
+                 u_dut.u_bsc.eng_op_size,    u_dut.u_bsc.eng_op_burst} :
+                {u_dut.u_bsc.ord_addr[28:0], u_dut.u_bsc.ord_write,
+                 u_dut.u_bsc.ord_size,       u_dut.u_bsc.ord_burst};
+            if(sb_qn == 0) begin
+                $display("      [FAIL] SB oracle: unit start with empty queue (exp=%h)", sb_exp);
+                sb_err = sb_err + 1;
+            end
+            else begin
+                if(sb_q[0] !== sb_exp) begin
+                    $display("      [FAIL] SB oracle: head mismatch got=%h exp=%h", sb_q[0], sb_exp);
+                    sb_err = sb_err + 1;
+                end
+                sb_q[0] = sb_q[1]; sb_q[1] = sb_q[2]; sb_q[2] = sb_q[3];
+                sb_qn   = sb_qn - 1;
+            end
+        end
+        sb_ordbusy_z = u_dut.u_bsc.ord_busy;    //updated last: rise detect above
     end
 end
 
@@ -3236,6 +3310,13 @@ task automatic test_bus_monitors;
         begin_test("Board-bus shape monitors: D-bus contention, addr/data hold under WE (whole run)");
         chk_true("no D-bus driver overlap",         !dbus_viol);
         chk_true("no addr/data movement under WE",  !we_shape_viol);
+        end_test;
+        begin_test("Sideband match-queue oracle: strobe==unit 1:1, in order, fields exact (whole run)");
+        $display("      (info) %0d strobes matched, measured R8 depth = %0d, reset-flushed = %0d",
+                 sb_pushes, sb_qmax, sb_flushed);
+        chk_true("no oracle mismatches",            sb_err == 0);
+        chk_true("strobe coverage nonzero",         sb_pushes > 1000);
+        chk_true("R8 outstanding depth within 2",   sb_qmax <= 2);
         end_test;
     end
 endtask

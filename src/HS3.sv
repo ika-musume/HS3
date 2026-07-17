@@ -96,6 +96,16 @@ module HS3 #(
     input   wire            i_MEM_FAULT,
     output  wire            o_MEM_RSP_READY,
 
+    /* EARLY-TRANSACTION SIDEBAND (ikacore_CV1k sh3_sideband.md): one
+       registered pulse per committed external transaction unit at its
+       internal accept edge - advisory only, nothing returned. Leave
+       unconnected when unused. */
+    output  wire            o_SB_REQ,
+    output  wire            o_SB_WR,
+    output  wire    [28:0]  o_SB_ADDR,
+    output  wire    [1:0]   o_SB_SIZE,
+    output  wire            o_SB_BURST,
+
     /* INTERRUPT PINS - IRQ/IRL, IRLS and PINT arrive through the port pads
        below (table 18.1 pin shares); only NMI is dedicated */
     input   wire            i_NMI,
@@ -265,6 +275,12 @@ bsc #(
     .i_MEM_RSP_VALID        (i_MEM_RSP_VALID                        ),
     .i_MEM_FAULT            (i_MEM_FAULT                            ),
     .o_MEM_RSP_READY        (o_MEM_RSP_READY                        ),
+
+    .o_SB_REQ               (o_SB_REQ                               ),
+    .o_SB_WR                (o_SB_WR                                ),
+    .o_SB_ADDR              (o_SB_ADDR                              ),
+    .o_SB_SIZE              (o_SB_SIZE                              ),
+    .o_SB_BURST             (o_SB_BURST                             ),
 
     .o_A                    (o_A                                    ),
     .o_D_O                  (o_D_O                                  ),

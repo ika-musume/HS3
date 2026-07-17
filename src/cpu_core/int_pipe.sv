@@ -242,8 +242,10 @@ logic   [15:0]  pair_inst;
 pd_route_t      pair_pd;          //sibling predecode, computed once at capture
 logic           data_req_sent;    //MA request accepted; response still pending
 logic           data_req_sent_agu;    //AGU-only preserved duplicate (u_ma_seq o_req_sent_agu)
+logic           data_req_sent_idx;    //cache-index-slice duplicate (u_ma_seq o_req_sent_idx)
 logic           ma_second_access; //MEM_MAC second read or MEM_RMW write phase
 logic           ma_second_access_agu; //AGU-only preserved duplicate (u_ma_seq o_second_agu)
+logic           ma_second_access_idx; //cache-index-slice duplicate (u_ma_seq o_second_idx)
 logic           mac_started;      //current multiply command has entered u_mac_dsp
 logic   [31:0]  ma_first_value;   //first MAC operand or original RMW byte
 logic           mac_armed;        //operands captured in dsp_a/dsp_b; multiply launches next cycle
@@ -287,6 +289,12 @@ logic   [31:0]  fwd_shadow_a, fwd_shadow_b, fwd_shadow_st; //deposited operand w
 (* preserve *) fwd_lane_t fwd_lane_a_agu, fwd_lane_b_agu;
 (* preserve *) logic      fwd_wbsel_a_agu, fwd_wbsel_b_agu;
 (* preserve *) logic      fwd_dep_a_agu,  fwd_dep_b_agu;
+//Cache-index-slice duplicates (third copy set): sole loads are the 12-bit l_addr_idx
+//twin's muxes/adder, so the fitter can place that WHOLE slice at the cache RAM block.
+(* preserve *) fwd_lane_t fwd_lane_a_idx, fwd_lane_b_idx;
+(* preserve *) logic      fwd_wbsel_a_idx, fwd_wbsel_b_idx;
+(* preserve *) logic      fwd_dep_a_idx,  fwd_dep_b_idx;
+(* preserve *) logic      idex_is_data_idx;
 
 assign  o_FETCH_PC = fetch_pc;
 
@@ -1567,6 +1575,11 @@ wire [31:0] agu_wb_a = fwd_dep_a_agu ? fwd_shadow_a :
                        (fwd_lane_a_agu == FWD_EXMA_G1 ? mawb.gpr1_data : mawb.gpr0_data);
 wire [31:0] agu_wb_b = fwd_dep_b_agu ? fwd_shadow_b :
                        (fwd_lane_b_agu == FWD_EXMA_G1 ? mawb.gpr1_data : mawb.gpr0_data);
+//Cache-index-slice twins of the same folds ([11:0] only), from the _idx duplicates.
+wire [11:0] agu_wb_a_idx = fwd_dep_a_idx ? fwd_shadow_a[11:0] :
+                           (fwd_lane_a_idx == FWD_EXMA_G1 ? mawb.gpr1_data[11:0] : mawb.gpr0_data[11:0]);
+wire [11:0] agu_wb_b_idx = fwd_dep_b_idx ? fwd_shadow_b[11:0] :
+                           (fwd_lane_b_idx == FWD_EXMA_G1 ? mawb.gpr1_data[11:0] : mawb.gpr0_data[11:0]);
 always_comb begin
     case(fwd_wbsel_a ? FWD_WB : fwd_lane_a)
         FWD_EXMA_G0: ex_a = exma.gpr0_data;      //producer result, one stage ahead
@@ -1900,6 +1913,8 @@ end
 //EX instruction gets the AGU that cycle instead of being forced to the second address.
 //Built from the preserved *_agu duplicates: the AGU is its only consumer.
 assign  ma_second_pending_agu = ma_second_access_agu && !data_req_sent_agu;
+//index-slice twin of the same gate, off the _idx duplicates (sole load: l_addr_idx cone)
+wire    ma_second_pending_idx = ma_second_access_idx && !data_req_sent_idx;
 
 //SHALLOW "data access presented this cycle" (was the o_D_REQ_RAW sideband). Drives the L bus
 //req_fetch: a fetch is presented only when this is 0 (DATA priority). The AGU time-share select
@@ -1930,6 +1945,43 @@ agu u_agu_d (
     .i_PC_INC   (1'b0                          ),
     .o_ADDR     (ea_addr_sum                   )
 );
+
+//CACHE-INDEX SLICE TWIN: a 12-bit copy of the whole u_agu_d cone (operand muxes +
+//adder), re-rooted on the private (* preserve *) _idx select/state duplicates. Sum
+//bits [11:0] depend only on operand bits [11:0], so l_addr_idx == ea_addr_sum[11:0]
+//every cycle (sim-asserted below). Its ONLY consumer is L_BUS.req_addr_idx -> the
+//cache RAM read index + WT-bypass compares, so the fitter can drop the whole slice
+//at the RAM block instead of routing the shared adder across the die (Wall A/B).
+//en mirror: u_agu_d runs i_R_T=0, so agu.sv's en = mode[0] exactly.
+logic   [11:0]  ea_base_idx, ea_addend_idx;
+always_comb begin
+    case(ma_second_pending_idx ? FWD_NONE : (fwd_wbsel_a_idx ? FWD_WB : fwd_lane_a_idx))
+        FWD_EXMA_G0: ea_base_idx = exma.gpr0_data[11:0];
+        FWD_EXMA_G1: ea_base_idx = exma.gpr1_data[11:0];
+        FWD_WB:      ea_base_idx = agu_wb_a_idx;
+        default:     ea_base_idx = agu_base_q[11:0];
+    endcase
+    case(fwd_wbsel_b_idx ? FWD_WB : fwd_lane_b_idx)
+        FWD_EXMA_G0: ea_addend_idx = exma.gpr0_data[11:0];
+        FWD_EXMA_G1: ea_addend_idx = exma.gpr1_data[11:0];
+        FWD_WB:      ea_addend_idx = agu_wb_b_idx;
+        default:     ea_addend_idx = idex.src_b_value[11:0];
+    endcase
+end
+wire            l_is_data_idx = idex_is_data_idx || ma_second_access_idx;
+wire            agu_en_idx    = (l_is_data_idx && !ma_second_pending_idx) && idex.agu_en_mode[0];
+wire    [11:0]  agu_x_idx     = l_is_data_idx ? ea_base_idx : fetch_pc[11:0];
+wire    [11:0]  l_addr_idx    = agu_x_idx + (agu_en_idx ? ea_addend_idx : 12'd0);
+
+// synthesis translate_off
+//Index-slice equivalence: the twin must equal the shared AGU's low bits every cycle -
+//proves the _idx duplicate set and the 12-bit slice against the original cone.
+always_comb begin
+    if(l_addr_idx !== ea_addr_sum[11:0])
+        $fatal(1, "cache-index slice twin mismatch: idx=%03x agu=%03x",
+               l_addr_idx, ea_addr_sum[11:0]);
+end
+// synthesis translate_on
 
 always_comb begin
     //Convert the register value into normalized 32-bit memory lanes.
@@ -2211,8 +2263,10 @@ ma_seq #(.BIG_ENDIAN(BIG_ENDIAN)) u_ma_seq (
     .o_req          (early_bus_d_req      ),
     .o_second       (ma_second_access     ),
     .o_second_agu   (ma_second_access_agu ),
+    .o_second_idx   (ma_second_access_idx ),
     .o_req_sent     (data_req_sent        ),
     .o_req_sent_agu (data_req_sent_agu    ),
+    .o_req_sent_idx (data_req_sent_idx    ),
     .o_first_value  (ma_first_value       )
 );
 
@@ -2421,6 +2475,7 @@ always_comb begin
     L_BUS.req_fetch = !l_is_data;
     L_BUS.req_valid = l_is_data ? early_bus_d_req.valid : early_i_req_raw_valid;
     L_BUS.req_addr  = effective_addr;                  //= ea_addr_sum: data EA (MA) or fetch PC (IF)
+    L_BUS.req_addr_idx = l_addr_idx[11:2];             //cache-index slice twin (== req_addr[11:2])
     L_BUS.req_write = early_bus_d_req.write;
     L_BUS.req_size  = early_bus_d_req.size;
     L_BUS.req_wdata = early_bus_d_req.wdata;
@@ -2661,16 +2716,22 @@ always_ff @(posedge i_CLK or negedge i_RST_n) begin
         fwd_lane_st         <= FWD_NONE;
         fwd_lane_a_agu      <= FWD_NONE;
         fwd_lane_b_agu      <= FWD_NONE;
+        fwd_lane_a_idx      <= FWD_NONE;
+        fwd_lane_b_idx      <= FWD_NONE;
         fwd_wbsel_a         <= 1'b0;
         fwd_wbsel_b         <= 1'b0;
         fwd_wbsel_st        <= 1'b0;
         fwd_wbsel_a_agu     <= 1'b0;
         fwd_wbsel_b_agu     <= 1'b0;
+        fwd_wbsel_a_idx     <= 1'b0;
+        fwd_wbsel_b_idx     <= 1'b0;
         fwd_dep_a           <= 1'b0;
         fwd_dep_b           <= 1'b0;
         fwd_dep_st          <= 1'b0;
         fwd_dep_a_agu       <= 1'b0;
         fwd_dep_b_agu       <= 1'b0;
+        fwd_dep_a_idx       <= 1'b0;
+        fwd_dep_b_idx       <= 1'b0;
         idex.src_a_used     <= 1'b0;
         idex.src_a_id       <= 5'd0;
         idex.src_b_used     <= 1'b0;
@@ -2710,6 +2771,7 @@ always_ff @(posedge i_CLK or negedge i_RST_n) begin
         idex.illegal        <= 1'b0;
         idex.privileged     <= 1'b0;
         idex_is_data_agu <= 1'b0;
+        idex_is_data_idx <= 1'b0;
         exma.valid        <= 1'b0;
         exma.delay_slot   <= 1'b0;
         exma.gpr0_we      <= 1'b0;
@@ -2819,21 +2881,28 @@ always_ff @(posedge i_CLK or negedge i_RST_n) begin
         if(i_REDIRECT_VALID) begin
             idex          <= '0;
             idex_is_data_agu <= 1'b0;
+            idex_is_data_idx <= 1'b0;
             fwd_lane_a    <= FWD_NONE;
             fwd_lane_b    <= FWD_NONE;
             fwd_lane_st   <= FWD_NONE;
             fwd_lane_a_agu<= FWD_NONE;
             fwd_lane_b_agu<= FWD_NONE;
+            fwd_lane_a_idx<= FWD_NONE;
+            fwd_lane_b_idx<= FWD_NONE;
             fwd_wbsel_a   <= 1'b0;
             fwd_wbsel_b   <= 1'b0;
             fwd_wbsel_st  <= 1'b0;
             fwd_wbsel_a_agu <= 1'b0;
             fwd_wbsel_b_agu <= 1'b0;
+            fwd_wbsel_a_idx <= 1'b0;
+            fwd_wbsel_b_idx <= 1'b0;
             fwd_dep_a     <= 1'b0;
             fwd_dep_b     <= 1'b0;
             fwd_dep_st    <= 1'b0;
             fwd_dep_a_agu <= 1'b0;
             fwd_dep_b_agu <= 1'b0;
+            fwd_dep_a_idx <= 1'b0;
+            fwd_dep_b_idx <= 1'b0;
             exma          <= '0;
             mawb          <= '0;
             fault_hold    <= 1'b0;
@@ -2967,6 +3036,7 @@ always_ff @(posedge i_CLK or negedge i_RST_n) begin
                                      id_decode.addr_op == ADDR_NONE) ? 2'd0 : 2'd1;
                 //preserved AGU-only duplicate: same cone as idex.is_data above
                 idex_is_data_agu <= id_issue && (id_decode.mem_op != MEM_NONE);
+                idex_is_data_idx <= id_issue && (id_decode.mem_op != MEM_NONE);
                 //Pre-decoded address-update addend (see au_addend_q declaration).
                 au_addend_q <= (id_decode.addr_op == ADDR_PREDEC)  ? (~id_mem_step + 32'd1) :
                                (id_decode.addr_op == ADDR_POSTINC) ? id_mem_step :
@@ -3017,26 +3087,32 @@ always_ff @(posedge i_CLK or negedge i_RST_n) begin
                 fwd_lane_st     <= id_lane_st;
                 fwd_lane_a_agu  <= id_lane_a;
                 fwd_lane_b_agu  <= id_lane_b;
+                fwd_lane_a_idx  <= id_lane_a;
+                fwd_lane_b_idx  <= id_lane_b;
                 fwd_wbsel_a     <= id_lane_a  == FWD_WB;
                 fwd_wbsel_b     <= id_lane_b  == FWD_WB;
                 fwd_wbsel_st    <= id_lane_st == FWD_WB;
                 fwd_wbsel_a_agu <= id_lane_a  == FWD_WB;
                 fwd_wbsel_b_agu <= id_lane_b  == FWD_WB;
+                fwd_wbsel_a_idx <= id_lane_a  == FWD_WB;
+                fwd_wbsel_b_idx <= id_lane_b  == FWD_WB;
                 fwd_dep_a       <= 1'b0;
                 fwd_dep_b       <= 1'b0;
                 fwd_dep_st      <= 1'b0;
                 fwd_dep_a_agu   <= 1'b0;
                 fwd_dep_b_agu   <= 1'b0;
+                fwd_dep_a_idx   <= 1'b0;
+                fwd_dep_b_idx   <= 1'b0;
             end
             else begin
                 //held consumer: the drain edge switches the port to the WB view
                 if(fwd_lane_a  != FWD_NONE && exma_allow) begin
-                    fwd_wbsel_a <= 1'b1; fwd_wbsel_a_agu <= 1'b1; end
+                    fwd_wbsel_a <= 1'b1; fwd_wbsel_a_agu <= 1'b1; fwd_wbsel_a_idx <= 1'b1; end
                 if(fwd_lane_b  != FWD_NONE && exma_allow) begin
-                    fwd_wbsel_b <= 1'b1; fwd_wbsel_b_agu <= 1'b1; end
+                    fwd_wbsel_b <= 1'b1; fwd_wbsel_b_agu <= 1'b1; fwd_wbsel_b_idx <= 1'b1; end
                 if(fwd_lane_st != FWD_NONE && exma_allow) fwd_wbsel_st <= 1'b1;
-                if(fwd_wbsel_a ) begin fwd_dep_a  <= 1'b1; fwd_dep_a_agu <= 1'b1; end
-                if(fwd_wbsel_b ) begin fwd_dep_b  <= 1'b1; fwd_dep_b_agu <= 1'b1; end
+                if(fwd_wbsel_a ) begin fwd_dep_a  <= 1'b1; fwd_dep_a_agu <= 1'b1; fwd_dep_a_idx <= 1'b1; end
+                if(fwd_wbsel_b ) begin fwd_dep_b  <= 1'b1; fwd_dep_b_agu <= 1'b1; fwd_dep_b_idx <= 1'b1; end
                 if(fwd_wbsel_st) fwd_dep_st <= 1'b1;
             end
 
@@ -3046,21 +3122,28 @@ always_ff @(posedge i_CLK or negedge i_RST_n) begin
             if(wb_valid && mawb.fault) begin
                 idex          <= '0;
                 idex_is_data_agu <= 1'b0;
+                idex_is_data_idx <= 1'b0;
                 fwd_lane_a    <= FWD_NONE;
                 fwd_lane_b    <= FWD_NONE;
                 fwd_lane_st   <= FWD_NONE;
                 fwd_lane_a_agu<= FWD_NONE;
                 fwd_lane_b_agu<= FWD_NONE;
+                fwd_lane_a_idx<= FWD_NONE;
+                fwd_lane_b_idx<= FWD_NONE;
                 fwd_wbsel_a   <= 1'b0;
                 fwd_wbsel_b   <= 1'b0;
                 fwd_wbsel_st  <= 1'b0;
                 fwd_wbsel_a_agu <= 1'b0;
                 fwd_wbsel_b_agu <= 1'b0;
+                fwd_wbsel_a_idx <= 1'b0;
+                fwd_wbsel_b_idx <= 1'b0;
                 fwd_dep_a     <= 1'b0;
                 fwd_dep_b     <= 1'b0;
                 fwd_dep_st    <= 1'b0;
                 fwd_dep_a_agu <= 1'b0;
                 fwd_dep_b_agu <= 1'b0;
+                fwd_dep_a_idx <= 1'b0;
+                fwd_dep_b_idx <= 1'b0;
                 exma          <= '0;
                 mawb          <= '0;
                 mac_started       <= 1'b0;
@@ -3172,8 +3255,10 @@ module ma_seq import int_pipe_pkg::*; #(
     output  dbus_req_pkt_t  o_req,          //unified request to the single D bus port
     output  wire            o_second,       //second access in progress (phase)
     output  wire            o_second_agu,   //AGU-only preserved duplicate of o_second
+    output  wire            o_second_idx,   //cache-index-slice preserved duplicate of o_second
     output  wire            o_req_sent,     //request accepted, response still pending
     output  wire            o_req_sent_agu, //AGU-only preserved duplicate of o_req_sent
+    output  wire            o_req_sent_idx, //cache-index-slice preserved duplicate
     output  wire    [31:0]  o_first_value   //captured first operand / original RMW byte
 );
 
@@ -3185,8 +3270,11 @@ logic   [31:0]  first_value;    //first MAC operand or original RMW byte
 //loads; preserve stops Quartus merging these copies back into the originals, so the
 //fitter can place them beside the AGU half-cycle (cen_p->cen_n) i_USE_BASE / i_EN_MODE
 //nets. D-cones mirror the originals exactly; only the AGU loads their Q outputs.
+//The _idx pair feeds ONLY the cache-index slice twin (int_pipe l_addr_idx cone).
 (* preserve *) logic    second_access_agu;
 (* preserve *) logic    req_sent_agu;
+(* preserve *) logic    second_access_idx;
+(* preserve *) logic    req_sent_idx;
 
 //Scalar handshake products. Each next-state below composes the ORIGINAL nested-if
 //priority exactly: capture beats fire beats hold, advance reloads, flush clears.
@@ -3278,12 +3366,16 @@ always_ff @(posedge i_CLK or negedge i_RST_n) begin
         //first_value: R7 strip - MAC capture word, consumed only under exma MEM_MAC
         req_sent_agu      <= 1'b0;
         second_access_agu <= 1'b0;
+        req_sent_idx      <= 1'b0;
+        second_access_idx <= 1'b0;
     end
     else if(i_CEN) begin
         req_sent          <= req_sent_nx;
         second_access     <= second_nx;
         req_sent_agu      <= req_sent_nx;
         second_access_agu <= second_nx;
+        req_sent_idx      <= req_sent_nx;
+        second_access_idx <= second_nx;
         if(fv_ce) first_value <= i_ma_capture;
     end
 end
@@ -3292,8 +3384,10 @@ assign  o_req          = d_req;
 assign  o_ex_accept    = ex_accept;
 assign  o_second       = second_access;
 assign  o_second_agu   = second_access_agu;
+assign  o_second_idx   = second_access_idx;
 assign  o_req_sent     = req_sent;
 assign  o_req_sent_agu = req_sent_agu;
+assign  o_req_sent_idx = req_sent_idx;
 assign  o_first_value  = first_value;
 
 endmodule

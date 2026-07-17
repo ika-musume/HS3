@@ -32,6 +32,13 @@ module HS3_ooc_top (
     input   wire            i_MEM_FAULT,
     output  wire            o_MEM_RSP_READY,
 
+    /* EARLY-TRANSACTION SIDEBAND (sh3_sideband.md) */
+    output  wire            o_SB_REQ,
+    output  wire            o_SB_WR,
+    output  wire    [28:0]  o_SB_ADDR,
+    output  wire    [1:0]   o_SB_SIZE,
+    output  wire            o_SB_BURST,
+
     /* BSC PHYSICAL PINS (shared external bus, table 10.1) */
     output  wire    [25:0]  o_A,
     output  wire    [31:0]  o_D_O,
@@ -132,6 +139,12 @@ module HS3_ooc_top (
         .i_MEM_RSP_VALID        (i_MEM_RSP_VALID            ),
         .i_MEM_FAULT            (i_MEM_FAULT                ),
         .o_MEM_RSP_READY        (o_MEM_RSP_READY            ),
+
+        .o_SB_REQ               (o_SB_REQ                   ),
+        .o_SB_WR                (o_SB_WR                    ),
+        .o_SB_ADDR              (o_SB_ADDR                  ),
+        .o_SB_SIZE              (o_SB_SIZE                  ),
+        .o_SB_BURST             (o_SB_BURST                 ),
 
         .o_A                    (o_A                        ),
         .o_D_O                  (o_D_O                      ),
