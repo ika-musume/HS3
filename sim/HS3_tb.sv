@@ -72,10 +72,10 @@ wire    [28:0]  mem_addr_p;
 wire    [6:0]   mem_cs_n;
 wire    [3:0]   mem_wstrb;
 
-//early-transaction sideband (sh3_sideband.md) - oracle checks it whole-run
-wire            sb_req, sb_wr, sb_burst;
-wire    [1:0]   sb_size;
-wire    [28:0]  sb_addr;
+//MON transaction monitor / early-transaction sideband (sh3_sideband.md) - oracle checks it whole-run
+wire            mon_req, mon_wr, mon_burst;
+wire    [1:0]   mon_size;
+wire    [28:0]  mon_addr;
 
 //the chip's physical external bus (table 10.1) + the one true bidirectional
 //net (controls stay unidirectional; the inout lives only at board level)
@@ -112,7 +112,7 @@ HS3 #(
     .i_EXTAL2                  (extal2),
 
     .o_MEM_REQ                 (mem_req),
-    .o_MEM_WRITE               (mem_write),
+    .o_MEM_WR               (mem_write),
     .o_MEM_BURST               (mem_burst),
     .o_MEM_SIZE                (mem_size),
     .o_MEM_ADDR                (mem_addr_p),
@@ -123,11 +123,11 @@ HS3 #(
     .i_MEM_FAULT               (MEM_BUS.rsp_fault),
     .o_MEM_RSP_READY           (mem_rsp_ready),
 
-    .o_SB_REQ                  (sb_req),
-    .o_SB_WR                   (sb_wr),
-    .o_SB_ADDR                 (sb_addr),
-    .o_SB_SIZE                 (sb_size),
-    .o_SB_BURST                (sb_burst),
+    .o_MON_REQ                  (mon_req),
+    .o_MON_WR                   (mon_wr),
+    .o_MON_ADDR                 (mon_addr),
+    .o_MON_SIZE                 (mon_size),
+    .o_MON_BURST                (mon_burst),
 
     .o_A                       (a_pin),
     .o_D_O                     (d_o),
@@ -832,65 +832,65 @@ always @(posedge clk) begin
 end
 
 /*
-    Sideband match-queue oracle (sh3_sideband.md R1-R3/R8): the pump's
-    matching algorithm as a passive whole-run checker. Every o_SB_REQ pulse
+    MON match-queue oracle (sh3_sideband.md R1-R3/R8): the pump's
+    matching algorithm as a passive whole-run checker. Every o_MON_REQ pulse
     enqueues {addr, wr, size, burst}; every external transaction UNIT start
     (SDRAM engine dispatch / ordinary envelope open, white-box) pops the
     head and compares. Push runs before pop - the registered strobe and
     the earliest grid dispatch land the same cycle. The BSC's own reset
     (WDT flavors included) flushes the queue: a strobed-undispatched op is
-    legitimately dropped (spec R10). sb_qmax = the MEASURED R8 depth bound.
+    legitimately dropped (spec R10). mon_qmax = the MEASURED R8 depth bound.
     Single writer; results checked in test_bus_monitors.
 */
 
-logic   [32:0]  sb_q [0:3];             //{addr[28:0], wr, size[1:0], burst}
-logic   [32:0]  sb_exp;
-logic           sb_ordbusy_z = 1'b0;    //ord_busy delay for the rise detect
-integer         sb_qn      = 0;         //queue occupancy
-integer         sb_qmax    = 0;         //occupancy high-water (measured R8)
-integer         sb_pushes  = 0;         //total strobes seen (coverage)
-integer         sb_flushed = 0;         //reset-dropped strobes (R10 path)
-integer         sb_err     = 0;         //oracle mismatches (must end 0)
+logic   [32:0]  mon_q [0:3];             //{addr[28:0], wr, size[1:0], burst}
+logic   [32:0]  mon_exp;
+logic           mon_ordbusy_z = 1'b0;    //ord_busy delay for the rise detect
+integer         mon_qn      = 0;         //queue occupancy
+integer         mon_qmax    = 0;         //occupancy high-water (measured R8)
+integer         mon_pushes  = 0;         //total strobes seen (coverage)
+integer         mon_flushed = 0;         //reset-dropped strobes (R10 path)
+integer         mon_err     = 0;         //oracle mismatches (must end 0)
 
 always @(posedge clk) begin
     if(!u_dut.u_bsc.i_RST_n) begin              //any reset flavor: front-end dies
-        sb_flushed   = sb_flushed + sb_qn;
-        sb_qn        = 0;
-        sb_ordbusy_z = 1'b0;
+        mon_flushed   = mon_flushed + mon_qn;
+        mon_qn        = 0;
+        mon_ordbusy_z = 1'b0;
     end
     else begin
-        if(sb_req) begin                        //push first (same-cycle pop is legal)
-            if(sb_qn == 4) begin
-                $display("      [FAIL] SB oracle: queue overflow");
-                sb_err = sb_err + 1;
-                sb_qn  = 0;
+        if(mon_req) begin                        //push first (same-cycle pop is legal)
+            if(mon_qn == 4) begin
+                $display("      [FAIL] MON oracle: queue overflow");
+                mon_err = mon_err + 1;
+                mon_qn  = 0;
             end
-            sb_q[sb_qn] = {sb_addr, sb_wr, sb_size, sb_burst};
-            sb_qn       = sb_qn + 1;
-            sb_pushes   = sb_pushes + 1;
-            if(sb_qn > sb_qmax) sb_qmax = sb_qn;
+            mon_q[mon_qn] = {mon_addr, mon_wr, mon_size, mon_burst};
+            mon_qn       = mon_qn + 1;
+            mon_pushes   = mon_pushes + 1;
+            if(mon_qn > mon_qmax) mon_qmax = mon_qn;
         end
         if((u_dut.u_bsc.eng_start_tk && !u_dut.u_bsc.eng_op_mrs) ||
-           (u_dut.u_bsc.ord_busy && !sb_ordbusy_z)) begin
-            sb_exp = u_dut.u_bsc.eng_start_tk ?
+           (u_dut.u_bsc.ord_busy && !mon_ordbusy_z)) begin
+            mon_exp = u_dut.u_bsc.eng_start_tk ?
                 {u_dut.u_bsc.eng_addr[28:0], u_dut.u_bsc.eng_op_write,
                  u_dut.u_bsc.eng_op_size,    u_dut.u_bsc.eng_op_burst} :
                 {u_dut.u_bsc.ord_addr[28:0], u_dut.u_bsc.ord_write,
                  u_dut.u_bsc.ord_size,       u_dut.u_bsc.ord_burst};
-            if(sb_qn == 0) begin
-                $display("      [FAIL] SB oracle: unit start with empty queue (exp=%h)", sb_exp);
-                sb_err = sb_err + 1;
+            if(mon_qn == 0) begin
+                $display("      [FAIL] MON oracle: unit start with empty queue (exp=%h)", mon_exp);
+                mon_err = mon_err + 1;
             end
             else begin
-                if(sb_q[0] !== sb_exp) begin
-                    $display("      [FAIL] SB oracle: head mismatch got=%h exp=%h", sb_q[0], sb_exp);
-                    sb_err = sb_err + 1;
+                if(mon_q[0] !== mon_exp) begin
+                    $display("      [FAIL] MON oracle: head mismatch got=%h exp=%h", mon_q[0], mon_exp);
+                    mon_err = mon_err + 1;
                 end
-                sb_q[0] = sb_q[1]; sb_q[1] = sb_q[2]; sb_q[2] = sb_q[3];
-                sb_qn   = sb_qn - 1;
+                mon_q[0] = mon_q[1]; mon_q[1] = mon_q[2]; mon_q[2] = mon_q[3];
+                mon_qn   = mon_qn - 1;
             end
         end
-        sb_ordbusy_z = u_dut.u_bsc.ord_busy;    //updated last: rise detect above
+        mon_ordbusy_z = u_dut.u_bsc.ord_busy;    //updated last: rise detect above
     end
 end
 
@@ -3311,12 +3311,12 @@ task automatic test_bus_monitors;
         chk_true("no D-bus driver overlap",         !dbus_viol);
         chk_true("no addr/data movement under WE",  !we_shape_viol);
         end_test;
-        begin_test("Sideband match-queue oracle: strobe==unit 1:1, in order, fields exact (whole run)");
+        begin_test("MON match-queue oracle: strobe==unit 1:1, in order, fields exact (whole run)");
         $display("      (info) %0d strobes matched, measured R8 depth = %0d, reset-flushed = %0d",
-                 sb_pushes, sb_qmax, sb_flushed);
-        chk_true("no oracle mismatches",            sb_err == 0);
-        chk_true("strobe coverage nonzero",         sb_pushes > 1000);
-        chk_true("R8 outstanding depth within 2",   sb_qmax <= 2);
+                 mon_pushes, mon_qmax, mon_flushed);
+        chk_true("no oracle mismatches",            mon_err == 0);
+        chk_true("strobe coverage nonzero",         mon_pushes > 1000);
+        chk_true("R8 outstanding depth within 2",   mon_qmax <= 2);
         end_test;
     end
 endtask

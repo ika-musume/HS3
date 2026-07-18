@@ -370,21 +370,21 @@ Levers that COULD move the plateau (all bigger / need a decision):
   here) or an AGU-front cut. No RTL levers remain on the list; RTL RE-FROZEN post-R3.
 
 ### CV1k sideband + re-anchor (2026-07-18, seeds 1/3/4/5/7, branch `sideband`) — NEUTRAL as designed
-- Context: ikacore_CV1k requested an early-transaction sideband (`o_SB_*`, spec at
+- Context: ikacore_CV1k requested an early-transaction sideband (`o_MON_*`, spec at
   `~/Desktop/ikacore_CV1k/docs/sh3_sideband.md`) — one registered pulse per committed
-  external transaction UNIT at its internal accept edge (bsc.sv `sb_fire =
+  external transaction UNIT at its internal accept edge (bsc.sv `mon_fire =
   (fe_eng_start && !fe_sdmr) | (fe_acc && fe_gen && !ord_bcont)`), fields latched at
   fire. Observation-only; laws bit-exact (HS3_tb 84/84 incl. a NEW whole-run
   match-queue oracle: 341,575 strobes matched 1:1 with pin units, measured
   outstanding depth = 1, zero mismatches; cpu_core_tb 103/103).
-- Sweep A (wrapper did NOT yet connect o_SB — sideband swept; = an identical-RTL
+- Sweep A (wrapper did NOT yet connect o_MON — sideband swept; = an identical-RTL
   re-probe of the post-R3 baseline on fresh CAD state):
   s1 −2.574, s3 −2.609, s4 −2.912, s5 −2.766, s7 −2.032; mean −2.579. The +0.111
   mean drift vs R3's logged −2.690 on identical logic re-measures the plateau noise.
-- Sweep A2 (o_SB connected through `HS3_ooc_top`, `sb_*` regs confirmed in fit):
+- Sweep A2 (o_MON connected through `HS3_ooc_top`, `mon_*` regs confirmed in fit):
   s1 −2.912, s3 −2.758, s4 −2.253, s5 −2.502, s7 −2.883; mean −2.662. Δmean vs A
   −0.083 (inside ±0.4); per-seed swings ±0.66/−0.85 in BOTH directions = plateau
-  placement noise. **Zero `sb_` cells in any seed top-20.** Headliners: bram_addr →
+  placement noise. **Zero `mon_` cells in any seed top-20.** Headliners: bram_addr →
   (BSC fe_* live decode) → req_ready → cache `state.S_IDLE` (the handshake-loop /
   Wall B-FSM family) + S_FLUSH/S_DRAIN self-loops — all catalogued classes.
 - S1 audit (CV1k §10.2 suggestion 1): inferred altsyncram already carries
@@ -431,3 +431,79 @@ Levers that COULD move the plateau (all bigger / need a decision):
   registers, block memory bits identical 158,336. Latch-inference log CLEAN.
 - Verdict: **KEPT.** RTL freeze lifted for this branch; post-R4 state = best 5-seed
   mean and best single fit recorded for this design.
+
+### R5 — sum-addressed exc-MMIO classification (2026-07-18, seeds dse/1/4/5/7, branch `sideband`) — **MEASURED NEGATIVE, REVERTED**
+- The R4-designed lever, built as specced: carry-free `base+addend==K` decode
+  (per-bit "required carry-in x^y^K == neighbor's provided carry-out, K[i-1] ? x&y :
+  x|y", AND-reduced; NO carry chain) for all SIX exact-address MMIO compares
+  (TRA/EXPEVT/INTEVT/TEA FFD0/D4/D8/FC + CCR FFEC + CCR2 A400_00B0), computed in
+  int_pipe on a FOURTH private-select copy of the u_agu_d cone (`_cls`, the R4 `_idx`
+  recipe at FULL width), shipped as `LBus.req_mmio_cls[5:0]` with a translate_off
+  equality assertion. All six consumer sites rewired, including the THIRD compare
+  site found in the audit: exc_handler's write-commit `unique case(L_BUS.req_addr)`
+  (the literal o_TEA/o_EXPEVT `|ena` endpoint), plus HIT_LIVE, lmmio_sel_q, cache
+  live_is_ccr/ccr2 + bram_is_ccr/ccr2 captures.
+- Verification: cpu_core_tb 103/103 + HS3_tb 84/84 first try, equality assertion
+  silent both runs, sideband oracle bit-identical (341,575 strobes, depth 1). The
+  change was functionally perfect - the verdict below is purely physical.
+- Worst multicorner slack @ 10 ns / restricted Fmax (vs R4 same-seed):
+  dse −2.488/80.08 (+0.189), s1 −2.767/78.33 (−0.547), s4 −3.113/76.26 (−0.964),
+  s5 −2.742/78.48 (−0.325), s7 −2.970/77.10 (−0.462). Mean **−2.816 vs R4 −2.394
+  (−0.422, outside the ±0.4 floor, 4/5 seeds worse)**. Registers 7,966 (+105).
+- Cone anatomy (crit reports archived `scratchpad/C_reports/`): the adder→compare
+  arc IS gone as designed - but the twin **became the new, slower headline** on 3/5
+  seeds: `fwd_lane_*_cls → agu_wb fold → operand mux → match → WideAnd tree →
+  o_LMMIO_EXC_WE → priority chain → o_EXPEVT/o_TEA |ena` (dse −2.487 11/20 cls
+  paths, s5 −2.742 6/20, s7 −2.970 15/20). s4's −3.113 is the catalogued
+  advance-front/pair-slot placement swing (0/20 cls).
+- WHY it lost (the pattern-#16 boundary, measured): (1) sum-addressed classify needs
+  FULL-width x and y, so ~six 32-bit operand words (exma.gpr0/1, mawb words, shadow,
+  agu_base_q, src_b, fetch_pc) fan into the classification cluster where before only
+  the ONE 32-bit sum routed there - on an interconnect-dominated fit that trade
+  inverts pattern #15's premise; (2) ~6 soft-LUT levels (fold+mux+match+AND32) LOSE
+  to Cyclone V's hard carry chain (~35 ps/bit ≈ 1.1 ns for 32 bits with zero
+  inter-bit routing) in raw delay - the carry chain was never the expensive part of
+  this family, the compare fan-in placement was. Contrast R4, which won because its
+  slice kept 12-bit operands (narrow inputs) and a single consumer cluster.
+- Residual truth for this family: the deep tail is the CONSUMER side - the
+  `o_LMMIO_EXC_WE → general_reset_like/exc/nmi/int priority chain → |ena` levels in
+  exc_handler. A consumer-side flatten ("no higher-priority event" pre-rail + 2-input
+  ena AND) is the only unspent idea; the request-side classify is now a recorded dead
+  end in both forms (S3 sub-decode = provable no-op; R5 sum-addressed = measured
+  negative).
+- Revert: hand-reversed edit-by-edit (branch state uncommitted-style staging);
+  `git status` clean vs the pre-R5 `staging` commit 985f8ee = byte-exact restoration,
+  re-verified 103/103 + 84/84. **Post-R5 state == post-R4 state (mean −2.394, best
+  s4 −2.149/80.32 MHz).**
+
+### R6' — 2-bit address_error slice twin (2026-07-18, seeds dse/1/4/5/7, branch `sideband`) — **MEASURED NEGATIVE, REVERTED; campaign closed**
+- The lever surfaced by the R6 scoping audit (which killed R6-as-specced: the dominant
+  S_IDLE arcs are pipe-internal — operand front → o_ADDR[0] → address_error →
+  early_d_req_valid → idex_allow → S_IDLE — and never enter the BSC; the
+  bram_addr→fe_* round-trip leg sat at panel position 20/20). Built as the R4 recipe
+  at [1:0]: a fourth `_err` preserve set + private 2-bit operand-mux/adder slice
+  (`l_addr_err`, carry-free at [1:0]) + mirrored MAC term; consumer split -
+  `early_ex_fault`'s address term reads the twin (sole load = the request-valid
+  cone), `ex_result` fault recording keeps the original; equality sim-asserted.
+  int_pipe-only, ~11 registers + a few LUTs.
+- Verification: 103/103 + 84/84 first try, assertion silent, oracle bit-identical.
+- Worst multicorner slack @ 10 ns (vs R4 same-seed): dse −2.759 (−0.082),
+  s1 −3.135 (−0.915), s4 −3.407 (−1.258), s5 −3.012 (−0.595), s7 −3.229 (−0.721).
+  Mean **−3.108 vs R4 −2.394 (−0.714)** — worse than R5. `_err` present in the
+  netlist (10 named regs, map.rpt) but in **0/20 top paths on every seed**; the
+  panels are the catalogued families re-rolled worse (o_TEA/o_TRA|ena headliners
+  −2.76..−3.23, s4 S_IDLE ×20 at −3.407). Reports in `scratchpad/D_reports/`.
+- THE LOAD-BEARING FINDING (two rounds of evidence): R5 and R6' both regressed the
+  mean −0.4..−0.7 with the new logic in ZERO top-20 paths, while identical-RTL
+  re-anchors (A vs A2) moved only −0.08. The plateau is **perturbation-chaotic**:
+  any netlist change - even 11 registers - re-rolls global placement across the
+  flat cluster, and each additional preserve-mirror set adds D/CE load on the
+  saturated enable fabric (idex_allow fo ~350, exma_allow, id_lane_*). The twin
+  pattern's marginal cost now exceeds any single remaining cone's removal value.
+  R4 was the last change big enough to pay for its own perturbation.
+- Verdict: **REVERTED** (edit-by-edit, `git status src/` clean vs staging 985f8ee,
+  suites re-passed). **CAMPAIGN CLOSED at R4** (mean −2.394, best s4 −2.149/80.32).
+  Remaining ideas (consumer-side ena-tail flatten, R6 area class) are recorded but
+  NOT recommended: expected effect is below the measured perturbation cost. Next
+  step toward 100 MHz is physical only: LogicLock floorplan (unlicensed here),
+  C6 speed grade, or wide DSE/seed harvesting on the frozen netlist.

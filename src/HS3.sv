@@ -79,13 +79,22 @@ module HS3 #(
     output  wire            o_D_PU,         //PULD: D31-D0 pull-up state (figs 10.42-43)
     output  wire            o_IRQOUT_n,     //bus retrieval request (p.321)
 
+    /* TRANSACTION MONITOR - (early-transaction snoop): one registered
+       pulse per committed external transaction unit at its internal accept
+       edge - advisory only, nothing returned. Leave unconnected when unused. */
+    output  wire            o_MON_REQ,
+    output  wire            o_MON_WR,
+    output  wire            o_MON_BURST,
+    output  wire    [1:0]   o_MON_SIZE,
+    output  wire    [28:0]  o_MON_ADDR,
+
     /* GENERIC MEMORY PORT - mirrors EVERY external access. Generic-class
        accesses may be completed early by i_MEM_RSP_VALID (ORed with the
        i_WAIT_n-timed physical bus cycle); BSC-owned accesses (SDRAM 2/3,
        areas 1/7) are one-cycle accept strobes - observation only, never
        answered. i_MEM_READY is reserved (ignored). */
     output  wire            o_MEM_REQ,
-    output  wire            o_MEM_WRITE,
+    output  wire            o_MEM_WR,
     output  wire            o_MEM_BURST,
     output  wire    [1:0]   o_MEM_SIZE,
     output  wire    [28:0]  o_MEM_ADDR,
@@ -95,16 +104,6 @@ module HS3 #(
     input   wire            i_MEM_RSP_VALID,
     input   wire            i_MEM_FAULT,
     output  wire            o_MEM_RSP_READY,
-
-    /* EARLY-TRANSACTION SIDEBAND (ikacore_CV1k sh3_sideband.md): one
-       registered pulse per committed external transaction unit at its
-       internal accept edge - advisory only, nothing returned. Leave
-       unconnected when unused. */
-    output  wire            o_SB_REQ,
-    output  wire            o_SB_WR,
-    output  wire    [28:0]  o_SB_ADDR,
-    output  wire    [1:0]   o_SB_SIZE,
-    output  wire            o_SB_BURST,
 
     /* INTERRUPT PINS - IRQ/IRL, IRLS and PINT arrive through the port pads
        below (table 18.1 pin shares); only NMI is dedicated */
@@ -265,7 +264,7 @@ bsc #(
     .REG_DMAC               (PBUS_DMAC                              ),
 
     .o_MEM_REQ              (o_MEM_REQ                              ),
-    .o_MEM_WRITE            (o_MEM_WRITE                            ),
+    .o_MEM_WR            (o_MEM_WR                            ),
     .o_MEM_BURST            (o_MEM_BURST                            ),
     .o_MEM_SIZE             (o_MEM_SIZE                             ),
     .o_MEM_ADDR             (o_MEM_ADDR                             ),
@@ -276,11 +275,11 @@ bsc #(
     .i_MEM_FAULT            (i_MEM_FAULT                            ),
     .o_MEM_RSP_READY        (o_MEM_RSP_READY                        ),
 
-    .o_SB_REQ               (o_SB_REQ                               ),
-    .o_SB_WR                (o_SB_WR                                ),
-    .o_SB_ADDR              (o_SB_ADDR                              ),
-    .o_SB_SIZE              (o_SB_SIZE                              ),
-    .o_SB_BURST             (o_SB_BURST                             ),
+    .o_MON_REQ               (o_MON_REQ                               ),
+    .o_MON_WR                (o_MON_WR                                ),
+    .o_MON_ADDR              (o_MON_ADDR                              ),
+    .o_MON_SIZE              (o_MON_SIZE                              ),
+    .o_MON_BURST             (o_MON_BURST                             ),
 
     .o_A                    (o_A                                    ),
     .o_D_O                  (o_D_O                                  ),

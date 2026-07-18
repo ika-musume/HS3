@@ -159,7 +159,7 @@ module bsc #(
        always as one full 32-bit D-bus transfer, bypassing the width split -
        so tying both low leaves i_WAIT_n in sole control. */
     output  wire            o_MEM_REQ,
-    output  wire            o_MEM_WRITE,
+    output  wire            o_MEM_WR,
     output  wire            o_MEM_BURST,    //beat of a 16-byte line transfer
     output  wire    [1:0]   o_MEM_SIZE,
     output  wire    [28:0]  o_MEM_ADDR,     //physical (A31-29 shadow stripped, p.232)
@@ -178,16 +178,17 @@ module bsc #(
        cycles are NOT implemented (ordinary/burst-ROM areas only). */
     output  wire    [1:0]   o_DACK_WIN,     //[0]=DACK0 window, [1]=DACK1 window
 
-    /* EARLY-TRANSACTION SIDEBAND ("fast main", ikacore_CV1k sh3_sideband.md):
+    /* TRANSACTION MONITOR - MON (early-transaction sideband "fast main",
+       ikacore_CV1k sh3_sideband.md):
        advisory-with-guarantees strobe for an external memory controller -
        ONE registered pulse per committed external transaction UNIT at its
        internal accept edge, fields valid only under the pulse. Nothing is
        received back; the external protocol is the unchanged contract. */
-    output  wire            o_SB_REQ,       //1-cycle pulse, one per external unit
-    output  wire            o_SB_WR,        //1 = write
-    output  wire    [28:0]  o_SB_ADDR,      //physical, [28:26] = CS area (o_MEM_ADDR encoding)
-    output  wire    [1:0]   o_SB_SIZE,      //I_BUS size encoding
-    output  wire            o_SB_BURST,     //16-byte unit / burst-ROM envelope
+    output  wire            o_MON_REQ,       //1-cycle pulse, one per external unit
+    output  wire            o_MON_WR,        //1 = write
+    output  wire    [28:0]  o_MON_ADDR,      //physical, [28:26] = CS area (o_MEM_ADDR encoding)
+    output  wire    [1:0]   o_MON_SIZE,      //I_BUS size encoding
+    output  wire            o_MON_BURST,     //16-byte unit / burst-ROM envelope
 
     /* REFRESH TIMER INTERRUPTS (table 6.4 REF entries) */
     output  wire            o_RCMI_REQ,     //compare match  (INTEVT 0x580)
@@ -387,7 +388,7 @@ logic           ord_saddr;          //  single-address cycle: a write leaves D u
 
 assign  o_MEM_REQ       = ord_busy ? 1'b1            :
                           (I_BUS.req_valid & ~fe_p4 & (fe_gen | I_BUS.req_ready));
-assign  o_MEM_WRITE     = ord_busy ? ord_write       : I_BUS.req_write;
+assign  o_MEM_WR     = ord_busy ? ord_write       : I_BUS.req_write;
 assign  o_MEM_BURST     = ord_busy ? ord_burst       : I_BUS.req_burst;
 assign  o_MEM_SIZE      = ord_busy ? ord_size        : I_BUS.req_size;
 assign  o_MEM_ADDR      = ord_busy ? ord_addr[28:0]  : fa[28:0];
@@ -1087,7 +1088,7 @@ end
 
 
 ///////////////////////////////////////////////////////////
-//////  Early-Transaction Sideband (CV1k fast main)
+//////  Transaction Monitor - MON (early-transaction sideband, CV1k fast main)
 ////
 
 /*
@@ -1106,32 +1107,32 @@ end
     the consumer flushes its match queue on any reset assertion (R10).
 */
 
-logic           sb_req_q;
-logic           sb_wr_q, sb_burst_q;
-logic   [1:0]   sb_size_q;
-logic   [28:0]  sb_addr_q;
+logic           mon_req_q;
+logic           mon_wr_q, mon_burst_q;
+logic   [1:0]   mon_size_q;
+logic   [28:0]  mon_addr_q;
 
-wire            sb_fire = (fe_eng_start && !fe_sdmr) ||
+wire            mon_fire = (fe_eng_start && !fe_sdmr) ||
                           (fe_acc && fe_gen && !ord_bcont);
 
 always_ff @(posedge i_CLK or negedge i_RST_n) begin
-    if(!i_RST_n) sb_req_q <= 1'b0;
+    if(!i_RST_n) mon_req_q <= 1'b0;
     else begin if(i_CEN) begin
-        sb_req_q <= sb_fire;
-        if(sb_fire) begin                       //live request fields at the accept edge
-            sb_wr_q    <= I_BUS.req_write;
-            sb_burst_q <= I_BUS.req_burst;
-            sb_size_q  <= I_BUS.req_size;
-            sb_addr_q  <= fa[28:0];
+        mon_req_q <= mon_fire;
+        if(mon_fire) begin                       //live request fields at the accept edge
+            mon_wr_q    <= I_BUS.req_write;
+            mon_burst_q <= I_BUS.req_burst;
+            mon_size_q  <= I_BUS.req_size;
+            mon_addr_q  <= fa[28:0];
         end
     end end
 end
 
-assign  o_SB_REQ   = sb_req_q;
-assign  o_SB_WR    = sb_wr_q;
-assign  o_SB_ADDR  = sb_addr_q;
-assign  o_SB_SIZE  = sb_size_q;
-assign  o_SB_BURST = sb_burst_q;
+assign  o_MON_REQ   = mon_req_q;
+assign  o_MON_WR    = mon_wr_q;
+assign  o_MON_ADDR  = mon_addr_q;
+assign  o_MON_SIZE  = mon_size_q;
+assign  o_MON_BURST = mon_burst_q;
 
 
 
