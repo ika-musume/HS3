@@ -507,3 +507,55 @@ Levers that COULD move the plateau (all bigger / need a decision):
   NOT recommended: expected effect is below the measured perturbation cost. Next
   step toward 100 MHz is physical only: LogicLock floorplan (unlicensed here),
   C6 speed grade, or wide DSE/seed harvesting on the frozen netlist.
+
+### R7 — fetch_pending_pc CE preload (2026-07-18, seeds dse/1/4/5/7, branch `sideband`) — **MEASURED NEGATIVE, REVERTED**
+- External proposal experiment 1: widen the 32-FF `fetch_pending_pc` CE from
+  `i_req_fire` to `(!fetch_pending || if_accept)` (a proven factor of
+  `early_i_req_raw_valid`, so every `ifid_ld_dat`-consumed value is identical;
+  empty slot tracks junk). Removes `req_ready` (handshake loop), `l_is_data`
+  (the `fwd_dep_a_agu` arc), `fault_hold`, `wb_fault_kill`, `rsp_pair_ok` from
+  that CE cone. Shadow-register equivalence assertion at the consuming edge.
+- Verification: cpu_core_tb 103/103 + HS3_tb 84/84 first try, assertion silent,
+  sideband oracle bit-identical (341,575 strobes, depth 1). Zero IPC change.
+- Worst multicorner slack @ 10 ns (vs R4 same-seed): dse −2.820 (−0.143),
+  s1 −2.729 (−0.509), s4 −2.684 (−0.535), s5 −2.777 (−0.360), s7 −2.676 (−0.168).
+  Mean **−2.737 vs R4 −2.394 (−0.343, 5/5 seeds worse)**. Registers 7,854–7,925.
+- Cones: `fetch_pending_pc` 0/20 on all seeds — but it was ALREADY absent from
+  the R4 panels (its headline was one seed of the 2026-07-09 post-merge baseline),
+  so no binding cone was cut. Headliners = catalogued families re-rolled:
+  exc-MMIO `|ena` (dse/s1/s5), **pair-slot payload CE (s4: `fwd_lane_b_agu` →
+  `pair_pc`/`pair_inst`, −2.684 — LIVE, the R3-successor class)**, ma_seq
+  `req_sent` (s7). Same shape as R5/R6': change lands off the walls, placement
+  re-roll eats the mean. A CE *narrowing* (removal) is not exempt from the
+  perturbation tax when its target class is not binding.
+- Verdict: **REVERTED** (`git checkout`, byte-exact vs 8744ebe). Lesson: only
+  attack classes present in the CURRENT panels; the s4 pair-slot headline is the
+  one live candidate → R8.
+
+### R8 — pair-payload CE preload (2026-07-18, seeds dse/1/4/5/7, branch `sideband`) — **MEASURED NEGATIVE, REVERTED; closure re-confirmed**
+- External proposal experiment 2, the one candidate whose class was LIVE in the
+  R7 panels (s4 `fwd_lane_b_agu` → `pair_pc`/`pair_inst` −2.684; also the R3
+  successor). The 66-FF payload (`pair_pc`/`pair_inst`/`pair_pd`) moves to a bare
+  `!pair_ready` CE — `pair_capture` provably implies an empty slot (its
+  `if_accept` comes through the `!pair_ready` arm of `i_rsp_ready`) and every
+  consumer is `pair_ready`-gated. Shadow-payload assertion on all valid cycles.
+- Verification: cpu_core_tb 103/103 + HS3_tb 84/84 first try, assertion silent,
+  sideband oracle bit-identical. Zero IPC change.
+- Worst multicorner slack @ 10 ns (vs R4 same-seed): dse −2.810 (−0.133),
+  s1 −2.477 (−0.257), s4 −2.791 (−0.642), s5 −2.959 (−0.542), s7 −2.863 (−0.355).
+  Mean **−2.780 vs R4 −2.394 (−0.386, 5/5 seeds worse)**.
+- Cones: the target class IS cut — pair payload **0/20 on every seed** (was the
+  live s4 headline). But the family just rotated: **s5's new headline is
+  `fwd_lane_b_agu` → `fetch_pending_pc` (R7's target class, back on the original
+  RTL)**, plus S_IDLE handshake (dse/s4/s7) and operand→EX (s1). The advance-front
+  composition has many 32-bit landing zones (fetch_pending_pc, pair payload,
+  fetch_pc via fpc_ce, exma.gpr0_data, S_IDLE); cutting one member promotes
+  another and the perturbation tax (−0.3..−0.7 mean) lands regardless.
+- Verdict: **REVERTED** (byte-exact vs 8744ebe). 2026-07-18 evidence stack:
+  identical-RTL re-anchor −0.08; R5 −0.42; R6' −0.71; R7 −0.34; R8 −0.39. FOUR
+  independent change-shapes (twin add ×2, CE preload ×2 — including one that cut
+  a live headline cone) all pay the same tax. **CAMPAIGN REMAINS CLOSED at R4**
+  (mean −2.394, best s4 −2.149/80.32). Proposal experiments 3-6 (need_a arm,
+  exc-write round trip, priority flatten, MAC mux fold) NOT run: all target
+  classes now measured as rotation members, expected value below the tax. Path
+  to 100 MHz stays physical: floorplan / speed grade / seed harvesting.
