@@ -368,3 +368,194 @@ Levers that COULD move the plateau (all bigger / need a decision):
   eliminated as classes; the plateau successor is the pair-slot ENABLE cone (1-bit CE,
   no late-select applies) + Wall B/FSM — both need a floorplan (LogicLock unlicensed
   here) or an AGU-front cut. No RTL levers remain on the list; RTL RE-FROZEN post-R3.
+
+### CV1k sideband + re-anchor (2026-07-18, seeds 1/3/4/5/7, branch `sideband`) — NEUTRAL as designed
+- Context: ikacore_CV1k requested an early-transaction sideband (`o_MON_*`, spec at
+  `~/Desktop/ikacore_CV1k/docs/sh3_sideband.md`) — one registered pulse per committed
+  external transaction UNIT at its internal accept edge (bsc.sv `mon_fire =
+  (fe_eng_start && !fe_sdmr) | (fe_acc && fe_gen && !ord_bcont)`), fields latched at
+  fire. Observation-only; laws bit-exact (HS3_tb 84/84 incl. a NEW whole-run
+  match-queue oracle: 341,575 strobes matched 1:1 with pin units, measured
+  outstanding depth = 1, zero mismatches; cpu_core_tb 103/103).
+- Sweep A (wrapper did NOT yet connect o_MON — sideband swept; = an identical-RTL
+  re-probe of the post-R3 baseline on fresh CAD state):
+  s1 −2.574, s3 −2.609, s4 −2.912, s5 −2.766, s7 −2.032; mean −2.579. The +0.111
+  mean drift vs R3's logged −2.690 on identical logic re-measures the plateau noise.
+- Sweep A2 (o_MON connected through `HS3_ooc_top`, `mon_*` regs confirmed in fit):
+  s1 −2.912, s3 −2.758, s4 −2.253, s5 −2.502, s7 −2.883; mean −2.662. Δmean vs A
+  −0.083 (inside ±0.4); per-seed swings ±0.66/−0.85 in BOTH directions = plateau
+  placement noise. **Zero `mon_` cells in any seed top-20.** Headliners: bram_addr →
+  (BSC fe_* live decode) → req_ready → cache `state.S_IDLE` (the handshake-loop /
+  Wall B-FSM family) + S_FLUSH/S_DRAIN self-loops — all catalogued classes.
+- S1 audit (CV1k §10.2 suggestion 1): inferred altsyncram already carries
+  `MIXED_PORT_FEED_THROUGH_MODE = "dont_care"` for tag (`pgn1`), data (`lpo1`), LRU
+  (`vdn1`) — `no_rw_check` works in this flow. The CV1k STA's
+  `PORT_B_WRITE_ENABLE_REG` launch class does not exist in a faithful build; their
+  fits predate R3 (their §10.1 quotes the pre-R3 catalog). Action for CV1k: re-drop
+  current RTL, verify the map-report RAM parameter, keep the ramstyle string intact.
+
+### R4 — cache-index slice twin (2026-07-18, seeds 1/3/4/5/7, branch `sideband`) — **KEPT; best mean + best single fit ever**
+- The campaign's named "AGU-front cut", executed as a per-consumer duplicate (CV1k §10.2
+  suggestion 2's request-side cousin): a private 12-bit copy of the WHOLE u_agu_d cone
+  (base/addend forward muxes + adder, `l_addr_idx`), re-rooted on a third (* preserve *)
+  select/state set (`*_idx`: fwd lane/wbsel/dep a+b, idex_is_data, ma_seq second/req_sent).
+  Sole consumer: `LBus.req_addr_idx[11:2]` -> cache `grant_idx`/`grant_word` (tag/LRU/data
+  RAM read index + the WT-bypass compares). Sum bits [11:0] close under [11:0] operands, so
+  the twin == `ea_addr_sum[11:0]` every cycle (translate_off assertion). en mirror =
+  `agu_en_mode[0]` (exact: u_agu_d runs i_R_T=0). All other req_addr consumers unchanged.
+- Verification: cpu_core_tb 103/103 + HS3_tb 84/84 (incl. sideband oracle bit-identical:
+  341,575 strobes, depth 1), laws exact, equivalence assertion silent. Zero IPC change
+  (pure duplication).
+- Worst multicorner slack @ 10 ns / restricted Fmax (vs the A2 sideband anchor):
+  s1 −2.220/81.83 (+0.692), s3 −2.677/78.88 (+0.081), s4 **−2.149/80.32 (+0.104, BEST
+  SINGLE FIT EVER, prev −2.192)**, s5 −2.417/80.19 (+0.085), s7 −2.508/79.57 (+0.375).
+  Mean **−2.394** vs A2 −2.662 (+0.268) and vs the R3 logged mean −2.690 (+0.296) —
+  EVERY seed improved vs its A2 twin; three seeds fit ≥80 MHz restricted.
+- Cone verdict — the AGU->RAM-index class is structurally cut:
+  - `byp_q`/`Equal0`(cache)/`tag_raddr`/`data_raddr` appear in **0/20 paths on 4 of 5
+    seeds**; the `_idx` twin logic itself appears in **zero** top-20 (placed with the
+    RAMs, as designed). s5's surviving "Equal0" hits are `u_exc_handler|Equal0` — a
+    DIFFERENT class (below).
+  - New plateau headline family = **exc-MMIO live classification**: AGU adder carry →
+    the shared 4-address compare networks (`o_LMMIO_HIT_LIVE` == the case arms) → `o_TEA[*]|ena`
+    (s4 headline −2.149) and → cache dispatch/`state.S_IDLE` (s5). Plus the operand→EX
+    (s3/s7 `fwd_*`→`exma.gpr0_data`) and FSM/handshake-loop members rotating per seed.
+- CV1k §10.2 suggestion-3 verdict (measured): the cheap 2-bit case sub-decode in
+  exc_handler is a PROVABLE NO-OP — the four compare networks are shared with
+  HIT_LIVE (the o_TEA CE's WE gate), so the binding adder→compare→ena arc survives it.
+  The real lever for this family is SUM-ADDRESSED (carry-free) classification computed
+  in int_pipe off the operand muxes and shipped like req_addr_idx — designed, NOT
+  built (next session). Suggestion 4 (way-select duplicate): measured absent from all
+  panels — skipped.
+- Resources (s4): 10,093 ALMs (24 %; +~170 = 12-bit twin + sideband regs), 7,861
+  registers, block memory bits identical 158,336. Latch-inference log CLEAN.
+- Verdict: **KEPT.** RTL freeze lifted for this branch; post-R4 state = best 5-seed
+  mean and best single fit recorded for this design.
+
+### R5 — sum-addressed exc-MMIO classification (2026-07-18, seeds dse/1/4/5/7, branch `sideband`) — **MEASURED NEGATIVE, REVERTED**
+- The R4-designed lever, built as specced: carry-free `base+addend==K` decode
+  (per-bit "required carry-in x^y^K == neighbor's provided carry-out, K[i-1] ? x&y :
+  x|y", AND-reduced; NO carry chain) for all SIX exact-address MMIO compares
+  (TRA/EXPEVT/INTEVT/TEA FFD0/D4/D8/FC + CCR FFEC + CCR2 A400_00B0), computed in
+  int_pipe on a FOURTH private-select copy of the u_agu_d cone (`_cls`, the R4 `_idx`
+  recipe at FULL width), shipped as `LBus.req_mmio_cls[5:0]` with a translate_off
+  equality assertion. All six consumer sites rewired, including the THIRD compare
+  site found in the audit: exc_handler's write-commit `unique case(L_BUS.req_addr)`
+  (the literal o_TEA/o_EXPEVT `|ena` endpoint), plus HIT_LIVE, lmmio_sel_q, cache
+  live_is_ccr/ccr2 + bram_is_ccr/ccr2 captures.
+- Verification: cpu_core_tb 103/103 + HS3_tb 84/84 first try, equality assertion
+  silent both runs, sideband oracle bit-identical (341,575 strobes, depth 1). The
+  change was functionally perfect - the verdict below is purely physical.
+- Worst multicorner slack @ 10 ns / restricted Fmax (vs R4 same-seed):
+  dse −2.488/80.08 (+0.189), s1 −2.767/78.33 (−0.547), s4 −3.113/76.26 (−0.964),
+  s5 −2.742/78.48 (−0.325), s7 −2.970/77.10 (−0.462). Mean **−2.816 vs R4 −2.394
+  (−0.422, outside the ±0.4 floor, 4/5 seeds worse)**. Registers 7,966 (+105).
+- Cone anatomy (crit reports archived `scratchpad/C_reports/`): the adder→compare
+  arc IS gone as designed - but the twin **became the new, slower headline** on 3/5
+  seeds: `fwd_lane_*_cls → agu_wb fold → operand mux → match → WideAnd tree →
+  o_LMMIO_EXC_WE → priority chain → o_EXPEVT/o_TEA |ena` (dse −2.487 11/20 cls
+  paths, s5 −2.742 6/20, s7 −2.970 15/20). s4's −3.113 is the catalogued
+  advance-front/pair-slot placement swing (0/20 cls).
+- WHY it lost (the pattern-#16 boundary, measured): (1) sum-addressed classify needs
+  FULL-width x and y, so ~six 32-bit operand words (exma.gpr0/1, mawb words, shadow,
+  agu_base_q, src_b, fetch_pc) fan into the classification cluster where before only
+  the ONE 32-bit sum routed there - on an interconnect-dominated fit that trade
+  inverts pattern #15's premise; (2) ~6 soft-LUT levels (fold+mux+match+AND32) LOSE
+  to Cyclone V's hard carry chain (~35 ps/bit ≈ 1.1 ns for 32 bits with zero
+  inter-bit routing) in raw delay - the carry chain was never the expensive part of
+  this family, the compare fan-in placement was. Contrast R4, which won because its
+  slice kept 12-bit operands (narrow inputs) and a single consumer cluster.
+- Residual truth for this family: the deep tail is the CONSUMER side - the
+  `o_LMMIO_EXC_WE → general_reset_like/exc/nmi/int priority chain → |ena` levels in
+  exc_handler. A consumer-side flatten ("no higher-priority event" pre-rail + 2-input
+  ena AND) is the only unspent idea; the request-side classify is now a recorded dead
+  end in both forms (S3 sub-decode = provable no-op; R5 sum-addressed = measured
+  negative).
+- Revert: hand-reversed edit-by-edit (branch state uncommitted-style staging);
+  `git status` clean vs the pre-R5 `staging` commit 985f8ee = byte-exact restoration,
+  re-verified 103/103 + 84/84. **Post-R5 state == post-R4 state (mean −2.394, best
+  s4 −2.149/80.32 MHz).**
+
+### R6' — 2-bit address_error slice twin (2026-07-18, seeds dse/1/4/5/7, branch `sideband`) — **MEASURED NEGATIVE, REVERTED; campaign closed**
+- The lever surfaced by the R6 scoping audit (which killed R6-as-specced: the dominant
+  S_IDLE arcs are pipe-internal — operand front → o_ADDR[0] → address_error →
+  early_d_req_valid → idex_allow → S_IDLE — and never enter the BSC; the
+  bram_addr→fe_* round-trip leg sat at panel position 20/20). Built as the R4 recipe
+  at [1:0]: a fourth `_err` preserve set + private 2-bit operand-mux/adder slice
+  (`l_addr_err`, carry-free at [1:0]) + mirrored MAC term; consumer split -
+  `early_ex_fault`'s address term reads the twin (sole load = the request-valid
+  cone), `ex_result` fault recording keeps the original; equality sim-asserted.
+  int_pipe-only, ~11 registers + a few LUTs.
+- Verification: 103/103 + 84/84 first try, assertion silent, oracle bit-identical.
+- Worst multicorner slack @ 10 ns (vs R4 same-seed): dse −2.759 (−0.082),
+  s1 −3.135 (−0.915), s4 −3.407 (−1.258), s5 −3.012 (−0.595), s7 −3.229 (−0.721).
+  Mean **−3.108 vs R4 −2.394 (−0.714)** — worse than R5. `_err` present in the
+  netlist (10 named regs, map.rpt) but in **0/20 top paths on every seed**; the
+  panels are the catalogued families re-rolled worse (o_TEA/o_TRA|ena headliners
+  −2.76..−3.23, s4 S_IDLE ×20 at −3.407). Reports in `scratchpad/D_reports/`.
+- THE LOAD-BEARING FINDING (two rounds of evidence): R5 and R6' both regressed the
+  mean −0.4..−0.7 with the new logic in ZERO top-20 paths, while identical-RTL
+  re-anchors (A vs A2) moved only −0.08. The plateau is **perturbation-chaotic**:
+  any netlist change - even 11 registers - re-rolls global placement across the
+  flat cluster, and each additional preserve-mirror set adds D/CE load on the
+  saturated enable fabric (idex_allow fo ~350, exma_allow, id_lane_*). The twin
+  pattern's marginal cost now exceeds any single remaining cone's removal value.
+  R4 was the last change big enough to pay for its own perturbation.
+- Verdict: **REVERTED** (edit-by-edit, `git status src/` clean vs staging 985f8ee,
+  suites re-passed). **CAMPAIGN CLOSED at R4** (mean −2.394, best s4 −2.149/80.32).
+  Remaining ideas (consumer-side ena-tail flatten, R6 area class) are recorded but
+  NOT recommended: expected effect is below the measured perturbation cost. Next
+  step toward 100 MHz is physical only: LogicLock floorplan (unlicensed here),
+  C6 speed grade, or wide DSE/seed harvesting on the frozen netlist.
+
+### R7 — fetch_pending_pc CE preload (2026-07-18, seeds dse/1/4/5/7, branch `sideband`) — **MEASURED NEGATIVE, REVERTED**
+- External proposal experiment 1: widen the 32-FF `fetch_pending_pc` CE from
+  `i_req_fire` to `(!fetch_pending || if_accept)` (a proven factor of
+  `early_i_req_raw_valid`, so every `ifid_ld_dat`-consumed value is identical;
+  empty slot tracks junk). Removes `req_ready` (handshake loop), `l_is_data`
+  (the `fwd_dep_a_agu` arc), `fault_hold`, `wb_fault_kill`, `rsp_pair_ok` from
+  that CE cone. Shadow-register equivalence assertion at the consuming edge.
+- Verification: cpu_core_tb 103/103 + HS3_tb 84/84 first try, assertion silent,
+  sideband oracle bit-identical (341,575 strobes, depth 1). Zero IPC change.
+- Worst multicorner slack @ 10 ns (vs R4 same-seed): dse −2.820 (−0.143),
+  s1 −2.729 (−0.509), s4 −2.684 (−0.535), s5 −2.777 (−0.360), s7 −2.676 (−0.168).
+  Mean **−2.737 vs R4 −2.394 (−0.343, 5/5 seeds worse)**. Registers 7,854–7,925.
+- Cones: `fetch_pending_pc` 0/20 on all seeds — but it was ALREADY absent from
+  the R4 panels (its headline was one seed of the 2026-07-09 post-merge baseline),
+  so no binding cone was cut. Headliners = catalogued families re-rolled:
+  exc-MMIO `|ena` (dse/s1/s5), **pair-slot payload CE (s4: `fwd_lane_b_agu` →
+  `pair_pc`/`pair_inst`, −2.684 — LIVE, the R3-successor class)**, ma_seq
+  `req_sent` (s7). Same shape as R5/R6': change lands off the walls, placement
+  re-roll eats the mean. A CE *narrowing* (removal) is not exempt from the
+  perturbation tax when its target class is not binding.
+- Verdict: **REVERTED** (`git checkout`, byte-exact vs 8744ebe). Lesson: only
+  attack classes present in the CURRENT panels; the s4 pair-slot headline is the
+  one live candidate → R8.
+
+### R8 — pair-payload CE preload (2026-07-18, seeds dse/1/4/5/7, branch `sideband`) — **MEASURED NEGATIVE, REVERTED; closure re-confirmed**
+- External proposal experiment 2, the one candidate whose class was LIVE in the
+  R7 panels (s4 `fwd_lane_b_agu` → `pair_pc`/`pair_inst` −2.684; also the R3
+  successor). The 66-FF payload (`pair_pc`/`pair_inst`/`pair_pd`) moves to a bare
+  `!pair_ready` CE — `pair_capture` provably implies an empty slot (its
+  `if_accept` comes through the `!pair_ready` arm of `i_rsp_ready`) and every
+  consumer is `pair_ready`-gated. Shadow-payload assertion on all valid cycles.
+- Verification: cpu_core_tb 103/103 + HS3_tb 84/84 first try, assertion silent,
+  sideband oracle bit-identical. Zero IPC change.
+- Worst multicorner slack @ 10 ns (vs R4 same-seed): dse −2.810 (−0.133),
+  s1 −2.477 (−0.257), s4 −2.791 (−0.642), s5 −2.959 (−0.542), s7 −2.863 (−0.355).
+  Mean **−2.780 vs R4 −2.394 (−0.386, 5/5 seeds worse)**.
+- Cones: the target class IS cut — pair payload **0/20 on every seed** (was the
+  live s4 headline). But the family just rotated: **s5's new headline is
+  `fwd_lane_b_agu` → `fetch_pending_pc` (R7's target class, back on the original
+  RTL)**, plus S_IDLE handshake (dse/s4/s7) and operand→EX (s1). The advance-front
+  composition has many 32-bit landing zones (fetch_pending_pc, pair payload,
+  fetch_pc via fpc_ce, exma.gpr0_data, S_IDLE); cutting one member promotes
+  another and the perturbation tax (−0.3..−0.7 mean) lands regardless.
+- Verdict: **REVERTED** (byte-exact vs 8744ebe). 2026-07-18 evidence stack:
+  identical-RTL re-anchor −0.08; R5 −0.42; R6' −0.71; R7 −0.34; R8 −0.39. FOUR
+  independent change-shapes (twin add ×2, CE preload ×2 — including one that cut
+  a live headline cone) all pay the same tax. **CAMPAIGN REMAINS CLOSED at R4**
+  (mean −2.394, best s4 −2.149/80.32). Proposal experiments 3-6 (need_a arm,
+  exc-write round trip, priority flatten, MAC mux fold) NOT run: all target
+  classes now measured as rotation members, expected value below the tax. Path
+  to 100 MHz stays physical: floorplan / speed grade / seed harvesting.

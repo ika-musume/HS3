@@ -7,8 +7,9 @@ in this folder. Manual page citations (`p.NNN`) point at the SH7709S hardware
 manual or the SH-3 software manual unless noted.
 
 **Target:** Intel Cyclone V FPGA, 100 MHz deliverable. **Verification:** Verilator
-(`cpu_core_tb` = 103/103, `HS3_tb` = 83/83 — see §7). **Physical status:** Quartus
-out-of-context (OOC) restricted Fmax **≈ 75–82 MHz across seeds (best fit 82.0 MHz)**
+(`cpu_core_tb` = 103/103, `HS3_tb` = 84/84 — see §7). **Physical status:** Quartus
+out-of-context (OOC) restricted Fmax **≈ 78–82 MHz across seeds (best fit −2.15 ns
+/ 80.3 MHz, best 5-seed mean −2.39 ns)**
 on the full SoC (§6); the gap to 100 MHz is a flat plateau of protected single-cycle
 datapath loops (see §0 and §6), not the cache, bus, or peripherals — every OOC
 critical path is CPU-internal, and none passes through the interrupt/exception
@@ -316,8 +317,9 @@ a two-beat overlapped lookup:
 
 - **Beat 0 (request cycle):** the pipe presents the live AGU address. The **accept**
   (`req_ready`) is decided from registered state and the *previous* access's resolve
-  (`z_ok`, below). At the edge the RAMs capture the read index and `bram_*` captures
-  the request descriptor.
+  (`z_ok`, below). At the edge the RAMs capture the read index — sourced from the
+  pipe's private 12-bit index-slice twin `LBus.req_addr_idx`, not the shared adder
+  (the R4 lever, §6) — and `bram_*` captures the request descriptor.
 - **Beat 1 (resolve cycle):** tag/data `q` are compared against `bram_*`; a hit is
   answered **combinationally** and consumed by the pipe at the closing edge — the
   same edge the *next* access is captured. Back-to-back hits therefore run at one per
@@ -501,6 +503,17 @@ the port-C pads. Front-end route classes:
   controllers (fabric SDRAM ctrl / HPS DDR3); this is the IPC-parity path. All data
   rides the physical D pins; the generic port is pure address/control.
 - **Register / dummy** — the BSC's own POR-only register file (`0xFFFFFF50–74`).
+- **Early-transaction sideband (`o_MON_*`)** — an advisory, observation-only strobe
+  for integrators with their own fast memory path (built for ikacore CV1k): one
+  registered pulse per committed external transaction *unit* at its internal accept
+  edge (`mon_fire = engine-op start | ordinary accept`), carrying the physical
+  address, direction, size, and burst flag one cycle before the pin sequence
+  begins. It changes no cycle behavior and no arbitration (measured timing-neutral
+  across a 5-seed sweep), and is proven by a whole-run match-queue oracle in the
+  TB: every strobe is matched 1:1, in order, field-exact against the independently
+  detected pin units (341,575 events; measured outstanding depth = 1). Full
+  contract, measured lead tables, and timing diagrams live in the CV1k spec
+  (`ikacore_CV1k/docs/sh3_sideband.md` §11).
 
 Verified against a Micron MT48LC2M32B2 SDRAM model and a Macronix MX29LV320E NOR
 flash model (patched vendor copies in `sim/models/`), including **boot-from-flash**
@@ -641,19 +654,24 @@ final tree:
 
 | Seed | Worst multicorner slack @ 10 ns | Restricted Fmax | Top-20 headline class |
 |---|---|---|---|
-| 1 | −2.57 ns | 79.5 MHz | cache `bram_addr` → response → GPR read-ahead M10K address (Wall A data leg) |
-| 3 | −2.63 ns | 79.2 MHz | `mawb.gpr0_data` → advance front → pair-slot capture (`pair_inst`/`pair_pc`) |
-| 4 | −3.24 ns | 75.5 MHz | `fwd_lane_b_agu` → AGU → cache miss-FSM state decode (Wall B, placement swing) |
-| 5 | −2.82 ns | 78.0 MHz | AGU request front → cache miss-FSM state decode (Wall B) |
-| 7 | **−2.19 ns** | **82.0 MHz** | mixed plateau residue (FSM, operand → EX, `byp_q`) — best HS3 fit recorded |
+| dse | −2.68 ns | 78.9 MHz | mixed plateau (advance front, exc-MMIO compare legs) |
+| 1 | −2.22 ns | 81.8 MHz | Wall A data leg residue |
+| 4 | **−2.15 ns** | **80.3 MHz** | AGU carry → exc-MMIO compares → `o_TEA\|ena` — best HS3 fit recorded |
+| 5 | −2.42 ns | 80.2 MHz | exc-MMIO classification → cache dispatch (`state.S_IDLE`) |
+| 7 | −2.51 ns | 79.6 MHz | advance front → pair-slot capture |
 
-(Measured 2026-07-10 on `main` at `b70c15d` — the complete SoC including the full
-DMAC and the **R3 read-ahead tail late-select** (§1), the last catalogued RTL
-timing lever. Mean worst slack −2.69 ns vs −2.83 pre-R3; the decisive evidence is
-the cone panel: the old headline — the advance loop capturing at the GPR read-ahead
-M10K address registers — fell from 20/20 of seed 3's worst paths to 3/20, and those
-survivors route through the one-level select, i.e. they are now bound by the
-measured-full AGU front. **Zero dmac/arb/bsc cones appear in any seed's top-20.**)
+(Measured 2026-07-18 on branch `sideband` — the complete SoC including the full
+DMAC, the **R3 read-ahead tail late-select** (§1), the CV1k early-transaction
+sideband (`o_MON_*`, §5 BSC — measured timing-neutral, zero `mon_` cells in any
+top-20), and the **R4 cache-index slice twin**: a private 12-bit copy of the whole
+AGU cone on `(* preserve *)` select duplicates whose sole consumer is the cache
+RAM read index (`LBus.req_addr_idx`), letting the fitter place the slice at the
+RAM block. R4 is the best 5-seed result recorded: mean worst slack **−2.39 ns**
+vs −2.69 post-R3, every seed improved vs its same-seed anchor, and the old
+AGU→RAM-index class (`byp_q`/tag/data read address) fell to 0/20 paths on 4 of 5
+seeds. The promoted headline is the **exc-MMIO live classification** family:
+adder carry → the shared TRA/EXPEVT/INTEVT/TEA/CCR compares → exception-register
+write enables and cache dispatch.)
 
 > **Read this as a plateau, not a ranking.** The design sits on a *flat cluster* of
 > single-cycle protected loops; each seed's placement picks a different one as the
@@ -662,6 +680,11 @@ measured-full AGU front. **Zero dmac/arb/bsc cones appear in any seed's top-20.*
 > change by worst-slack trend *and cone composition across seeds*, never by one
 > fit. The 100 MHz deliverable corresponds to worst slack ≥ 0; the measured gap is
 > ~2.2–3.2 ns of mostly interconnect (55–65 % of every failing path is routing).
+> Post-R4 the plateau is also measured **perturbation-chaotic**: two later small
+> levers (R5, R6′) each shifted the 5-seed *mean* by −0.4..−0.7 ns with their own
+> logic in zero worst paths, while an identical-RTL re-anchor moved <0.1 — any
+> netlist change re-rolls global placement and taxes the saturated issue-enable
+> fabric more than a small cone removal buys. That is why the catalog closes here.
 
 The recurring cone classes, all protected by the no-bubbles rule (each is a
 single-cycle loop that cannot take a register without costing an architectural
@@ -681,19 +704,29 @@ cycle):
 3. **Operand → EX flags** — forward-lane selects → operand mux → the EX adder
    carry chain → T/compare select tree → `exma.t_data` / `r_t`. ~9 levels, ~60 %
    interconnect; a placement-spread cone rather than a logic-depth one.
+4. **Exc-MMIO live classification** (promoted by R4) — AGU carry → the shared
+   `req_addr == TRA/EXPEVT/INTEVT/TEA/CCR` compares → `o_TEA`/`o_EXPEVT` write
+   enables and the cache dispatch arm. Both request-side transforms are measured
+   dead ends: a case sub-decode is a provable no-op (the compares are shared with
+   the WE gate), and the full sum-addressed carry-free rewrite (R5) fitted
+   *worse* — six full-width operand words fan into the compare cluster where one
+   sum routed before, and six soft-LUT levels lose to the hard carry chain
+   (reverted; anatomy in the campaign log). The unspent idea is consumer-side:
+   flattening the enable's priority tail in `exc_handler`.
 
 The interrupt/exception machinery (§2) contributes **no logic to any failing
 path**: the acceptance boundary, restart-PC register, bank/flag mirrors, and MA
 phase gate are all registered-launch, registered-capture structures placed off the
 walls — confirmed by name-search over every top-20 path across seeds.
 
-**The RTL lever catalog is exhausted** (R3 was the last entry; the full round
-history lives in `eval_ooc/cache_wall_campaign.md`). What remains toward 100 MHz
-is physical, not structural: a LogicLock floorplan pinning the AGU/request cluster
-next to the cache banks (unlicensed in the current docker Quartus flow), a C6
-speed grade, or wide seed/DSE harvesting (seed 7 shows what a lucky placement
-yields). Explicitly **not** on the table: an operand- or address-capture pipeline
-beat — that would break cycle accuracy (the no-bubbles rule, §0).
+**The RTL lever catalog is exhausted** (R4 was the last kept entry and R5 the
+last measured attempt; the full round history lives in
+`eval_ooc/cache_wall_campaign.md`). What remains toward 100 MHz is physical, not
+structural: a LogicLock floorplan pinning the AGU/request cluster next to the
+cache banks (unlicensed in the current docker Quartus flow), a C6 speed grade, or
+wide seed/DSE harvesting (seed 4 shows what a lucky placement yields). Explicitly
+**not** on the table: an operand- or address-capture pipeline beat — that would
+break cycle accuracy (the no-bubbles rule, §0).
 
 *Flow note:* the OOC flow (`eval_ooc/tools/quartus_ooc.py all <config>`) reuses the
 run directory named in the config; the STA/summary regenerate on every run but the
@@ -710,7 +743,11 @@ and the three IPC laws (§1) are asserted values, not observations.
 | Bench | Scope | Tests |
 |---|---|---|
 | `cpu_core_tb` | core only (`src/cpu_core`), bus modeled in the tb | **103** |
-| `HS3_tb` | full SoC on the real pin set, vendor SDRAM/flash models | **83** |
+| `HS3_tb` | full SoC on the real pin set, vendor SDRAM/flash models | **84** |
+
+(Test 84 is the sideband match-queue oracle — a whole-run passive checker that
+holds every `o_MON_*` strobe against the independently detected external unit
+starts: 1:1, in order, fields exact, reset-flushed; see §5 BSC.)
 
 The suite is built in four layers:
 

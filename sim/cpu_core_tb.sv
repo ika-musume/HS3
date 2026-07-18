@@ -715,13 +715,13 @@ always @(posedge clk) begin
                  u_dut.u_int_pipe.mawb.gpr1_we, u_dut.u_int_pipe.mawb.gpr1_dst, u_dut.u_int_pipe.mawb.gpr1_data);
     if(dbg_trace && u_dut.u_int_pipe.u_ma_seq.fv_ce)
         $display("        [trace %0t] CAP val=%08h hit=%b rmiss=%08h addr=%08h op=%0d", $time,
-                 u_dut.u_int_pipe.ma_capture_value, u_dut.PIPE_L_BUS.rsp_hit_d,
-                 u_dut.PIPE_L_BUS.rsp_rdata_miss, u_dut.u_int_pipe.exma.mem_addr,
+                 u_dut.u_int_pipe.ma_capture_value, u_dut.LBUS_PIPE.rsp_hit_d,
+                 u_dut.LBUS_PIPE.rsp_rdata_miss, u_dut.u_int_pipe.exma.mem_addr,
                  u_dut.u_int_pipe.exma.mem_op);
-    if(dbg_trace && u_dut.PIPE_L_BUS.req_valid && !u_dut.PIPE_L_BUS.req_fetch && u_dut.PIPE_L_BUS.req_ready)
+    if(dbg_trace && u_dut.LBUS_PIPE.req_valid && !u_dut.LBUS_PIPE.req_fetch && u_dut.LBUS_PIPE.req_ready)
         $display("        [trace %0t] DREQ addr=%08h wr=%b lock=%b wdata=%08h wstrb=%b second=%b", $time,
-                 u_dut.PIPE_L_BUS.req_addr, u_dut.PIPE_L_BUS.req_write, u_dut.PIPE_L_BUS.req_lock,
-                 u_dut.PIPE_L_BUS.req_wdata, u_dut.PIPE_L_BUS.req_wstrb,
+                 u_dut.LBUS_PIPE.req_addr, u_dut.LBUS_PIPE.req_write, u_dut.LBUS_PIPE.req_lock,
+                 u_dut.LBUS_PIPE.req_wdata, u_dut.LBUS_PIPE.req_wstrb,
                  u_dut.u_int_pipe.ma_second_access);
     if(dbg_trace && u_dut.u_int_pipe.o_SR_T_WE)
         $display("        [trace %0t] TWR t=%b (wb pc=%08h)", $time,
@@ -764,8 +764,8 @@ logic   [3:0]   mb_wstrb_z;
 logic   [1:0]   mb_size_z;
 logic           mb_write_z, mb_burst_z, mb_lock_z;
 
-wire            lb_d_now = u_dut.PIPE_L_BUS.req_valid && !u_dut.PIPE_L_BUS.req_fetch;
-wire            lb_r_now = u_dut.PIPE_L_BUS.rsp_valid && !u_dut.PIPE_L_BUS.rsp_fetch;
+wire            lb_d_now = u_dut.LBUS_PIPE.req_valid && !u_dut.LBUS_PIPE.req_fetch;
+wire            lb_r_now = u_dut.LBUS_PIPE.rsp_valid && !u_dut.LBUS_PIPE.rsp_fetch;
 
 always @(posedge clk) begin
     if(!rst_n) begin
@@ -777,24 +777,24 @@ always @(posedge clk) begin
         //D-request stability while pending (presented last cycle, unaccepted).
         if(lb_dpend_z && lb_d_now) begin
             lbus_dreq_pends = lbus_dreq_pends + 1;
-            if(u_dut.PIPE_L_BUS.req_addr  !== lb_addr_z  ||
-               u_dut.PIPE_L_BUS.req_write !== lb_write_z ||
-               u_dut.PIPE_L_BUS.req_size  !== lb_size_z  ||
-               u_dut.PIPE_L_BUS.req_lock  !== lb_lock_z  ||
-               (lb_write_z && u_dut.PIPE_L_BUS.req_wdata !== lb_wdata_z)) begin
+            if(u_dut.LBUS_PIPE.req_addr  !== lb_addr_z  ||
+               u_dut.LBUS_PIPE.req_write !== lb_write_z ||
+               u_dut.LBUS_PIPE.req_size  !== lb_size_z  ||
+               u_dut.LBUS_PIPE.req_lock  !== lb_lock_z  ||
+               (lb_write_z && u_dut.LBUS_PIPE.req_wdata !== lb_wdata_z)) begin
                 lbus_dreq_viol = lbus_dreq_viol + 1;
                 $display("      [LBUS] D-request mutated while unaccepted @%0t: addr %08h->%08h wr %b->%b size %0d->%0d lock %b->%b wdata %08h->%08h",
-                         $time, lb_addr_z, u_dut.PIPE_L_BUS.req_addr, lb_write_z, u_dut.PIPE_L_BUS.req_write,
-                         lb_size_z, u_dut.PIPE_L_BUS.req_size, lb_lock_z, u_dut.PIPE_L_BUS.req_lock,
-                         lb_wdata_z, u_dut.PIPE_L_BUS.req_wdata);
+                         $time, lb_addr_z, u_dut.LBUS_PIPE.req_addr, lb_write_z, u_dut.LBUS_PIPE.req_write,
+                         lb_size_z, u_dut.LBUS_PIPE.req_size, lb_lock_z, u_dut.LBUS_PIPE.req_lock,
+                         lb_wdata_z, u_dut.LBUS_PIPE.req_wdata);
             end
         end
         //D-response hold until consumed (identical data/fault re-presentation).
         if(lb_rpend_z) begin
             lbus_drsp_pends = lbus_drsp_pends + 1;
             if(!lb_r_now ||
-               u_dut.PIPE_L_BUS.rsp_rdata  !== lb_rdata_z ||
-               u_dut.PIPE_L_BUS.rsp_dfault !== lb_dfault_z) begin
+               u_dut.LBUS_PIPE.rsp_rdata  !== lb_rdata_z ||
+               u_dut.LBUS_PIPE.rsp_dfault !== lb_dfault_z) begin
                 lbus_drsp_viol = lbus_drsp_viol + 1;
                 $display("      [LBUS] D-response mutated/lost while unconsumed @%0t", $time);
             end
@@ -815,18 +815,18 @@ always @(posedge clk) begin
             end
         end
 
-        lb_dpend_z = lb_d_now && !u_dut.PIPE_L_BUS.req_ready;
-        lb_addr_z  = u_dut.PIPE_L_BUS.req_addr;
-        lb_write_z = u_dut.PIPE_L_BUS.req_write;
-        lb_size_z  = u_dut.PIPE_L_BUS.req_size;
-        lb_lock_z  = u_dut.PIPE_L_BUS.req_lock;
-        lb_wdata_z = u_dut.PIPE_L_BUS.req_wdata;
+        lb_dpend_z = lb_d_now && !u_dut.LBUS_PIPE.req_ready;
+        lb_addr_z  = u_dut.LBUS_PIPE.req_addr;
+        lb_write_z = u_dut.LBUS_PIPE.req_write;
+        lb_size_z  = u_dut.LBUS_PIPE.req_size;
+        lb_lock_z  = u_dut.LBUS_PIPE.req_lock;
+        lb_wdata_z = u_dut.LBUS_PIPE.req_wdata;
 
-        lb_rpend_z  = lb_r_now && !u_dut.PIPE_L_BUS.rsp_ready;
-        lb_rdata_z  = u_dut.PIPE_L_BUS.rsp_rdata;
-        lb_dfault_z = u_dut.PIPE_L_BUS.rsp_dfault;
+        lb_rpend_z  = lb_r_now && !u_dut.LBUS_PIPE.rsp_ready;
+        lb_rdata_z  = u_dut.LBUS_PIPE.rsp_rdata;
+        lb_dfault_z = u_dut.LBUS_PIPE.rsp_dfault;
 
-        if(u_dut.PIPE_L_BUS.req_valid && u_dut.PIPE_L_BUS.req_ready && u_dut.PIPE_L_BUS.req_fetch)
+        if(u_dut.LBUS_PIPE.req_valid && u_dut.LBUS_PIPE.req_ready && u_dut.LBUS_PIPE.req_fetch)
             lbus_ifetch_acc = lbus_ifetch_acc + 1;
 
         mb_pend_z  = MEM_BUS.req_valid && !MEM_BUS.req_ready;

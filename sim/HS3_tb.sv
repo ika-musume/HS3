@@ -32,7 +32,7 @@
     onto the real INTC/BSC: IRL requests on the pins vs SDRAM fill/drain/
     refresh machinery, TAS.B locked pairs, and synchronous-exception
     collisions - plus suite-wide passive checkers for lock pairing on
-    CORE_I_BUS and the ack/INTEVT/INTEVT2 handshake law.
+    IBUS1_CORE and the ack/INTEVT/INTEVT2 handshake law.
 */
 
 module HS3_tb;
@@ -72,6 +72,11 @@ wire    [28:0]  mem_addr_p;
 wire    [6:0]   mem_cs_n;
 wire    [3:0]   mem_wstrb;
 
+//MON transaction monitor / early-transaction sideband (sh3_sideband.md) - oracle checks it whole-run
+wire            mon_req, mon_wr, mon_burst;
+wire    [1:0]   mon_size;
+wire    [28:0]  mon_addr;
+
 //the chip's physical external bus (table 10.1) + the one true bidirectional
 //net (controls stay unidirectional; the inout lives only at board level)
 wire    [25:0]  a_pin;
@@ -107,7 +112,7 @@ HS3 #(
     .i_EXTAL2                  (extal2),
 
     .o_MEM_REQ                 (mem_req),
-    .o_MEM_WRITE               (mem_write),
+    .o_MEM_WR               (mem_write),
     .o_MEM_BURST               (mem_burst),
     .o_MEM_SIZE                (mem_size),
     .o_MEM_ADDR                (mem_addr_p),
@@ -117,6 +122,12 @@ HS3 #(
     .i_MEM_RSP_VALID           (raw_mode ? 1'b0 : MEM_BUS.rsp_valid),
     .i_MEM_FAULT               (MEM_BUS.rsp_fault),
     .o_MEM_RSP_READY           (mem_rsp_ready),
+
+    .o_MON_REQ                  (mon_req),
+    .o_MON_WR                   (mon_wr),
+    .o_MON_ADDR                 (mon_addr),
+    .o_MON_SIZE                 (mon_size),
+    .o_MON_BURST                (mon_burst),
 
     .o_A                       (a_pin),
     .o_D_O                     (d_o),
@@ -662,17 +673,17 @@ always_ff @(posedge clk or negedge sys_rst_n) begin
         //single-address DMA write never drives D (fig 11.10a): take it at
         //the accept and delay the sample until the device's DACK window
         if(MEM_BUS.req_valid && MEM_BUS.req_ready && mem_owned &&
-           (!MEM_BUS.req_write || d_oe || u_dut.BSC_I_BUS.req_saddr)) begin
+           (!MEM_BUS.req_write || d_oe || u_dut.IBUS1_BSC.req_saddr)) begin
             mem_pending  <= 1'b1;
             mem_addr     <= MEM_BUS.req_addr;
             mem_is_data  <= req_is_data;
             mem_is_write <= MEM_BUS.req_write;
-            mem_is_sgw   <= MEM_BUS.req_write && u_dut.BSC_I_BUS.req_saddr;
-            mem_is_dack  <= u_dut.BSC_I_BUS.req_dack;
+            mem_is_sgw   <= MEM_BUS.req_write && u_dut.IBUS1_BSC.req_saddr;
+            mem_is_dack  <= u_dut.IBUS1_BSC.req_dack;
             mem_wstrb_q  <= MEM_BUS.req_wstrb;
             if(req_is_data) begin
                 mem_is_fault <= d_fault_en && (MEM_BUS.req_addr[9:2] == d_fault_widx);
-                mem_wait_cnt <= (MEM_BUS.req_write && u_dut.BSC_I_BUS.req_saddr)
+                mem_wait_cnt <= (MEM_BUS.req_write && u_dut.IBUS1_BSC.req_saddr)
                                 ? 6 : d_latency;    //wait for the grid-aligned CS window
             end
             else begin
@@ -813,10 +824,73 @@ always @(posedge clk) begin
         dmaw_log <= 64'd0;
         dmaw_cnt <= 0;
     end
-    else if(u_dut.DMA_I_BUS.rsp_valid && u_dut.DMA_I_BUS.rsp_ready &&
+    else if(u_dut.IBUS1_DMA.rsp_valid && u_dut.IBUS1_DMA.rsp_ready &&
             u_dut.u_dmac.seq == 3'd4) begin     //S_WR_WAIT completion
         dmaw_log <= {dmaw_log[59:0], u_dut.u_dmac.addr_q[11:8]};
         dmaw_cnt <= dmaw_cnt + 1;
+    end
+end
+
+/*
+    MON match-queue oracle (sh3_sideband.md R1-R3/R8): the pump's
+    matching algorithm as a passive whole-run checker. Every o_MON_REQ pulse
+    enqueues {addr, wr, size, burst}; every external transaction UNIT start
+    (SDRAM engine dispatch / ordinary envelope open, white-box) pops the
+    head and compares. Push runs before pop - the registered strobe and
+    the earliest grid dispatch land the same cycle. The BSC's own reset
+    (WDT flavors included) flushes the queue: a strobed-undispatched op is
+    legitimately dropped (spec R10). mon_qmax = the MEASURED R8 depth bound.
+    Single writer; results checked in test_bus_monitors.
+*/
+
+logic   [32:0]  mon_q [0:3];             //{addr[28:0], wr, size[1:0], burst}
+logic   [32:0]  mon_exp;
+logic           mon_ordbusy_z = 1'b0;    //ord_busy delay for the rise detect
+integer         mon_qn      = 0;         //queue occupancy
+integer         mon_qmax    = 0;         //occupancy high-water (measured R8)
+integer         mon_pushes  = 0;         //total strobes seen (coverage)
+integer         mon_flushed = 0;         //reset-dropped strobes (R10 path)
+integer         mon_err     = 0;         //oracle mismatches (must end 0)
+
+always @(posedge clk) begin
+    if(!u_dut.u_bsc.i_RST_n) begin              //any reset flavor: front-end dies
+        mon_flushed   = mon_flushed + mon_qn;
+        mon_qn        = 0;
+        mon_ordbusy_z = 1'b0;
+    end
+    else begin
+        if(mon_req) begin                        //push first (same-cycle pop is legal)
+            if(mon_qn == 4) begin
+                $display("      [FAIL] MON oracle: queue overflow");
+                mon_err = mon_err + 1;
+                mon_qn  = 0;
+            end
+            mon_q[mon_qn] = {mon_addr, mon_wr, mon_size, mon_burst};
+            mon_qn       = mon_qn + 1;
+            mon_pushes   = mon_pushes + 1;
+            if(mon_qn > mon_qmax) mon_qmax = mon_qn;
+        end
+        if((u_dut.u_bsc.eng_start_tk && !u_dut.u_bsc.eng_op_mrs) ||
+           (u_dut.u_bsc.ord_busy && !mon_ordbusy_z)) begin
+            mon_exp = u_dut.u_bsc.eng_start_tk ?
+                {u_dut.u_bsc.eng_addr[28:0], u_dut.u_bsc.eng_op_write,
+                 u_dut.u_bsc.eng_op_size,    u_dut.u_bsc.eng_op_burst} :
+                {u_dut.u_bsc.ord_addr[28:0], u_dut.u_bsc.ord_write,
+                 u_dut.u_bsc.ord_size,       u_dut.u_bsc.ord_burst};
+            if(mon_qn == 0) begin
+                $display("      [FAIL] MON oracle: unit start with empty queue (exp=%h)", mon_exp);
+                mon_err = mon_err + 1;
+            end
+            else begin
+                if(mon_q[0] !== mon_exp) begin
+                    $display("      [FAIL] MON oracle: head mismatch got=%h exp=%h", mon_q[0], mon_exp);
+                    mon_err = mon_err + 1;
+                end
+                mon_q[0] = mon_q[1]; mon_q[1] = mon_q[2]; mon_q[2] = mon_q[3];
+                mon_qn   = mon_qn - 1;
+            end
+        end
+        mon_ordbusy_z = u_dut.u_bsc.ord_busy;    //updated last: rise detect above
     end
 end
 
@@ -898,7 +972,7 @@ end
 
 /*
     SoC twins of the cpu_core_tb suite-wide contracts. The lock-pairing law
-    watches the CPU's own bus (CORE_I_BUS, the splitter input): every locked
+    watches the CPU's own bus (IBUS1_CORE, the splitter input): every locked
     READ opens an RMW pair that exactly one locked WRITE closes - no nested
     reads, no widowed writes (TAS.B indivisibility, p.320). The ack law is
     the INTC handshake: o_INT_ACK must land ON an exception-entry edge (an
@@ -909,7 +983,7 @@ end
     Coverage counters prove the sweeps land entries mid-machinery.
 */
 integer         int_ack_cnt;                    //clocked ack counter (sweep drop key)
-integer         locked_rd_cnt, locked_wr_cnt;   //accepted locked beats on CORE_I_BUS
+integer         locked_rd_cnt, locked_wr_cnt;   //accepted locked beats on IBUS1_CORE
 integer         lock_pairs_checked = 0;
 integer         lock_pair_viol     = 0;
 logic           lock_open_q;
@@ -922,8 +996,8 @@ integer         entry_sdram_busy = 0;           //entries with the SDRAM engine 
 logic   [4:0]   cache_st, bsc_est;
 localparam logic [4:0] TB_CS_IDLE = 5'd1;       //cache state_t encoding (drift guard: cpu_core_tb)
 
-wire            core_lock_beat = u_dut.CORE_I_BUS.req_valid && u_dut.CORE_I_BUS.req_ready &&
-                                 u_dut.CORE_I_BUS.req_lock;
+wire            core_lock_beat = u_dut.IBUS1_CORE.req_valid && u_dut.IBUS1_CORE.req_ready &&
+                                 u_dut.IBUS1_CORE.req_lock;
 
 always @(posedge clk) begin
     cache_st = u_dut.u_cpu.u_cache.state;
@@ -937,9 +1011,9 @@ always @(posedge clk) begin
     end
     else begin
         if(u_dut.int_ack) int_ack_cnt = int_ack_cnt + 1;
-        //(1) locked read->write pairing, observed as CORE_I_BUS accept beats
+        //(1) locked read->write pairing, observed as IBUS1_CORE accept beats
         if(core_lock_beat) begin
-            if(u_dut.CORE_I_BUS.req_write) begin
+            if(u_dut.IBUS1_CORE.req_write) begin
                 locked_wr_cnt = locked_wr_cnt + 1;
                 if(!lock_open_q) begin
                     lock_pair_viol = lock_pair_viol + 1;
@@ -3237,6 +3311,13 @@ task automatic test_bus_monitors;
         chk_true("no D-bus driver overlap",         !dbus_viol);
         chk_true("no addr/data movement under WE",  !we_shape_viol);
         end_test;
+        begin_test("MON match-queue oracle: strobe==unit 1:1, in order, fields exact (whole run)");
+        $display("      (info) %0d strobes matched, measured R8 depth = %0d, reset-flushed = %0d",
+                 mon_pushes, mon_qmax, mon_flushed);
+        chk_true("no oracle mismatches",            mon_err == 0);
+        chk_true("strobe coverage nonzero",         mon_pushes > 1000);
+        chk_true("R8 outstanding depth within 2",   mon_qmax <= 2);
+        end_test;
     end
 endtask
 
@@ -4316,7 +4397,7 @@ endtask
     RMW pairs, phase 0 on SDRAM (engine lock path), phase 1 on an ordinary
     handshake area stretched by d_latency (front-end lock path). An IRL-13
     request lands at every offset: acceptance must never split a pair (the
-    MA-inflight defer), T flows exactly once, and the CORE_I_BUS lock-pairing
+    MA-inflight defer), T flows exactly once, and the IBUS1_CORE lock-pairing
     counters must show exactly 2 reads / 2 writes per run.
 */
 task automatic test_int_tas_sweep;
