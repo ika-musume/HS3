@@ -32,7 +32,7 @@
     onto the real INTC/BSC: IRL requests on the pins vs SDRAM fill/drain/
     refresh machinery, TAS.B locked pairs, and synchronous-exception
     collisions - plus suite-wide passive checkers for lock pairing on
-    CORE_I_BUS and the ack/INTEVT/INTEVT2 handshake law.
+    IBUS1_CORE and the ack/INTEVT/INTEVT2 handshake law.
 */
 
 module HS3_tb;
@@ -673,17 +673,17 @@ always_ff @(posedge clk or negedge sys_rst_n) begin
         //single-address DMA write never drives D (fig 11.10a): take it at
         //the accept and delay the sample until the device's DACK window
         if(MEM_BUS.req_valid && MEM_BUS.req_ready && mem_owned &&
-           (!MEM_BUS.req_write || d_oe || u_dut.BSC_I_BUS.req_saddr)) begin
+           (!MEM_BUS.req_write || d_oe || u_dut.IBUS1_BSC.req_saddr)) begin
             mem_pending  <= 1'b1;
             mem_addr     <= MEM_BUS.req_addr;
             mem_is_data  <= req_is_data;
             mem_is_write <= MEM_BUS.req_write;
-            mem_is_sgw   <= MEM_BUS.req_write && u_dut.BSC_I_BUS.req_saddr;
-            mem_is_dack  <= u_dut.BSC_I_BUS.req_dack;
+            mem_is_sgw   <= MEM_BUS.req_write && u_dut.IBUS1_BSC.req_saddr;
+            mem_is_dack  <= u_dut.IBUS1_BSC.req_dack;
             mem_wstrb_q  <= MEM_BUS.req_wstrb;
             if(req_is_data) begin
                 mem_is_fault <= d_fault_en && (MEM_BUS.req_addr[9:2] == d_fault_widx);
-                mem_wait_cnt <= (MEM_BUS.req_write && u_dut.BSC_I_BUS.req_saddr)
+                mem_wait_cnt <= (MEM_BUS.req_write && u_dut.IBUS1_BSC.req_saddr)
                                 ? 6 : d_latency;    //wait for the grid-aligned CS window
             end
             else begin
@@ -824,7 +824,7 @@ always @(posedge clk) begin
         dmaw_log <= 64'd0;
         dmaw_cnt <= 0;
     end
-    else if(u_dut.DMA_I_BUS.rsp_valid && u_dut.DMA_I_BUS.rsp_ready &&
+    else if(u_dut.IBUS1_DMA.rsp_valid && u_dut.IBUS1_DMA.rsp_ready &&
             u_dut.u_dmac.seq == 3'd4) begin     //S_WR_WAIT completion
         dmaw_log <= {dmaw_log[59:0], u_dut.u_dmac.addr_q[11:8]};
         dmaw_cnt <= dmaw_cnt + 1;
@@ -972,7 +972,7 @@ end
 
 /*
     SoC twins of the cpu_core_tb suite-wide contracts. The lock-pairing law
-    watches the CPU's own bus (CORE_I_BUS, the splitter input): every locked
+    watches the CPU's own bus (IBUS1_CORE, the splitter input): every locked
     READ opens an RMW pair that exactly one locked WRITE closes - no nested
     reads, no widowed writes (TAS.B indivisibility, p.320). The ack law is
     the INTC handshake: o_INT_ACK must land ON an exception-entry edge (an
@@ -983,7 +983,7 @@ end
     Coverage counters prove the sweeps land entries mid-machinery.
 */
 integer         int_ack_cnt;                    //clocked ack counter (sweep drop key)
-integer         locked_rd_cnt, locked_wr_cnt;   //accepted locked beats on CORE_I_BUS
+integer         locked_rd_cnt, locked_wr_cnt;   //accepted locked beats on IBUS1_CORE
 integer         lock_pairs_checked = 0;
 integer         lock_pair_viol     = 0;
 logic           lock_open_q;
@@ -996,8 +996,8 @@ integer         entry_sdram_busy = 0;           //entries with the SDRAM engine 
 logic   [4:0]   cache_st, bsc_est;
 localparam logic [4:0] TB_CS_IDLE = 5'd1;       //cache state_t encoding (drift guard: cpu_core_tb)
 
-wire            core_lock_beat = u_dut.CORE_I_BUS.req_valid && u_dut.CORE_I_BUS.req_ready &&
-                                 u_dut.CORE_I_BUS.req_lock;
+wire            core_lock_beat = u_dut.IBUS1_CORE.req_valid && u_dut.IBUS1_CORE.req_ready &&
+                                 u_dut.IBUS1_CORE.req_lock;
 
 always @(posedge clk) begin
     cache_st = u_dut.u_cpu.u_cache.state;
@@ -1011,9 +1011,9 @@ always @(posedge clk) begin
     end
     else begin
         if(u_dut.int_ack) int_ack_cnt = int_ack_cnt + 1;
-        //(1) locked read->write pairing, observed as CORE_I_BUS accept beats
+        //(1) locked read->write pairing, observed as IBUS1_CORE accept beats
         if(core_lock_beat) begin
-            if(u_dut.CORE_I_BUS.req_write) begin
+            if(u_dut.IBUS1_CORE.req_write) begin
                 locked_wr_cnt = locked_wr_cnt + 1;
                 if(!lock_open_q) begin
                     lock_pair_viol = lock_pair_viol + 1;
@@ -4397,7 +4397,7 @@ endtask
     RMW pairs, phase 0 on SDRAM (engine lock path), phase 1 on an ordinary
     handshake area stretched by d_latency (front-end lock path). An IRL-13
     request lands at every offset: acceptance must never split a pair (the
-    MA-inflight defer), T flows exactly once, and the CORE_I_BUS lock-pairing
+    MA-inflight defer), T flows exactly once, and the IBUS1_CORE lock-pairing
     counters must show exactly 2 reads / 2 writes per run.
 */
 task automatic test_int_tas_sweep;
