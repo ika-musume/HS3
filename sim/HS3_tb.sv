@@ -76,6 +76,7 @@ wire    [3:0]   mem_wstrb;
 wire            mon_req, mon_wr, mon_burst;
 wire    [1:0]   mon_size;
 wire    [28:0]  mon_addr;
+wire            mon_de;          //data-enable window (Early_Monitor_Guide.md)
 
 //the chip's physical external bus (table 10.1) + the one true bidirectional
 //net (controls stay unidirectional; the inout lives only at board level)
@@ -95,7 +96,7 @@ assign  d_bus = d_oe ? d_o : 32'hzzzz_zzzz;
 
 //clock pins: CKIO output (drives the SDRAM model below) and the RTC crystal
 wire            ckio;
-wire            ckio_pcen, ckio_ncen;       //CKIO edge enables (DREQ/WAIT phase checks)
+wire            bus_pcen, bus_ncen;         //CKIO edge enables (DREQ/WAIT phase checks)
 logic           extal2 = 1'b0;
 
 HS3 #(
@@ -107,8 +108,8 @@ HS3 #(
     .i_CLK                     (clk),
     .i_CEN                     (1'b1),
     .o_CKIO                    (ckio),
-    .o_CKIO_PCEN               (ckio_pcen),
-    .o_CKIO_NCEN               (ckio_ncen),
+    .o_BUS_PCEN                (bus_pcen),
+    .o_BUS_NCEN                (bus_ncen),
     .i_EXTAL2                  (extal2),
 
     .o_MEM_REQ                 (mem_req),
@@ -128,6 +129,7 @@ HS3 #(
     .o_MON_ADDR                 (mon_addr),
     .o_MON_SIZE                 (mon_size),
     .o_MON_BURST                (mon_burst),
+    .o_MON_DE                   (mon_de),
 
     .o_A                       (a_pin),
     .o_D_O                     (d_o),
@@ -892,6 +894,159 @@ always @(posedge clk) begin
         end
         mon_ordbusy_z = u_dut.u_bsc.ord_busy;    //updated last: rise detect above
     end
+end
+
+/*
+    MON DE window oracle (docs/Early_Monitor_Guide.md section 8): the six
+    passive whole-run checks of the o_MON_DE data-enable rail.
+      (1) REQ pulses never merge  (2) DE moves only at CKIO rises
+      (3) DE == pin window truth every CKIO cycle AND per-unit asserted-
+          cycle count == physical beat count  (4) REQ/DE overlap only in
+          the own-unit ordinary-write-T1 shape, no unit-less (orphan) DE
+      (5) refresh/MRS/BRQ/self-entry engine bursts are DE-silent
+      (6) MON dead across reset (queue flush is the oracle above).
+    Truth is sampled in the FIRST core cycle of each CKIO cycle only: the
+    generic-port hsk fast path may rewrite ord state at the MID-cycle edge
+    (documented off-grid chop) which the BUS_PCEN-locked DE cannot follow.
+    Per-unit counts skip GEN units with the hsk leg live (!raw_mode chops
+    pin cycles); an engine write burst may yield mid-run (the resumed
+    continuation unit re-strobes the remaining beats, guide section 2), so
+    its bound is 1..expected instead of exact. Single writer; results
+    checked in test_bus_monitors.
+*/
+
+//window truth = the trackers that drive the pins themselves. The write-T1
+//term drops stalled shapes (an hsk stall entry can leave BS low off-grid)
+wire mon_de_truth = u_dut.u_bsc.sd_dq_oe | u_dut.u_bsc.rd_lat |
+                    (u_dut.u_bsc.ord_pins & u_dut.u_bsc.ord_write &
+                     ~u_dut.u_bsc.ord_bs_n & ~u_dut.u_bsc.ordp_stall) |
+                    (u_dut.u_bsc.ord_pins & ~u_dut.u_bsc.ord_write &
+                     u_dut.u_bsc.ord_t2);
+
+logic           mon_req_z    = 1'b0;    //pulse-merge detect
+logic           mon_de_z     = 1'b0;    //off-grid transition detect
+logic           mon_pcen_z   = 1'b0;    //the edge just passed was a CKIO rise
+logic           mon_rst_z    = 1'b0;    //reset view one sample back (check 6)
+logic   [4:0]   mon_est_v;              //engine state, numeric view (decl order)
+logic           mon_ordbz2   = 1'b0;    //private ord_busy delay (pop detect)
+integer         mon_de_err   = 0;       //DE oracle failures (must end 0)
+integer         mon_de_cyc   = 0;       //asserted DE CKIO cycles (coverage)
+integer         mon_u_exp    = 0;       //open unit: expected physical beats
+integer         mon_u_cnt    = 0;       //open unit: DE cycles delivered
+logic           mon_u_open   = 1'b0;    //a unit is being counted
+logic           mon_u_chk    = 1'b0;    //count compare valid for this unit
+logic           mon_u_wrb    = 1'b0;    //engine write burst (may yield mid-run)
+integer         mon_u_units  = 0;       //units count-checked (coverage)
+
+task automatic mon_u_close;             //compare the closing unit's beat count
+    begin
+        if(mon_u_open && mon_u_chk) begin
+            if(mon_u_wrb ? !(mon_u_cnt >= 1 && mon_u_cnt <= mon_u_exp)
+                         : (mon_u_cnt != mon_u_exp)) begin
+                $display("      [FAIL] MON DE: unit beat count got=%0d exp=%0d (wrb=%0d)",
+                         mon_u_cnt, mon_u_exp, mon_u_wrb);
+                mon_de_err = mon_de_err + 1;
+            end
+            mon_u_units = mon_u_units + 1;
+        end
+        mon_u_open = 1'b0;
+    end
+endtask
+
+always @(posedge clk) begin
+    if(!u_dut.u_bsc.i_RST_n) begin
+        //(6) MON dead across a HELD reset; the assertion instant itself is
+        //skipped (the tb drives rst_n blocking in the same timestep, racing
+        //the async clear) - the open unit is legitimately dropped (R10)
+        if(!mon_rst_z && (mon_req || mon_de)) begin
+            $display("      [FAIL] MON DE: REQ/DE alive under reset");
+            mon_de_err = mon_de_err + 1;
+        end
+        mon_u_open = 1'b0;
+        mon_req_z  = 1'b0;
+        mon_de_z   = 1'b0;
+    end
+    else begin
+        mon_est_v = u_dut.u_bsc.est;
+        //(1) two units never share one REQ pulse
+        if(mon_req && mon_req_z) begin
+            $display("      [FAIL] MON DE: REQ pulses merged");
+            mon_de_err = mon_de_err + 1;
+        end
+        //(2) DE transitions only at CKIO rising edges (the BUS_PCEN grid)
+        if((mon_de !== mon_de_z) && !mon_pcen_z) begin
+            $display("      [FAIL] MON DE: transition off the BUS_PCEN grid");
+            mon_de_err = mon_de_err + 1;
+        end
+        //(4a) REQ over DE only in the own-unit ordinary-write-T1 shape
+        if(mon_req && mon_de &&
+           !(u_dut.u_bsc.ord_pins && u_dut.u_bsc.ord_write && !u_dut.u_bsc.ord_bs_n)) begin
+            $display("      [FAIL] MON DE: REQ overlaps a foreign DE window");
+            mon_de_err = mon_de_err + 1;
+        end
+        //(5) silent engine bursts own the pins with DE low (numeric est:
+        //MRS=1-4, BRQ=16-17, REF=18-21, SLF entry=22-24; E_SLF/E_SLF_EXIT
+        //excluded - ordinary cycles may legitimately run under those)
+        if(mon_de && ((mon_est_v >= 5'd16 && mon_est_v <= 5'd24) ||
+                      (mon_est_v >= 5'd1  && mon_est_v <= 5'd4))) begin
+            $display("      [FAIL] MON DE: DE high in a silent engine burst (est=%0d)", mon_est_v);
+            mon_de_err = mon_de_err + 1;
+        end
+
+        //unit-start pops (the match-queue oracle's events): close the previous
+        //unit's count, open the new one with its expected physical beat count
+        if(u_dut.u_bsc.eng_start_tk && !u_dut.u_bsc.eng_op_mrs) begin
+            mon_u_close;
+            mon_u_wrb  = u_dut.u_bsc.eng_op_write && u_dut.u_bsc.eng_op_burst;
+            mon_u_exp  = u_dut.u_bsc.eng_op_burst ?
+                             (u_dut.u_bsc.eng_sd16 ? (8 - u_dut.u_bsc.eng_addr[3:1])
+                                                   : (4 - u_dut.u_bsc.eng_addr[3:2])) :
+                         (u_dut.u_bsc.eng_sd16 &&
+                          u_dut.u_bsc.eng_op_size == 2'd2) ? 2 : 1;
+            mon_u_cnt  = 0;
+            mon_u_chk  = 1'b1;          //engine units always complete on pins
+            mon_u_open = 1'b1;
+        end
+        else if(u_dut.u_bsc.ord_busy && !mon_ordbz2) begin
+            mon_u_close;
+            mon_u_wrb  = 1'b0;
+            if(u_dut.u_bsc.ord_burst)   //envelope beats are longwords (full subs)
+                mon_u_exp = 4 * (u_dut.u_bsc.ord_w8 ? 4 : u_dut.u_bsc.ord_w16 ? 2 : 1);
+            else                        //single: sub-cycles owed by size vs width
+                mon_u_exp = u_dut.u_bsc.ord_w8 ?
+                                (u_dut.u_bsc.ord_size == 2'd2 ? 4 :
+                                 u_dut.u_bsc.ord_size == 2'd1 ? 2 : 1) :
+                            u_dut.u_bsc.ord_w16 ?
+                                (u_dut.u_bsc.ord_size == 2'd2 ? 2 : 1) : 1;
+            mon_u_cnt  = 0;
+            mon_u_chk  = raw_mode;      //the hsk leg chops pin cycles off-grid
+            mon_u_open = 1'b1;
+        end
+
+        //(3) once per CKIO cycle, on its first core cycle: DE == pin truth;
+        //(4b) every asserted cycle belongs to a strobed+dispatched unit
+        if(mon_pcen_z) begin
+            if(mon_de !== mon_de_truth) begin
+                $display("      [FAIL] MON DE: window != pin truth (de=%b truth=%b est=%0d)",
+                         mon_de, mon_de_truth, mon_est_v);
+                mon_de_err = mon_de_err + 1;
+            end
+            if(mon_de) begin
+                mon_de_cyc = mon_de_cyc + 1;
+                if(mon_u_open) mon_u_cnt = mon_u_cnt + 1;
+                else begin
+                    $display("      [FAIL] MON DE: orphan DE cycle (no unit open)");
+                    mon_de_err = mon_de_err + 1;
+                end
+            end
+        end
+
+        mon_req_z = mon_req;
+        mon_de_z  = mon_de;
+    end
+    mon_ordbz2 = u_dut.u_bsc.ord_busy;
+    mon_pcen_z = bus_pcen;
+    mon_rst_z  = u_dut.u_bsc.i_RST_n;
 end
 
 
@@ -3317,6 +3472,13 @@ task automatic test_bus_monitors;
         chk_true("no oracle mismatches",            mon_err == 0);
         chk_true("strobe coverage nonzero",         mon_pushes > 1000);
         chk_true("R8 outstanding depth within 2",   mon_qmax <= 2);
+        end_test;
+        begin_test("MON DE window oracle: BUS_PCEN grid, pin-truth equality, per-unit beat counts (whole run)");
+        $display("      (info) %0d asserted DE CKIO cycles, %0d units count-checked",
+                 mon_de_cyc, mon_u_units);
+        chk_true("no DE oracle failures",           mon_de_err == 0);
+        chk_true("DE cycle coverage nonzero",       mon_de_cyc > 1000);
+        chk_true("count-checked unit coverage",     mon_u_units > 200);
         end_test;
     end
 endtask

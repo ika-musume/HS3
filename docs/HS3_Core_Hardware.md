@@ -31,8 +31,9 @@ architectural cycle.
 | Domain | Clock | Rate | Owner |
 |---|---|---|---|
 | CPU + cache + on-chip fabric | `i_CLK`/`i_CEN` | 100 MHz | whole core |
-| PCB-facing SDRAM engine + refresh | `i_CLK` + `i_BCEN` | 50 MHz enable (B-φ = core/2, p.207) | BSC |
-| Bus clock output pin | `o_CKIO` | B-φ phase register | CPG |
+| PCB-facing SDRAM engine + refresh | `i_CLK` + `i_BUS_PCEN` | 50 MHz enable (B-φ = core/2, p.207) | BSC |
+| Bus clock output pin | `o_CKIO` | B-φ phase register, clocked off the two bus enables | CPG |
+| Bus grid (exported) | `o_BUS_PCEN` / `o_BUS_NCEN` | CKIO rise / CKIO fall enables - the ONLY phase source | CPG |
 | RTC oscillator | `i_EXTAL2` | 32.768 kHz, **genuinely asynchronous** | RTC only |
 
 The **RTC is the only true second clock domain.** Everything the RTC exposes to the
@@ -444,7 +445,7 @@ the port-C pads. Front-end route classes:
 
 - **SDRAM engine** — MRS / single / burst / auto-refresh / self-refresh /
   bank-active with per-bank open rows, tWR guard, CL read pipe. Timing is driven
-  exactly by the `MCR`/`WCR2` registers (CL/RCD/tRP), on the 50 MHz `i_BCEN` enable.
+  exactly by the `MCR`/`WCR2` registers (CL/RCD/tRP), on the 50 MHz `i_BUS_PCEN` enable.
   Reproduces the natural SDRAM latency of the original board (most emulated code runs
   from SDRAM), §10.3.4 figs 10.14–10.28. **Full table-10.13 address multiplexing**:
   every AMX family decodes — row = `addr >> {8,9,10}` on `A16–A1`, the
@@ -628,7 +629,7 @@ remains the critical path.
 
 | Module | File | Function |
 |---|---|---|
-| **CPG / WDT** | `cpg_wdt.sv` (286) | FRQCR/STBCR/STBCR2 clock-pulse generator; Pφ divider N∈{1,2,3,4,6}; watchdog timer with keyed `0x5A`/`0xA5` writes + reset stretcher; owns `o_BCEN` and the `o_CKIO` pin (B-φ = core/2, p.207 — FRQCR has no CKOEN, CKIO always drives in modes 0–2; datasheet phase: rises at the command edges). |
+| **CPG / WDT** | `cpg_wdt.sv` (311) | FRQCR/STBCR/STBCR2 clock-pulse generator; Pφ divider N∈{1,2,3,4,6}; watchdog timer with keyed `0x5A`/`0xA5` writes + reset stretcher; owns the bus grid `o_BUS_PCEN`/`o_BUS_NCEN` (nothing re-derives a phase downstream) and the `o_CKIO` pin (B-φ = core/2, p.207 — FRQCR has no CKOEN, CKIO always drives in modes 0–2; datasheet phase: rises at the command edges). |
 | **INTC** | `intc.sv` (455) | Full §6 interrupt controller: IRQ / IRL / IRLS / PINT / NMI, a 37-entry **2-stage registered priority resolver**, `INTEVT2`, `o_INT_ACK`/`o_NMI_ACK` (the acks latch/clear pending state — the core's ack-implies-entry law makes the handshake lossless). Interrupt inputs tap the I/O pads (below). |
 | **TMU** | `tmu.sv` (262) | 3× 32-bit auto-reload down-counters; shared Pφ prescaler taps (P/4, /16, /64, /256); external TCLK clock (per CKEG, 2FF + edge detect); ch2 input capture (TCPR2, ICPF); underflow interrupts `TUNI0-2`/`TICPI2` → INTC (IPRA). |
 | **I/O ports / PFC** | `ioport.sv` (236) | All 12 ports (A–L, SCP) as `pcr[]`/`pdr[]` arrays with per-port capability masks (drive/pull-up), PFC mode muxing (`MD1 ? pin : (DRV & DR)`), the PGCR PTG0 quirk (p.577), the `o_PC_FN` grant vector handing port-C pads to the BSC's MCS outputs. |

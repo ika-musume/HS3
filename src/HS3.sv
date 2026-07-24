@@ -37,8 +37,8 @@ module HS3 #(
     input   wire            i_CLK,      //single architectural clock
     input   wire            i_CEN,      //architectural clock enable
     output  wire            o_CKIO,     //bus clock output (B-phi = core/2, p.207)
-    output  wire            o_CKIO_PCEN,
-    output  wire            o_CKIO_NCEN,
+    output  wire            o_CKIO_PCEN, //CKIO rising-edge enable  (the bus/pin grid)
+    output  wire            o_CKIO_NCEN, //CKIO falling-edge enable (mid-state phase)
     input   wire            i_EXTAL2,   //RTC 32.768 kHz crystal pad (own clock domain)
 
     /* BSC PHYSICAL PINS - the real chip's shared external bus (table 10.1):
@@ -81,12 +81,15 @@ module HS3 #(
 
     /* TRANSACTION MONITOR - (early-transaction snoop): one registered
        pulse per committed external transaction unit at its internal accept
-       edge - advisory only, nothing returned. Leave unconnected when unused. */
+       edge, plus a data-enable window (one CKIO cycle per physical beat) -
+       advisory only, nothing returned. Leave unconnected when unused.
+       Spec: docs/Early_Monitor_Guide.md */
     output  wire            o_MON_REQ,
     output  wire            o_MON_WR,
     output  wire            o_MON_BURST,
     output  wire    [1:0]   o_MON_SIZE,
     output  wire    [28:0]  o_MON_ADDR,
+    output  wire            o_MON_DE,
 
     /* GENERIC MEMORY PORT - mirrors EVERY external access. Generic-class
        accesses may be completed early by i_MEM_RSP_VALID (ORed with the
@@ -171,8 +174,8 @@ module HS3 #(
 wire            wdt_rst_por_n;
 wire            wdt_rst_man_n;
 wire            iti_req;
-wire            pcen;
-wire            bcen; //bus clock enable (B-phi = CKIO rate) from the CPG
+wire            peri_pcen;          //P-phi enable from the CPG divider
+wire            bus_pcen, bus_ncen; //the CPG's bus grid: CKIO rise / CKIO fall
 
 wire            rst_por_n = i_POR_n & wdt_rst_por_n;
 wire            rst_man_n = i_RST_n & wdt_rst_man_n;
@@ -255,7 +258,8 @@ bsc #(
     .i_RST_n                (rst_all_n                  ),  //front-end handshake only
     .i_CLK                  (i_CLK                      ),
     .i_CEN                  (cen                        ),
-    .i_BCEN                 (bcen                       ),
+    .i_BUS_PCEN             (bus_pcen                   ),
+    .i_BUS_NCEN             (bus_ncen                   ),
 
     .I_BUS                  (IBUS1_BSC                  ),
     .REG_TMU                (PBUS1_TMU                  ),
@@ -280,6 +284,7 @@ bsc #(
     .o_MON_ADDR             (o_MON_ADDR                 ),
     .o_MON_SIZE             (o_MON_SIZE                 ),
     .o_MON_BURST            (o_MON_BURST                ),
+    .o_MON_DE               (o_MON_DE                   ),
 
     .o_A                    (o_A                        ),
     .o_D_O                  (o_D_O                      ),
@@ -390,15 +395,19 @@ cpg_wdt u_cpg_wdt (
 
     .REG_BUS                (IBUS2_CPG                  ),
 
-    .o_PCEN                 (pcen                       ),
-    .o_BCEN                 (bcen                       ),
+    .o_PERI_PCEN            (peri_pcen                  ),
+    .o_BUS_PCEN             (bus_pcen                   ),
+    .o_BUS_NCEN             (bus_ncen                   ),
     .o_CKIO                 (o_CKIO                     ),
-    .o_CKIO_PCEN            (o_CKIO_PCEN                ),
-    .o_CKIO_NCEN            (o_CKIO_NCEN                ),
     .o_ITI_REQ              (iti_req                    ),
     .o_WDT_RST_POR_n        (wdt_rst_por_n              ),
     .o_WDT_RST_MAN_n        (wdt_rst_man_n              )
 );
+
+//the bus grid leaves the chip alongside CKIO: an external controller in this
+//clock domain gets the same rise/fall enables the pins are built on
+assign  o_CKIO_PCEN = bus_pcen;
+assign  o_CKIO_NCEN = bus_ncen;
 
 
 
@@ -415,7 +424,7 @@ tmu u_tmu (
     .i_RST_n                (rst_all_n                  ),  //regs init on POR AND manual (p.391)
     .i_CLK                  (i_CLK                      ),
     .i_CEN                  (cen                        ),
-    .i_PCEN                 (pcen                       ),
+    .i_PERI_PCEN            (peri_pcen                  ),
 
     .REG_BUS                (PBUS1_TMU                  ),
 
@@ -465,8 +474,8 @@ dmac u_dmac (
     .i_RST_n                (rst_all_n                  ),  //CHCR/DMAOR/CMT clear on any reset (p.332)
     .i_CLK                  (i_CLK                      ),
     .i_CEN                  (cen                        ),
-    .i_PCEN                 (pcen                       ),
-    .i_CKIO_NCEN            (o_CKIO_NCEN                ),  //DREQ sample = CKIO falling edge (p.363)
+    .i_PERI_PCEN            (peri_pcen                  ),
+    .i_BUS_NCEN             (bus_ncen                   ),  //DREQ sample = CKIO falling edge (p.363)
 
     .REG_BUS                (PBUS2_DMAC                 ),
     .I_BUS                  (IBUS1_DMA                  ),
@@ -584,7 +593,7 @@ intc u_intc (
     .i_RST_n                (rst_all_n                  ),
     .i_CLK                  (i_CLK                      ),
     .i_CEN                  (cen                        ),
-    .i_PCEN                 (pcen                       ),
+    .i_PERI_PCEN            (peri_pcen                  ),
 
     .REG_HI                 (IBUS2_INTC_HI              ),
     .REG_LO                 (IBUS2_INTC_LO              ),

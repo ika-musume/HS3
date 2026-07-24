@@ -25,7 +25,7 @@
     software rules - no standby machinery exists in this SoC yet.
 
     External request (ch0/1, section 11.3.2): DREQ is sampled on the
-    CKIO falling edge (i_CKIO_NCEN); DS selects low-level or falling-
+    CKIO falling edge (i_BUS_NCEN); DS selects low-level or falling-
     edge detection (edge needs DREQ high at the previous sample, fig
     11.19). Cycle-steal withdraws the request at the FIRST transfer,
     burst-edge holds it to the LAST (fig 11.21: sample once, run to
@@ -61,8 +61,8 @@ module dmac (
     input   wire            i_RST_n,
     input   wire            i_CLK,
     input   wire            i_CEN,
-    input   wire            i_PCEN,         //P-phi enable (i_CEN-qualified) for the CMT prescaler
-    input   wire            i_CKIO_NCEN,    //CKIO falling-edge enable: DREQ sample phase (p.363)
+    input   wire            i_PERI_PCEN,    //P-phi enable (i_CEN-qualified) for the CMT prescaler
+    input   wire            i_BUS_NCEN,     //CKIO falling-edge enable: DREQ sample phase (p.363)
 
     /* INTERFACES */
     IBus_2.slave            REG_BUS,        //P bus window 0x04000020-77 (behind the BSC)
@@ -227,17 +227,17 @@ logic   [5:0]   psc;
 always_ff @(posedge i_CLK or negedge i_RST_n) begin
     if(!i_RST_n) psc <= 6'd0;
     else begin if(i_CEN) begin
-        if(i_PCEN) psc <= psc + 6'd1;
+        if(i_PERI_PCEN) psc <= psc + 6'd1;
     end end
 end
 
 logic           cmt_tick;                   //CKS-selected count enable (p.379)
 always_comb begin
     unique case(cks)
-        2'd0:    cmt_tick = i_PCEN & (psc[1:0] == 2'h3);    //P-phi/4
-        2'd1:    cmt_tick = i_PCEN & (psc[2:0] == 3'h7);    //P-phi/8
-        2'd2:    cmt_tick = i_PCEN & (psc[3:0] == 4'hF);    //P-phi/16
-        default: cmt_tick = i_PCEN & (psc[5:0] == 6'h3F);   //P-phi/64
+        2'd0:    cmt_tick = i_PERI_PCEN & (psc[1:0] == 2'h3);    //P-phi/4
+        2'd1:    cmt_tick = i_PERI_PCEN & (psc[2:0] == 3'h7);    //P-phi/8
+        2'd2:    cmt_tick = i_PERI_PCEN & (psc[3:0] == 4'hF);    //P-phi/16
+        default: cmt_tick = i_PERI_PCEN & (psc[5:0] == 6'h3F);   //P-phi/64
     endcase
 end
 
@@ -357,7 +357,7 @@ always_ff @(posedge i_CLK or negedge i_RST_n) begin
     else begin if(i_CEN) begin
         dreq_ff   <= i_DREQ_n;
         dreq_sync <= dreq_ff;
-        if(i_CKIO_NCEN) dreq_smp <= dreq_sync;
+        if(i_BUS_NCEN) dreq_smp <= dreq_sync;
     end end
 end
 wire    [1:0]   dreq_lvl = ~dreq_smp;       //DS=0: low-level detection (p.347)
@@ -646,7 +646,7 @@ always_ff @(posedge i_CLK or negedge i_RST_n) begin
         //DREQ edge pending: same withdraw laws (first transfer / fig 11.21
         //burst-edge runs to DMATCR=0); set needs DREQ high at the prior sample
         for(int k = 0; k < 2; k++) begin
-            if(i_CKIO_NCEN && dreq_smp[k] && !dreq_sync[k])          pend_ext[k] <= 1'b1;
+            if(i_BUS_NCEN && dreq_smp[k] && !dreq_sync[k])          pend_ext[k] <= 1'b1;
             else if(grant_fire && win == k[1:0] && !ch_tm_v[k])      pend_ext[k] <= 1'b0;
             else if(ch_upd[k] && ch_tcr[k] == 24'd1)                 pend_ext[k] <= 1'b0;
         end
@@ -657,7 +657,7 @@ always_ff @(posedge i_CLK or negedge i_RST_n) begin
                 drak_q[k]   <= 1'b1;
                 drak_vis[k] <= 1'b0;
             end
-            else if(i_CKIO_NCEN && drak_q[k]) begin
+            else if(i_BUS_NCEN && drak_q[k]) begin
                 if(drak_vis[k]) drak_q[k] <= 1'b0;      //seen one full CKIO fall
                 else            drak_vis[k] <= 1'b1;
             end

@@ -38,6 +38,7 @@ module HS3_ooc_top (
     output  wire    [28:0]  o_MON_ADDR,
     output  wire    [1:0]   o_MON_SIZE,
     output  wire            o_MON_BURST,
+    output  wire            o_MON_DE,
 
     /* BSC PHYSICAL PINS (shared external bus, table 10.1) */
     output  wire    [25:0]  o_A,
@@ -145,6 +146,7 @@ module HS3_ooc_top (
         .o_MON_ADDR              (o_MON_ADDR                  ),
         .o_MON_SIZE              (o_MON_SIZE                  ),
         .o_MON_BURST             (o_MON_BURST                 ),
+        .o_MON_DE                (o_MON_DE                    ),
 
         .o_A                    (o_A                        ),
         .o_D_O                  (o_D_O                      ),

@@ -559,3 +559,19 @@ Levers that COULD move the plateau (all bigger / need a decision):
   exc-write round trip, priority flatten, MAC mux fold) NOT run: all target
   classes now measured as rotation members, expected value below the tax. Path
   to 100 MHz stays physical: floorplan / speed grade / seed harvesting.
+
+## 2026-07-22 — o_MON_DE integration re-check (Early_Monitor_Guide.md section 8)
+
+- Change: the MON data-enable window flop in bsc.sv (`rd_td_nx` + E_WR
+  next-state + ord FSM mirror into one BCEN-registered sink FF) + the
+  o_MON_DE port through HS3/HS3_ooc_top (wrapper regenerated - the hand
+  top had to route the new port or the cone is swept).
+- Verification: HS3_tb 85/85 (new whole-run DE oracle: pin-truth equality
+  every CKIO cycle, 12486 DE cycles, 3423 units beat-count-checked). Zero
+  law movement, zero IPC change (pure sink FF, no feedback into any cone).
+- Worst multicorner slack @ 10 ns: dse **-2.440 / 80.39 MHz** (single
+  seed). Within the historical band (3-seed re-measure -2.61..-3.20, R4
+  best -2.149); `mon_de` appears in **0/20** critical paths - headline is
+  the familiar fwd_lane_b_agu -> AGU -> exc_handler TEA cone.
+- Verdict: **NEUTRAL, KEPT** - same shape as the proven-neutral o_SB
+  strobe (sink flop off already-registered state).
