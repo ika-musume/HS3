@@ -64,7 +64,9 @@ wire    [7:0]   pth_o, pth_oe;              //PTH pad ring view (TCLK merge)
 
 IBus_1          MEM_BUS();       //generic-port view; tb memory model slaves it
 
-//generic memory port (flat at the chip boundary since the BSC landed)
+//legacy live request view - whitebox taps (assigned after the DUT): the
+//raw-memory models and the hsk harness keep the exact pre-port trigger
+//timing, so bus behavior stays bit-exact (first principle)
 logic           wait_n;          //WAIT pin (auto-stretcher below drives it)
 wire            mem_req, mem_write, mem_burst, mem_rsp_ready;
 wire    [1:0]   mem_size;
@@ -72,11 +74,16 @@ wire    [28:0]  mem_addr_p;
 wire    [6:0]   mem_cs_n;
 wire    [3:0]   mem_wstrb;
 
-//MON transaction monitor / early-transaction sideband (sh3_sideband.md) - oracle checks it whole-run
-wire            mon_req, mon_wr, mon_burst;
+//o_MEM_* transaction port (Early_Monitor_Guide.md): REQ pulse + held
+//fields + per-beat DE pulse + WDATA - the oracles check it whole-run
+wire            mon_req, mon_wr, mon_burst, mon_saddr;
 wire    [1:0]   mon_size;
 wire    [28:0]  mon_addr;
-wire            mon_de;          //data-enable window (Early_Monitor_Guide.md)
+wire    [4:0]   mon_len;
+wire    [3:0]   mon_wstrb_p;
+wire    [6:0]   mon_csn;
+wire    [31:0]  mon_wdata;
+wire            mon_de;          //per-beat pulse: read pop / write push
 
 //the chip's physical external bus (table 10.1) + the one true bidirectional
 //net (controls stay unidirectional; the inout lives only at board level)
@@ -108,28 +115,25 @@ HS3 #(
     .i_CLK                     (clk),
     .i_CEN                     (1'b1),
     .o_CKIO                    (ckio),
-    .o_BUS_PCEN                (bus_pcen),
-    .o_BUS_NCEN                (bus_ncen),
+    .o_CKIO_PCEN               (bus_pcen),
+    .o_CKIO_NCEN               (bus_ncen),
     .i_EXTAL2                  (extal2),
 
-    .o_MEM_REQ                 (mem_req),
-    .o_MEM_WR               (mem_write),
-    .o_MEM_BURST               (mem_burst),
-    .o_MEM_SIZE                (mem_size),
-    .o_MEM_ADDR                (mem_addr_p),
-    .o_MEM_CS_n                (mem_cs_n),
-    .o_MEM_WSTRB               (mem_wstrb),
+    .o_MEM_REQ                 (mon_req),
+    .o_MEM_WR                  (mon_wr),
+    .o_MEM_BURST               (mon_burst),
+    .o_MEM_SIZE                (mon_size),
+    .o_MEM_ADDR                (mon_addr),
+    .o_MEM_LEN                 (mon_len),
+    .o_MEM_SADDR               (mon_saddr),
+    .o_MEM_CS_n                (mon_csn),
+    .o_MEM_WSTRB               (mon_wstrb_p),
+    .o_MEM_DE                  (mon_de),
+    .o_MEM_WDATA               (mon_wdata),
     .i_MEM_READY               (1'b0),
     .i_MEM_RSP_VALID           (raw_mode ? 1'b0 : MEM_BUS.rsp_valid),
     .i_MEM_FAULT               (MEM_BUS.rsp_fault),
     .o_MEM_RSP_READY           (mem_rsp_ready),
-
-    .o_MON_REQ                  (mon_req),
-    .o_MON_WR                   (mon_wr),
-    .o_MON_ADDR                 (mon_addr),
-    .o_MON_SIZE                 (mon_size),
-    .o_MON_BURST                (mon_burst),
-    .o_MON_DE                   (mon_de),
 
     .o_A                       (a_pin),
     .o_D_O                     (d_o),
@@ -205,6 +209,18 @@ HS3 #(
     .o_SCPT_OE                 (),
     .o_SCPT_PU                 ()
 );
+
+//legacy live request view (whitebox): identical expressions to the BSC's
+//internal live view - the retired mirror mux - so every model trigger and
+//law keeps its exact pre-port timing; o_MEM_* carries only committed state
+assign mem_req    = u_dut.u_bsc.ord_busy | (u_dut.IBUS1_BSC.req_valid &
+                    ~u_dut.u_bsc.fe_p4 & (u_dut.u_bsc.fe_gen | u_dut.IBUS1_BSC.req_ready));
+assign mem_write  = u_dut.u_bsc.ord_busy ? u_dut.u_bsc.ord_write : u_dut.IBUS1_BSC.req_write;
+assign mem_burst  = u_dut.u_bsc.ord_busy ? u_dut.u_bsc.ord_burst : u_dut.IBUS1_BSC.req_burst;
+assign mem_size   = u_dut.u_bsc.ord_busy ? u_dut.u_bsc.ord_size  : u_dut.IBUS1_BSC.req_size;
+assign mem_addr_p = u_dut.u_bsc.ord_busy ? u_dut.u_bsc.ord_addr[28:0] : u_dut.u_bsc.fa[28:0];
+assign mem_wstrb  = u_dut.u_bsc.ord_busy ? u_dut.u_bsc.ord_wstrb : u_dut.IBUS1_BSC.req_wstrb;
+assign mem_cs_n   = ~(mem_req ? (7'b000_0001 << mem_addr_p[28:26]) : 7'd0);
 
 //bridge the flat generic port onto the model's bundle (mechanical rename)
 assign MEM_BUS.req_valid = mem_req;
@@ -834,19 +850,22 @@ always @(posedge clk) begin
 end
 
 /*
-    MON match-queue oracle (sh3_sideband.md R1-R3/R8): the pump's
-    matching algorithm as a passive whole-run checker. Every o_MON_REQ pulse
-    enqueues {addr, wr, size, burst}; every external transaction UNIT start
-    (SDRAM engine dispatch / ordinary envelope open, white-box) pops the
-    head and compares. Push runs before pop - the registered strobe and
-    the earliest grid dispatch land the same cycle. The BSC's own reset
-    (WDT flavors included) flushes the queue: a strobed-undispatched op is
-    legitimately dropped (spec R10). mon_qmax = the MEASURED R8 depth bound.
+    MEM match-queue oracle (sh3_sideband.md R1-R3/R8): the pump's
+    matching algorithm as a passive whole-run checker. Every o_MEM_REQ pulse
+    enqueues {addr, wr, size, burst, LEN, SADDR}; every external transaction
+    UNIT start (SDRAM engine dispatch / ordinary envelope open, white-box)
+    pops the head and compares - LEN against the unit's physical beat count
+    recomputed from the latched op (remaining beats for a resumed drain).
+    Push runs before pop - the registered strobe and the earliest grid
+    dispatch land the same cycle. The BSC's own reset (WDT flavors included)
+    flushes the queue: a strobed-undispatched op is legitimately dropped
+    (spec R10). mon_qmax = the MEASURED R8 depth bound.
     Single writer; results checked in test_bus_monitors.
 */
 
-logic   [32:0]  mon_q [0:3];             //{addr[28:0], wr, size[1:0], burst}
-logic   [32:0]  mon_exp;
+logic   [38:0]  mon_q [0:3];             //{addr[28:0], wr, size[1:0], burst, len[4:0], saddr}
+logic   [38:0]  mon_exp;
+logic   [4:0]   mon_exp_len;
 logic           mon_ordbusy_z = 1'b0;    //ord_busy delay for the rise detect
 integer         mon_qn      = 0;         //queue occupancy
 integer         mon_qmax    = 0;         //occupancy high-water (measured R8)
@@ -867,18 +886,38 @@ always @(posedge clk) begin
                 mon_err = mon_err + 1;
                 mon_qn  = 0;
             end
-            mon_q[mon_qn] = {mon_addr, mon_wr, mon_size, mon_burst};
+            mon_q[mon_qn] = {mon_addr, mon_wr, mon_size, mon_burst, mon_len, mon_saddr};
             mon_qn       = mon_qn + 1;
             mon_pushes   = mon_pushes + 1;
             if(mon_qn > mon_qmax) mon_qmax = mon_qn;
         end
         if((u_dut.u_bsc.eng_start_tk && !u_dut.u_bsc.eng_op_mrs) ||
            (u_dut.u_bsc.ord_busy && !mon_ordbusy_z)) begin
-            mon_exp = u_dut.u_bsc.eng_start_tk ?
-                {u_dut.u_bsc.eng_addr[28:0], u_dut.u_bsc.eng_op_write,
-                 u_dut.u_bsc.eng_op_size,    u_dut.u_bsc.eng_op_burst} :
-                {u_dut.u_bsc.ord_addr[28:0], u_dut.u_bsc.ord_write,
-                 u_dut.u_bsc.ord_size,       u_dut.u_bsc.ord_burst};
+            if(u_dut.u_bsc.eng_start_tk) begin
+                //physical beats of the dispatched op (remaining, for a resume)
+                mon_exp_len = u_dut.u_bsc.eng_op_burst ?
+                                  (u_dut.u_bsc.eng_sd16 ?
+                                      5'd8 - {2'd0, u_dut.u_bsc.eng_addr[3:1]} :
+                                      5'd4 - {3'd0, u_dut.u_bsc.eng_addr[3:2]}) :
+                              (u_dut.u_bsc.eng_sd16 &&
+                               u_dut.u_bsc.eng_op_size == 2'd2) ? 5'd2 : 5'd1;
+                mon_exp = {u_dut.u_bsc.eng_addr[28:0], u_dut.u_bsc.eng_op_write,
+                           u_dut.u_bsc.eng_op_size,    u_dut.u_bsc.eng_op_burst,
+                           mon_exp_len, 1'b0};
+            end
+            else begin
+                mon_exp_len = u_dut.u_bsc.ord_burst ?
+                                  (u_dut.u_bsc.ord_w8  ? 5'd16 :
+                                   u_dut.u_bsc.ord_w16 ? 5'd8  : 5'd4) :
+                              u_dut.u_bsc.ord_w8 ?
+                                  (u_dut.u_bsc.ord_size == 2'd2 ? 5'd4 :
+                                   u_dut.u_bsc.ord_size == 2'd1 ? 5'd2 : 5'd1) :
+                              u_dut.u_bsc.ord_w16 ?
+                                  (u_dut.u_bsc.ord_size == 2'd2 ? 5'd2 : 5'd1) : 5'd1;
+                mon_exp = {u_dut.u_bsc.ord_addr[28:0], u_dut.u_bsc.ord_write,
+                           u_dut.u_bsc.ord_size,       u_dut.u_bsc.ord_burst,
+                           mon_exp_len, u_dut.u_bsc.ord_saddr};
+            end
             if(mon_qn == 0) begin
                 $display("      [FAIL] MON oracle: unit start with empty queue (exp=%h)", mon_exp);
                 mon_err = mon_err + 1;
@@ -897,54 +936,63 @@ always @(posedge clk) begin
 end
 
 /*
-    MON DE window oracle (docs/Early_Monitor_Guide.md section 8): the six
-    passive whole-run checks of the o_MON_DE data-enable rail.
-      (1) REQ pulses never merge  (2) DE moves only at CKIO rises
-      (3) DE == pin window truth every CKIO cycle AND per-unit asserted-
-          cycle count == physical beat count  (4) REQ/DE overlap only in
-          the own-unit ordinary-write-T1 shape, no unit-less (orphan) DE
-      (5) refresh/MRS/BRQ/self-entry engine bursts are DE-silent
-      (6) MON dead across reset (queue flush is the oracle above).
-    Truth is sampled in the FIRST core cycle of each CKIO cycle only: the
-    generic-port hsk fast path may rewrite ord state at the MID-cycle edge
-    (documented off-grid chop) which the BUS_PCEN-locked DE cannot follow.
-    Per-unit counts skip GEN units with the hsk leg live (!raw_mode chops
-    pin cycles); an engine write burst may yield mid-run (the resumed
-    continuation unit re-strobes the remaining beats, guide section 2), so
-    its bound is 1..expected instead of exact. Single writer; results
-    checked in test_bus_monitors.
+    MEM DE pulse oracle (docs/Early_Monitor_Guide.md sections 4/9): the six
+    passive whole-run checks of the o_MEM_DE per-beat pulse rail.
+      (1) REQ pulses never merge
+      (2) DE == consume/accept truth EVENT-FOR-EVENT: a one-cycle
+          registered twin built from whitebox pin-sample (ord T2 fall /
+          SDRAM capture rise), hsk-consume and write-accept truth
+      (3) unit framing [REQ(N), REQ(N+1)): every DE pulse belongs to an
+          open unit; READ units deliver exactly LEN pops - checked for
+          SDRAM units always and GEN units in raw mode only (the hsk leg
+          consumes logical beats and its faults abort tails); write-unit
+          push counts are covered by the event twin (a resumed drain
+          re-REQs with its beats already pushed, so no per-unit bound)
+      (4) REQ coincides with DE only as a write unit's own head push
+      (5) silent engine bursts (refresh/MRS/BRQ/self-entry) pop nothing -
+          drain continuation PUSHES may legally land there (write-envelope
+          accepts are not engine-gated)
+      (6) MEM port dead across reset (queue flush is the oracle above).
+    Single writer; results checked in test_bus_monitors.
 */
 
-//window truth = the trackers that drive the pins themselves. The write-T1
-//term drops stalled shapes (an hsk stall entry can leave BS low off-grid)
-wire mon_de_truth = u_dut.u_bsc.sd_dq_oe | u_dut.u_bsc.rd_lat |
-                    (u_dut.u_bsc.ord_pins & u_dut.u_bsc.ord_write &
-                     ~u_dut.u_bsc.ord_bs_n & ~u_dut.u_bsc.ordp_stall) |
-                    (u_dut.u_bsc.ord_pins & ~u_dut.u_bsc.ord_write &
-                     u_dut.u_bsc.ord_t2);
+//consume/accept truth: whitebox twins of the BSC's own data-motion enables
+wire tb_hskbt = u_dut.u_bsc.gen_ext_done && u_dut.u_bsc.ordp_env &&
+                u_dut.u_bsc.ord_busy && !u_dut.u_bsc.ordp_stall;
+wire tb_wpush = u_dut.IBUS1_BSC.req_valid && u_dut.IBUS1_BSC.req_ready &&
+                u_dut.IBUS1_BSC.req_write &&
+                (u_dut.u_bsc.fe_gen || (u_dut.u_bsc.fe_eng && !u_dut.u_bsc.fe_sdmr));
+wire tb_popsd = bus_pcen && u_dut.u_bsc.rd_lat;
+wire tb_popot = bus_ncen && u_dut.u_bsc.ord_busy && u_dut.u_bsc.ord_run &&
+                !u_dut.u_bsc.ord_done && u_dut.u_bsc.ord_t2 &&
+                !u_dut.u_bsc.ord_write && !tb_hskbt;
+wire tb_pophb = tb_hskbt && !u_dut.u_bsc.ord_write;
+wire tb_pophs = u_dut.u_bsc.gen_ext_done && u_dut.u_bsc.fe_rsp_done &&
+                u_dut.u_bsc.ord_busy && !u_dut.u_bsc.gen_bctx &&
+                !u_dut.u_bsc.ord_write && (u_dut.u_bsc.owner_q == 2'd0);    //OWN_GEN
 
 logic           mon_req_z    = 1'b0;    //pulse-merge detect
-logic           mon_de_z     = 1'b0;    //off-grid transition detect
-logic           mon_pcen_z   = 1'b0;    //the edge just passed was a CKIO rise
+logic           mon_expde_z  = 1'b0;    //expected DE: one-cycle registered twin
 logic           mon_rst_z    = 1'b0;    //reset view one sample back (check 6)
 logic   [4:0]   mon_est_v;              //engine state, numeric view (decl order)
-logic           mon_ordbz2   = 1'b0;    //private ord_busy delay (pop detect)
+logic   [4:0]   mon_est_z    = 5'd0;    //cause-time view: the registered pulse
+                                        //trails its consume edge by one cycle
+logic           mon_pinpop_z = 1'b0;    //cause was a PIN sample (not hsk/push)
 integer         mon_de_err   = 0;       //DE oracle failures (must end 0)
-integer         mon_de_cyc   = 0;       //asserted DE CKIO cycles (coverage)
-integer         mon_u_exp    = 0;       //open unit: expected physical beats
-integer         mon_u_cnt    = 0;       //open unit: DE cycles delivered
+integer         mon_de_cyc   = 0;       //DE pulses seen (coverage)
+integer         mon_u_exp    = 0;       //open unit: expected pops (= port LEN)
+integer         mon_u_cnt    = 0;       //open unit: DE pulses delivered
 logic           mon_u_open   = 1'b0;    //a unit is being counted
-logic           mon_u_chk    = 1'b0;    //count compare valid for this unit
-logic           mon_u_wrb    = 1'b0;    //engine write burst (may yield mid-run)
+logic           mon_u_wr     = 1'b0;    //open unit direction (held o_MEM_WR)
+logic           mon_u_chk    = 1'b0;    //pop-count compare valid for this unit
 integer         mon_u_units  = 0;       //units count-checked (coverage)
 
-task automatic mon_u_close;             //compare the closing unit's beat count
+task automatic mon_u_close;             //compare the closing READ unit's pop count
     begin
         if(mon_u_open && mon_u_chk) begin
-            if(mon_u_wrb ? !(mon_u_cnt >= 1 && mon_u_cnt <= mon_u_exp)
-                         : (mon_u_cnt != mon_u_exp)) begin
-                $display("      [FAIL] MON DE: unit beat count got=%0d exp=%0d (wrb=%0d)",
-                         mon_u_cnt, mon_u_exp, mon_u_wrb);
+            if(mon_u_cnt != mon_u_exp) begin
+                $display("      [FAIL] MEM DE: unit pop count got=%0d exp=%0d",
+                         mon_u_cnt, mon_u_exp);
                 mon_de_err = mon_de_err + 1;
             end
             mon_u_units = mon_u_units + 1;
@@ -955,97 +1003,74 @@ endtask
 
 always @(posedge clk) begin
     if(!u_dut.u_bsc.i_RST_n) begin
-        //(6) MON dead across a HELD reset; the assertion instant itself is
+        //(6) MEM dead across a HELD reset; the assertion instant itself is
         //skipped (the tb drives rst_n blocking in the same timestep, racing
         //the async clear) - the open unit is legitimately dropped (R10)
         if(!mon_rst_z && (mon_req || mon_de)) begin
-            $display("      [FAIL] MON DE: REQ/DE alive under reset");
+            $display("      [FAIL] MEM DE: REQ/DE alive under reset");
             mon_de_err = mon_de_err + 1;
         end
-        mon_u_open = 1'b0;
-        mon_req_z  = 1'b0;
-        mon_de_z   = 1'b0;
+        mon_u_open  = 1'b0;
+        mon_req_z   = 1'b0;
+        mon_expde_z = 1'b0;
     end
     else begin
         mon_est_v = u_dut.u_bsc.est;
         //(1) two units never share one REQ pulse
         if(mon_req && mon_req_z) begin
-            $display("      [FAIL] MON DE: REQ pulses merged");
+            $display("      [FAIL] MEM DE: REQ pulses merged");
             mon_de_err = mon_de_err + 1;
         end
-        //(2) DE transitions only at CKIO rising edges (the BUS_PCEN grid)
-        if((mon_de !== mon_de_z) && !mon_pcen_z) begin
-            $display("      [FAIL] MON DE: transition off the BUS_PCEN grid");
+        //(2) pulse == consume/accept truth, event-for-event
+        if(mon_de !== mon_expde_z) begin
+            $display("      [FAIL] MEM DE: pulse != event truth (de=%b exp=%b est=%0d)",
+                     mon_de, mon_expde_z, mon_est_v);
             mon_de_err = mon_de_err + 1;
         end
-        //(4a) REQ over DE only in the own-unit ordinary-write-T1 shape
-        if(mon_req && mon_de &&
-           !(u_dut.u_bsc.ord_pins && u_dut.u_bsc.ord_write && !u_dut.u_bsc.ord_bs_n)) begin
-            $display("      [FAIL] MON DE: REQ overlaps a foreign DE window");
+        //(4) REQ coincident with DE = the new unit's own head push only
+        if(mon_req && mon_de && !mon_wr) begin
+            $display("      [FAIL] MEM DE: REQ overlaps a read pop");
             mon_de_err = mon_de_err + 1;
         end
-        //(5) silent engine bursts own the pins with DE low (numeric est:
+        //(5) no PIN-SAMPLE pops inside silent engine bursts (numeric est:
         //MRS=1-4, BRQ=16-17, REF=18-21, SLF entry=22-24; E_SLF/E_SLF_EXIT
-        //excluded - ordinary cycles may legitimately run under those)
-        if(mon_de && ((mon_est_v >= 5'd16 && mon_est_v <= 5'd24) ||
-                      (mon_est_v >= 5'd1  && mon_est_v <= 5'd4))) begin
-            $display("      [FAIL] MON DE: DE high in a silent engine burst (est=%0d)", mon_est_v);
+        //excluded). Judged at the pulse's CAUSE time (one sample back) and
+        //for pin samples only: hsk completions and write pushes are off-pin
+        //events that may legally land under a concurrent refresh burst
+        if(mon_pinpop_z &&
+           ((mon_est_z >= 5'd16 && mon_est_z <= 5'd24) ||
+            (mon_est_z >= 5'd1  && mon_est_z <= 5'd4))) begin
+            $display("      [FAIL] MEM DE: pin pop in a silent engine burst (est=%0d)", mon_est_z);
             mon_de_err = mon_de_err + 1;
         end
 
-        //unit-start pops (the match-queue oracle's events): close the previous
-        //unit's count, open the new one with its expected physical beat count
-        if(u_dut.u_bsc.eng_start_tk && !u_dut.u_bsc.eng_op_mrs) begin
+        //(3) unit framing: REQ closes the previous unit and opens the next;
+        //a same-cycle DE pulse is the NEW unit's own head push
+        if(mon_req) begin
             mon_u_close;
-            mon_u_wrb  = u_dut.u_bsc.eng_op_write && u_dut.u_bsc.eng_op_burst;
-            mon_u_exp  = u_dut.u_bsc.eng_op_burst ?
-                             (u_dut.u_bsc.eng_sd16 ? (8 - u_dut.u_bsc.eng_addr[3:1])
-                                                   : (4 - u_dut.u_bsc.eng_addr[3:2])) :
-                         (u_dut.u_bsc.eng_sd16 &&
-                          u_dut.u_bsc.eng_op_size == 2'd2) ? 2 : 1;
+            mon_u_wr   = mon_wr;
+            mon_u_exp  = mon_len;       //delivery must match the PORT's LEN
             mon_u_cnt  = 0;
-            mon_u_chk  = 1'b1;          //engine units always complete on pins
+            mon_u_chk  = !mon_wr &&
+                         (((mon_addr[28:26] == 3'd2) && u_dut.u_bsc.a2_sdram) ||
+                          ((mon_addr[28:26] == 3'd3) && u_dut.u_bsc.a3_sdram) ||
+                          (raw_mode != 0));
             mon_u_open = 1'b1;
         end
-        else if(u_dut.u_bsc.ord_busy && !mon_ordbz2) begin
-            mon_u_close;
-            mon_u_wrb  = 1'b0;
-            if(u_dut.u_bsc.ord_burst)   //envelope beats are longwords (full subs)
-                mon_u_exp = 4 * (u_dut.u_bsc.ord_w8 ? 4 : u_dut.u_bsc.ord_w16 ? 2 : 1);
-            else                        //single: sub-cycles owed by size vs width
-                mon_u_exp = u_dut.u_bsc.ord_w8 ?
-                                (u_dut.u_bsc.ord_size == 2'd2 ? 4 :
-                                 u_dut.u_bsc.ord_size == 2'd1 ? 2 : 1) :
-                            u_dut.u_bsc.ord_w16 ?
-                                (u_dut.u_bsc.ord_size == 2'd2 ? 2 : 1) : 1;
-            mon_u_cnt  = 0;
-            mon_u_chk  = raw_mode;      //the hsk leg chops pin cycles off-grid
-            mon_u_open = 1'b1;
-        end
-
-        //(3) once per CKIO cycle, on its first core cycle: DE == pin truth;
-        //(4b) every asserted cycle belongs to a strobed+dispatched unit
-        if(mon_pcen_z) begin
-            if(mon_de !== mon_de_truth) begin
-                $display("      [FAIL] MON DE: window != pin truth (de=%b truth=%b est=%0d)",
-                         mon_de, mon_de_truth, mon_est_v);
+        if(mon_de) begin
+            mon_de_cyc = mon_de_cyc + 1;
+            if(mon_u_open) mon_u_cnt = mon_u_cnt + 1;
+            else begin
+                $display("      [FAIL] MEM DE: orphan DE pulse (no unit open)");
                 mon_de_err = mon_de_err + 1;
             end
-            if(mon_de) begin
-                mon_de_cyc = mon_de_cyc + 1;
-                if(mon_u_open) mon_u_cnt = mon_u_cnt + 1;
-                else begin
-                    $display("      [FAIL] MON DE: orphan DE cycle (no unit open)");
-                    mon_de_err = mon_de_err + 1;
-                end
-            end
         end
 
-        mon_req_z = mon_req;
-        mon_de_z  = mon_de;
+        mon_req_z    = mon_req;
+        mon_expde_z  = tb_wpush | tb_popsd | tb_popot | tb_pophb | tb_pophs;
+        mon_pinpop_z = tb_popsd | tb_popot;
+        mon_est_z    = mon_est_v;
     end
-    mon_ordbz2 = u_dut.u_bsc.ord_busy;
-    mon_pcen_z = bus_pcen;
     mon_rst_z  = u_dut.u_bsc.i_RST_n;
 end
 
@@ -3466,15 +3491,15 @@ task automatic test_bus_monitors;
         chk_true("no D-bus driver overlap",         !dbus_viol);
         chk_true("no addr/data movement under WE",  !we_shape_viol);
         end_test;
-        begin_test("MON match-queue oracle: strobe==unit 1:1, in order, fields exact (whole run)");
+        begin_test("MEM match-queue oracle: REQ==unit 1:1, in order, fields+LEN exact (whole run)");
         $display("      (info) %0d strobes matched, measured R8 depth = %0d, reset-flushed = %0d",
                  mon_pushes, mon_qmax, mon_flushed);
         chk_true("no oracle mismatches",            mon_err == 0);
         chk_true("strobe coverage nonzero",         mon_pushes > 1000);
         chk_true("R8 outstanding depth within 2",   mon_qmax <= 2);
         end_test;
-        begin_test("MON DE window oracle: BUS_PCEN grid, pin-truth equality, per-unit beat counts (whole run)");
-        $display("      (info) %0d asserted DE CKIO cycles, %0d units count-checked",
+        begin_test("MEM DE pulse oracle: event truth, unit framing, per-unit pop counts (whole run)");
+        $display("      (info) %0d DE pulses, %0d units count-checked",
                  mon_de_cyc, mon_u_units);
         chk_true("no DE oracle failures",           mon_de_err == 0);
         chk_true("DE cycle coverage nonzero",       mon_de_cyc > 1000);

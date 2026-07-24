@@ -575,3 +575,32 @@ Levers that COULD move the plateau (all bigger / need a decision):
   the familiar fwd_lane_b_agu -> AGU -> exc_handler TEA cone.
 - Verdict: **NEUTRAL, KEPT** - same shape as the proven-neutral o_SB
   strobe (sink flop off already-registered state).
+
+## 2026-07-25 — o_MEM_* merged transaction port re-measure (3 seeds) — NEUTRAL
+
+- Change: the o_MON_*/o_MEM_* merge in bsc.sv (docs/Early_Monitor_Guide.md):
+  REQ pulse + held fields gain LEN[4:0]/SADDR/registered WSTRB/CS_n, the DE
+  window mirror is DELETED (replaced by the registered pulse OR of the BSC's
+  own consume/accept enables), WDATA rail added, the combinational live
+  mirror + cs_area generate retired. ~45 new FF bits, all off existing
+  enables, no feedback into any cone. HS3/HS3_ooc_top port lists updated
+  (o_MON_* gone, LEN/SADDR/DE/WDATA at the registered boundary).
+- Verification: HS3_tb 85/85 + cpu_core_tb 103/103, zero law movement
+  (first principle held; tb models moved to whitebox live-view taps).
+- Worst multicorner slack @ 10 ns (vs R4 same-seed): dse −2.72 (−0.04),
+  s4 −2.641 (−0.49), s5 −2.982 (−0.57). Mean −2.781 vs R4 −2.414 (−0.37) —
+  inside the measured plateau-tax band (−0.3..−0.7, paid by every change
+  shape incl. identical-RTL re-anchors) and the historical identical-RTL
+  swing (−2.61..−3.20). Restricted Fmax 78.62 / 79.11 / 77.03 MHz.
+- Cones: **mon_* in 0/20 paths on all three seeds.** Headliners are the
+  catalogued plateau families re-rolled: dse = advance front →
+  fetch_pending_pc/pair_pc/o_TEA + cache FSM→S_IDLE; s4 = fwd_wbsel/fwd_dep
+  → exma.gpr0_data + S_DRAIN_REQ→S_IDLE; s5 = ma_seq second_access/req_sent
+  + fwd_wbsel_a_agu → cache S_IDLE. The u_bsc cells inside dse/s4 S_IDLE
+  paths (fe_sdmr~0/comb~12/fe_gen) are the PRE-EXISTING accept handshake
+  (fe_gen → req_ready → cache next-state, the R8-era S_IDLE family), not
+  new port logic.
+- Resources: registers 7,901 / 7,898 / 7,932, memory bits 158,336 (=).
+- Verdict: **NEUTRAL, KEPT** — same shape as the o_SB strobe and o_MON_DE
+  precedents (dedicated FFs off already-registered state). Campaign remains
+  closed at R4; this is a bookkeeping re-measure, not a round.
