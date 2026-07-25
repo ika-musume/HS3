@@ -165,7 +165,7 @@ assign  gpr_active_bank1  = i_SR[30] & i_SR[29]; //privileged mode and SR.RB sel
 //can produce (the sr_wr_wb arm); RTE/exception-entry SR writes redirect + flush IF/ID,
 //and r_bank1 re-converges off the live SR before any refetched packet reaches ID.
 //Sim-asserted == gpr_active_bank1 on every live packet. Sequential block rides below
-//the bank1_nx assign (declaration-before-use, Quartus 17).
+//the bank1_nx assign.
 logic           r_bank1;
 
 //NEXT-cycle read-address cone (nx_read0/1): what IF/ID will hold during the read-data
@@ -298,26 +298,40 @@ logic   [31:0]  fwd_shadow_a, fwd_shadow_b, fwd_shadow_st; //deposited operand w
 
 assign  o_FETCH_PC = fetch_pc;
 
-// gpr_read_address_a/b are the BRAM read addresses for the n- and m-field operands.
-// active_gpr_id() and gpr_bram_address() yield identical encodings (see pp.19-22), so
-// read_address_a is just dec_n_id; reusing it drops a redundant n-field decode. The
-// bank-swap form (LDC/STC Rm_BANK) and the port-0 assignment are PREDECODED at fetch
-// (ifid.pd.rib / ifid.pd.need_a, bank-free - see pd_need_n): the old ID-time 3-source
-// hz-vs-dec compare cone fed the cen_n read-address captures (gpr_read_ctx / RAM
-// address input regs) - the decode->ctx half-cycle limiter. Now those captures see a
-// registered 2-bit select over the 1-LUT bank-qualified ids. The old cone's only other
-// product (gpr_read_ports_ready) was constant: two line addresses can never demand
-// more than two ports, so the count<=2 guard is deleted, not moved.
+//gpr_read_address_a/b are the BRAM read addresses for the n- and m-field operands.
+//active_gpr_id() and gpr_bram_address() yield identical encodings (see pp.19-22), so
+//read_address_a is just dec_n_id; reusing it drops a redundant n-field decode. The
+//bank-swap form (LDC/STC Rm_BANK) and the port-0 assignment are PREDECODED at fetch
+//(ifid.pd.rib / ifid.pd.need_a, bank-free - see pd_need_n): the old ID-time 3-source
+//hz-vs-dec compare cone fed the cen_n read-address captures (gpr_read_ctx / RAM
+//address input regs) - the decode->ctx half-cycle limiter. Now those captures see a
+//registered 2-bit select over the 1-LUT bank-qualified ids.
 assign  reads_inactive_bank = ifid.pd.rib;
 assign  gpr_read_address_a = dec_n_id;
 assign  gpr_read_address_b = reads_inactive_bank ? dec_bank_id : dec_m_id;
 assign  gpr_read0_address  = ifid.pd.need_a ? gpr_read_address_a : gpr_read_address_b;
 assign  gpr_read1_address  = gpr_read_address_b;
 
+always_comb begin
+    //ctrl_reg samples the registered WB packet on its own enabled edge.
+    o_CTRL_WE  = wb_valid && !i_REDIRECT_VALID && !mawb.fault &&
+                 mawb.ctrl_dst != CTRL_NONE;
+    o_CTRL_DST = mawb.ctrl_dst;
+    o_CTRL_DATA= mawb.ctrl_data;
+
+    o_SR_T_WE  = wb_valid && !i_REDIRECT_VALID && !mawb.fault &&
+                 mawb.ctrl_dst == CTRL_NONE && mawb.t_we;
+    o_SR_T     = mawb.t_data;
+    o_SR_S_WE  = wb_valid && !i_REDIRECT_VALID && !mawb.fault &&
+                 mawb.ctrl_dst == CTRL_NONE && mawb.s_we;
+    o_SR_S     = mawb.s_data;
+    o_SR_MQ_WE = (wb_valid && !i_REDIRECT_VALID && !mawb.fault &&
+                  mawb.ctrl_dst == CTRL_NONE) ? mawb.mq_we : 2'b00;
+    o_SR_MQ    = mawb.mq_data;
+end
+
+`ifdef HS3_TEST
 // synthesis translate_off
-//Exhaustive one-shot check: the FLAT need_a decode (pd_route) must equal the selector-
-//composed form (pd_need_n over the routed sources) for all 65536 opcodes. Together with
-//the live check below (selector form == old ID-time cone) the equivalence chain closes.
 initial begin
     for(int i = 0; i < 65536; i++) begin
         pd_route_t p;
@@ -332,6 +346,7 @@ initial begin
     end
 end
 
+
 //Reference-model check: the fetch-time bank-free predecode must equal the old ID-time
 //bank-qualified port classification for every live packet, in every bank state.
 always_comb begin
@@ -343,6 +358,7 @@ always_comb begin
     if(ifid.valid && ifid.pd.need_a !== ref_need_a)
         $fatal(1, "pd.need_a mismatch: inst=%04x pd=%b ref=%b", ifid.inst, ifid.pd.need_a, ref_need_a);
 end
+
 
 //Reference-model checks for the fetch-time HAZARD classification bits: each must equal
 //the old ID-time expression for every live packet (the 64-test suite covers the classes).
@@ -396,25 +412,8 @@ always_comb begin
         $fatal(1, "r_bank1 stale under live packet: r=%b sr=%b", r_bank1, gpr_active_bank1);
 end
 // synthesis translate_on
+`endif
 
-
-always_comb begin
-    //ctrl_reg samples the registered WB packet on its own enabled edge.
-    o_CTRL_WE  = wb_valid && !i_REDIRECT_VALID && !mawb.fault &&
-                 mawb.ctrl_dst != CTRL_NONE;
-    o_CTRL_DST = mawb.ctrl_dst;
-    o_CTRL_DATA= mawb.ctrl_data;
-
-    o_SR_T_WE  = wb_valid && !i_REDIRECT_VALID && !mawb.fault &&
-                 mawb.ctrl_dst == CTRL_NONE && mawb.t_we;
-    o_SR_T     = mawb.t_data;
-    o_SR_S_WE  = wb_valid && !i_REDIRECT_VALID && !mawb.fault &&
-                 mawb.ctrl_dst == CTRL_NONE && mawb.s_we;
-    o_SR_S     = mawb.s_data;
-    o_SR_MQ_WE = (wb_valid && !i_REDIRECT_VALID && !mawb.fault &&
-                  mawb.ctrl_dst == CTRL_NONE) ? mawb.mq_we : 2'b00;
-    o_SR_MQ    = mawb.mq_data;
-end
 
 
 ///////////////////////////////////////////////////////////
@@ -444,16 +443,16 @@ logic           early_i_req_raw_valid; //pre-IF request before D-priority suppre
 //pipeline's former separate I-bus / D-bus VIEWS so the fetch and MA logic below stay intact.
 //l_is_data and the L_BUS request drive are assigned lower down (after u_ma_seq, where
 //ma_second_access is declared). All plain scalars: the dual-CEN 4-rail machinery is gone.
-wire            i_rsp_valid = L_BUS.rsp_valid &&  L_BUS.rsp_fetch;  //fetch response present
+wire            i_rsp_valid = L_BUS.rsp_valid &&  L_BUS.rsp_fetch; //fetch response present
 wire    [15:0]  i_rsp_inst  = L_BUS.rsp_inst;                      //fetched opcode (I-only field)
 wire            i_rsp_fault = L_BUS.rsp_ifault;                    //registered-flag product
-wire            d_rsp_valid = L_BUS.rsp_valid && !L_BUS.rsp_fetch;  //data response present
+wire            d_rsp_valid = L_BUS.rsp_valid && !L_BUS.rsp_fetch; //data response present
 wire    [31:0]  d_rsp_rdata = L_BUS.rsp_rdata;
 wire            d_rsp_fault = L_BUS.rsp_dfault;                    //registered-flag product
-logic           i_rsp_ready;           //fetch consume (was I_BUS.rsp_ready)
-logic           d_rsp_ready;           //MA    consume (was D_BUS.rsp_ready)
-logic           if_accept;             //fetch response consumed this cycle
-logic           i_req_fire;            //fetch issued this cycle (0 on a data cycle)
+logic           i_rsp_ready;                                       //fetch consume (was I_BUS.rsp_ready)
+logic           d_rsp_ready;                                       //MA    consume (was D_BUS.rsp_ready)
+logic           if_accept;                                         //fetch response consumed this cycle
+logic           i_req_fire;                                        //fetch issued this cycle (0 on a data cycle)
 
 assign  redirect_active = i_REDIRECT_VALID || branch_redirect;
 
@@ -471,6 +470,7 @@ pd_route_t      pd_fetch_sib;
 assign  pd_fetch_sib = pd_route(i_rsp_sib);
 
 
+
 ///////////////////////////////////////////////////////////
 //////  Instruction Decode
 ////
@@ -482,9 +482,9 @@ assign  pd_fetch_sib = pd_route(i_rsp_sib);
     Every unknown pattern remains illegal by default.
 */
 
-logic   [3:0]   dec_n, dec_m;                   //encoded Rn and Rm fields
+logic   [3:0]   dec_n, dec_m;                  //encoded Rn and Rm fields
 logic   [4:0]   dec_n_id, dec_m_id, dec_r0_id; //physical GPR identities
-logic   [4:0]   dec_bank_id;                    //inactive R0_BANK-R7_BANK identity
+logic   [4:0]   dec_bank_id;                   //inactive R0_BANK-R7_BANK identity
 
 //Hazard-path source identities rebuilt from the PREDECODED selectors (ifid.pd) and the
 //current-bank dec_*_id. This 4:1 qualify (one LUT level) replaces the ~3-level decode on
@@ -494,6 +494,7 @@ logic   [4:0]   dec_bank_id;                    //inactive R0_BANK-R7_BANK ident
 //next-read addresses); the old live recompute survives only as the sim reference.
 logic   [4:0]   hz_a_id, hz_b_id, hz_st_id;
 
+`ifdef HS3_TEST
 // synthesis translate_off
 //The registered ids must equal the live bank-qualified recompute on every LIVE packet.
 //(Not every cycle: a mid-run reset clears these flops while the R7-unreset IF/ID data
@@ -507,9 +508,11 @@ always_comb begin
         $fatal(1, "hz_st_id stale: inst=%04x", ifid.inst);
 end
 // synthesis translate_on
+`endif
 
 assign  dec_n        = ifid.inst[11:8];
 assign  dec_m        = ifid.inst[7:4];
+
 //Bank select = the REGISTERED local mirror (see r_bank1), not the live cross-module o_SR.
 assign  dec_n_id     = active_gpr_id(dec_n, r_bank1);
 assign  dec_m_id     = active_gpr_id(dec_m, r_bank1);
@@ -518,7 +521,7 @@ assign  dec_bank_id  = inactive_bank_id(ifid.inst[6:4], r_bank1);
 
 always_comb begin
     //Defaults describe an illegal, side-effect-free instruction packet.
-    id_decode = '0;
+    id_decode               = '0;
     id_decode.valid         = ifid.valid;
     id_decode.pc            = ifid.pc;
     id_decode.inst          = ifid.inst;
@@ -1136,11 +1139,13 @@ logic           ma_cpl_now;       //completes with no response (early registered
 logic           ma_cpl_on_rsp;    //completes when the D response arrives (early product)
 logic           ma_cpl_on_frsp;   //aborts on a FAULTING D response - MAC/RMW (early product)
 logic           wb_valid;         //registered WB packet commits on this i_CLK_p edge
+
 //Force the packet-register load enables onto the DFF dedicated clock-enable pin
 //instead of a LUT feedback mux; see Quartus direct_enable. The loads above are now
 //clean "if(allow) reg <= data" forms so the attribute can bind.
-(* direct_enable *) logic exma_allow;       //EX/MA can accept a replacement packet
-(* direct_enable *) logic idex_allow;       //ID/EX can accept a replacement packet
+(* direct_enable *) logic exma_allow; //EX/MA can accept a replacement packet
+(* direct_enable *) logic idex_allow; //ID/EX can accept a replacement packet
+
 logic           id_hazard;        //decoded instruction must remain in IF/ID
 logic           id_hazard_early;  //hazard terms free of ma_complete (rail-invariant)
 logic           hz_ld_exma_hit;   //exma-load source match, completion NOT yet applied
@@ -1164,31 +1169,34 @@ logic           ctrl_misc_write_pending;//older GBR/VBR/SSR/SPC/PR write still u
 
 logic  retire_int_defer;   //retiree was a delayed branch: slot still owed (pair atomicity)
 
-assign data_response = data_req_sent && d_rsp_valid;
-assign wb_valid      = mawb.valid;
-assign wb_fault_pending = wb_valid && mawb.fault;
+assign  data_response = data_req_sent && d_rsp_valid;
+assign  wb_valid      = mawb.valid;
+assign  wb_fault_pending = wb_valid && mawb.fault;
+
 //Interrupt-acceptance defer (exc_handler): killing an ACCEPTED D access orphans its
 //response - the held rsp_valid_d wedges the shared L-bus response channel and starves
 //every later fetch - and killing between the legs of a locked RMW / MAC pair splits an
 //indivisible sequence (dangling bus lock). Acceptance waits until the op leaves MA; a
 //not-yet-granted request stays killable (L-bus withdrawal is legal). Registered terms.
-wire   ma_inflight   = data_req_sent || (exma.valid && !exma.fault && ma_second_access);
+wire            ma_inflight   = data_req_sent || (exma.valid && !exma.fault && ma_second_access);
+
 //The pipe OWNS the whole acceptance-boundary invariant and exports ONE bit; the
 //exception handler no longer reassembles it from three raw pipeline signals.
-assign o_INT_BOUNDARY = o_RETIRE_VALID && !retire_int_defer && !ma_inflight;
+assign  o_INT_BOUNDARY = o_RETIRE_VALID && !retire_int_defer && !ma_inflight;
+
 //!i_REDIRECT_VALID: the packet in WB at an interrupt-redirect edge is KILLED (its
 //retirement and every other commit lane are suppressed) - without this gate its GPR
 //write leaked and the resumed instruction ran twice (interrupt-sweep golden).
-assign gpr_wb0_we    = wb_valid && !i_REDIRECT_VALID && !mawb.fault && mawb.gpr0_we;
-assign gpr_wb1_we    = wb_valid && !i_REDIRECT_VALID && !mawb.fault && mawb.gpr1_we;
-assign gpr_wb0_dst   = mawb.gpr0_dst;
-assign gpr_wb1_dst   = mawb.gpr1_dst;
-assign gpr_wb0_data  = mawb.gpr0_data;
-assign gpr_wb1_data  = mawb.gpr1_data;
+assign  gpr_wb0_we    = wb_valid && !i_REDIRECT_VALID && !mawb.fault && mawb.gpr0_we;
+assign  gpr_wb1_we    = wb_valid && !i_REDIRECT_VALID && !mawb.fault && mawb.gpr1_we;
+assign  gpr_wb0_dst   = mawb.gpr0_dst;
+assign  gpr_wb1_dst   = mawb.gpr1_dst;
+assign  gpr_wb0_data  = mawb.gpr0_data;
+assign  gpr_wb1_data  = mawb.gpr1_data;
 
 always_comb begin
-    mac_dsp_operation = (exma.mac_cmd == MAC_MULL || exma.mac_cmd == MAC_MULS_W ||
-                         exma.mac_cmd == MAC_MULU_W || exma.mac_cmd == MAC_DMULS_L ||
+    mac_dsp_operation = (exma.mac_cmd == MAC_MULL    || exma.mac_cmd == MAC_MULS_W  ||
+                         exma.mac_cmd == MAC_MULU_W  || exma.mac_cmd == MAC_DMULS_L ||
                          exma.mac_cmd == MAC_DMULU_L || exma.mac_cmd == MAC_ACCUM_L ||
                          exma.mac_cmd == MAC_ACCUM_W);
 
@@ -1302,15 +1310,18 @@ assign  ex_complete= (!idex.valid || !idex.branch_delayed ||
                       (ifid.valid && !id_hazard)) &&
                      (!early_d_req_valid || ex_data_req_accept);
 assign  idex_allow = !idex.valid || (ex_complete && exma_allow);
+
 //Per-cluster duplicates of idex_allow: the single net fans to ~266 loads (every idex
 //bit) and its one LUT paid ~2 ns of cross-die routing into the operand captures. keep
 //blocks the merge so the fitter places one copy at each 32-bit capture cluster.
 //D-cones are identical, so the split loads below stay bit-exact.
 (* keep *) wire idex_allow_opa = !idex.valid || (ex_complete && exma_allow);
 (* keep *) wire idex_allow_opb = !idex.valid || (ex_complete && exma_allow);
+
 //Kill-product duplicate for the issue/advance cluster: wb_fault_pending is one merged
 //LUT with ~1060 loads placed at the whole-pipe centroid (fit4 fanout table).
 (* keep *) wire wb_kill_issue = wb_valid && mawb.fault;
+
 assign  id_issue   = ifid.valid && idex_allow && !id_hazard &&
                      !fault_hold && !wb_kill_issue &&
                      !(btbf_cancel_base && exma_allow);
@@ -1323,20 +1334,23 @@ logic   [31:0]  id_mem_step;     //decoded transfer byte count for predecrement
 ///////////////////////////////////////////////////////////
 //////  Operand Select - LAST-LEVEL flat mux: every LATE word crosses exactly ONE level
 ////
-//TWO late data sources remain: the GPR BRAM read words (DOA/DOB). The old third late
-//word (the MA load ld_word) and the LIVE EX-result tail no longer enter this mux at
-//all - they moved to the EX-head lanes (fwd_lane_*): the load word DEPOSITS into a
-//shadow register at its completion edge, and the EX producer's result is read from
-//the EX/MA packet one cycle later. Every early candidate here (MA forward, WB lanes,
-//R0 mirrors, GBR/PC/imm/PREDEC overrides) is a REGISTERED field, so this cone carries
-//no ALU or cache term. Final mux per source: {DOA, DOB, early} - one ALM level;
-//the DOA/DOB routing compares hz ids against the live read addresses (1 LUT).
+
+/*
+    TWO late data sources remain: the GPR BRAM read words (DOA/DOB). The old third late
+    word (the MA load ld_word) and the LIVE EX-result tail no longer enter this mux at
+    all - they moved to the EX-head lanes (fwd_lane_*): the load word DEPOSITS into a
+    shadow register at its completion edge, and the EX producer's result is read from
+    the EX/MA packet one cycle later. Every early candidate here (MA forward, WB lanes,
+    R0 mirrors, GBR/PC/imm/PREDEC overrides) is a REGISTERED field, so this cone carries
+    no ALU or cache term. Final mux per source: {DOA, DOB, early} - one ALM level;
+    the DOA/DOB routing compares hz ids against the live read addresses (1 LUT).
+*/
 
 //MA (non-load) forward shadows - the "did the MA producer already win" selects.
 //The EX live tail and the MA load word are GONE from this mux (EX-head lanes).
-wire        ma_take_a  = ma_take_only(ifid.pd.a_used,  hz_a_id,  exma);
-wire        ma_take_b  = ma_take_only(ifid.pd.b_used,  hz_b_id,  exma);
-wire        ma_take_st = ma_take_only(ifid.pd.st_used, hz_st_id, exma);
+wire            ma_take_a  = ma_take_only(ifid.pd.a_used,  hz_a_id,  exma);
+wire            ma_take_b  = ma_take_only(ifid.pd.b_used,  hz_b_id,  exma);
+wire            ma_take_st = ma_take_only(ifid.pd.st_used, hz_st_id, exma);
 
 //EX-head lane picks (registered compares; latched into fwd_lane_* at issue). The
 //address-op overrides mirror the sel_* steering below: GBR/PC bases never patch
@@ -1365,47 +1379,48 @@ assign  id_lane_st = (ifid.pd.gbrx || !ifid.pd.st_used) ? FWD_NONE :
 (* keep *) wire wb1_we_opb  = wb_valid && !mawb.fault && mawb.gpr1_we;
 (* keep *) wire wb0_we_opst = wb_valid && !mawb.fault && mawb.gpr0_we;
 (* keep *) wire wb1_we_opst = wb_valid && !mawb.fault && mawb.gpr1_we;
-wire        wb_hit_a   = (ifid.pd.a_used  && wb0_we_opa  && gpr_wb0_dst == hz_a_id) ||
-                         (ifid.pd.a_used  && wb1_we_opa  && gpr_wb1_dst == hz_a_id) ||
-                         (ifid.pd.a_used  && wb0z_we     && wb0z_dst    == hz_a_id) ||
-                         (ifid.pd.a_used  && wb1z_we     && wb1z_dst    == hz_a_id);
-wire        wb_hit_b   = (ifid.pd.b_used  && wb0_we_opb  && gpr_wb0_dst == hz_b_id) ||
-                         (ifid.pd.b_used  && wb1_we_opb  && gpr_wb1_dst == hz_b_id) ||
-                         (ifid.pd.b_used  && wb0z_we     && wb0z_dst    == hz_b_id) ||
-                         (ifid.pd.b_used  && wb1z_we     && wb1z_dst    == hz_b_id);
-wire        wb_hit_st  = (ifid.pd.st_used && wb0_we_opst && gpr_wb0_dst == hz_st_id) ||
-                         (ifid.pd.st_used && wb1_we_opst && gpr_wb1_dst == hz_st_id) ||
-                         (ifid.pd.st_used && wb0z_we     && wb0z_dst    == hz_st_id) ||
-                         (ifid.pd.st_used && wb1z_we     && wb1z_dst    == hz_st_id);
+
+wire            wb_hit_a   = (ifid.pd.a_used  && wb0_we_opa  && gpr_wb0_dst == hz_a_id) ||
+                             (ifid.pd.a_used  && wb1_we_opa  && gpr_wb1_dst == hz_a_id) ||
+                             (ifid.pd.a_used  && wb0z_we     && wb0z_dst    == hz_a_id) ||
+                             (ifid.pd.a_used  && wb1z_we     && wb1z_dst    == hz_a_id);
+wire            wb_hit_b   = (ifid.pd.b_used  && wb0_we_opb  && gpr_wb0_dst == hz_b_id) ||
+                             (ifid.pd.b_used  && wb1_we_opb  && gpr_wb1_dst == hz_b_id) ||
+                             (ifid.pd.b_used  && wb0z_we     && wb0z_dst    == hz_b_id) ||
+                             (ifid.pd.b_used  && wb1z_we     && wb1z_dst    == hz_b_id);
+wire            wb_hit_st  = (ifid.pd.st_used && wb0_we_opst && gpr_wb0_dst == hz_st_id) ||
+                             (ifid.pd.st_used && wb1_we_opst && gpr_wb1_dst == hz_st_id) ||
+                             (ifid.pd.st_used && wb0z_we     && wb0z_dst    == hz_st_id) ||
+                             (ifid.pd.st_used && wb1z_we     && wb1z_dst    == hz_st_id);
 
 //EARLY base residue: WB lanes newest-first (live wb1 > live wb0 > shadow wb1 > shadow
 //wb0), then the R0 bank mirrors; 0 when nothing carries the id. Lane enables ride the
 //same per-port duplicates as the hit selects (one cluster per port).
-wire [31:0] early_base_a  = (ifid.pd.a_used  && wb1_we_opa  && gpr_wb1_dst == hz_a_id)  ? gpr_wb1_data :
-                            (ifid.pd.a_used  && wb0_we_opa  && gpr_wb0_dst == hz_a_id)  ? gpr_wb0_data :
-                            (ifid.pd.a_used  && wb1z_we     && wb1z_dst    == hz_a_id)  ? wb1z_data :
-                            (ifid.pd.a_used  && wb0z_we     && wb0z_dst    == hz_a_id)  ? wb0z_data :
-                            (hz_a_id  == 5'd0) ? gpr_r0_bank0 :
-                            (hz_a_id  == 5'd8) ? gpr_r0_bank1 : 32'd0;
-wire [31:0] early_base_b  = (ifid.pd.b_used  && wb1_we_opb  && gpr_wb1_dst == hz_b_id)  ? gpr_wb1_data :
-                            (ifid.pd.b_used  && wb0_we_opb  && gpr_wb0_dst == hz_b_id)  ? gpr_wb0_data :
-                            (ifid.pd.b_used  && wb1z_we     && wb1z_dst    == hz_b_id)  ? wb1z_data :
-                            (ifid.pd.b_used  && wb0z_we     && wb0z_dst    == hz_b_id)  ? wb0z_data :
-                            (hz_b_id  == 5'd0) ? gpr_r0_bank0 :
-                            (hz_b_id  == 5'd8) ? gpr_r0_bank1 : 32'd0;
-wire [31:0] early_base_st = (ifid.pd.st_used && wb1_we_opst && gpr_wb1_dst == hz_st_id) ? gpr_wb1_data :
-                            (ifid.pd.st_used && wb0_we_opst && gpr_wb0_dst == hz_st_id) ? gpr_wb0_data :
-                            (ifid.pd.st_used && wb1z_we     && wb1z_dst    == hz_st_id) ? wb1z_data :
-                            (ifid.pd.st_used && wb0z_we     && wb0z_dst    == hz_st_id) ? wb0z_data :
-                            (hz_st_id == 5'd0) ? gpr_r0_bank0 :
-                            (hz_st_id == 5'd8) ? gpr_r0_bank1 : 32'd0;
+wire    [31:0]  early_base_a  = (ifid.pd.a_used  && wb1_we_opa  && gpr_wb1_dst == hz_a_id)  ? gpr_wb1_data :
+                                (ifid.pd.a_used  && wb0_we_opa  && gpr_wb0_dst == hz_a_id)  ? gpr_wb0_data :
+                                (ifid.pd.a_used  && wb1z_we     && wb1z_dst    == hz_a_id)  ? wb1z_data :
+                                (ifid.pd.a_used  && wb0z_we     && wb0z_dst    == hz_a_id)  ? wb0z_data :
+                                (hz_a_id  == 5'd0) ? gpr_r0_bank0 :
+                                (hz_a_id  == 5'd8) ? gpr_r0_bank1 : 32'd0;
+wire    [31:0]  early_base_b  = (ifid.pd.b_used  && wb1_we_opb  && gpr_wb1_dst == hz_b_id)  ? gpr_wb1_data :
+                                (ifid.pd.b_used  && wb0_we_opb  && gpr_wb0_dst == hz_b_id)  ? gpr_wb0_data :
+                                (ifid.pd.b_used  && wb1z_we     && wb1z_dst    == hz_b_id)  ? wb1z_data :
+                                (ifid.pd.b_used  && wb0z_we     && wb0z_dst    == hz_b_id)  ? wb0z_data :
+                                (hz_b_id  == 5'd0) ? gpr_r0_bank0 :
+                                (hz_b_id  == 5'd8) ? gpr_r0_bank1 : 32'd0;
+wire    [31:0]  early_base_st = (ifid.pd.st_used && wb1_we_opst && gpr_wb1_dst == hz_st_id) ? gpr_wb1_data :
+                                (ifid.pd.st_used && wb0_we_opst && gpr_wb0_dst == hz_st_id) ? gpr_wb0_data :
+                                (ifid.pd.st_used && wb1z_we     && wb1z_dst    == hz_st_id) ? wb1z_data :
+                                (ifid.pd.st_used && wb0z_we     && wb0z_dst    == hz_st_id) ? wb0z_data :
+                                (hz_st_id == 5'd0) ? gpr_r0_bank0 :
+                                (hz_st_id == 5'd8) ? gpr_r0_bank1 : 32'd0;
 
 //EARLY value per source: MA > base residue. The EX live tail is GONE from here
 //(EX-head lanes read the registered exma packet at the consumer's own EX cycle),
 //so every input of this mux is a REGISTERED field - no ALU/cache cone remains.
-wire [31:0] early_src_a  = ma_forward(early_base_a,  ifid.pd.a_used,  hz_a_id,  exma);
-wire [31:0] early_src_b  = ma_forward(early_base_b,  ifid.pd.b_used,  hz_b_id,  exma);
-wire [31:0] early_src_st = ma_forward(early_base_st, ifid.pd.st_used, hz_st_id, exma);
+wire    [31:0]  early_src_a  = ma_forward(early_base_a,  ifid.pd.a_used,  hz_a_id,  exma);
+wire    [31:0]  early_src_b  = ma_forward(early_base_b,  ifid.pd.b_used,  hz_b_id,  exma);
+wire    [31:0]  early_src_st = ma_forward(early_base_st, ifid.pd.st_used, hz_st_id, exma);
 
 //BRAM word routing: which read port carries this source id (port A wins on a double
 //match, = decoded_gpr_value's order). Compares run against the LIVE read addresses, NOT
@@ -1413,53 +1428,53 @@ wire [31:0] early_src_st = ma_forward(early_base_st, ifid.pd.st_used, hz_st_id, 
 //cen_n from an ifid/SR that cannot change again before the consuming cen_p edge, so
 //ctx == live there ALWAYS (the gpr_read_ready argument). Dropping the regs moves these
 //selects onto the full 10 ns cen_p budget and deletes the launch class they anchored.
-wire        doa_hit_a  = hz_a_id  == gpr_read0_address;
-wire        dob_hit_a  = hz_a_id  == gpr_read1_address;
-wire        doa_hit_b  = hz_b_id  == gpr_read0_address;
-wire        dob_hit_b  = hz_b_id  == gpr_read1_address;
-wire        doa_hit_st = hz_st_id == gpr_read0_address;
-wire        dob_hit_st = hz_st_id == gpr_read1_address;
+wire            doa_hit_a  = hz_a_id  == gpr_read0_address;
+wire            dob_hit_a  = hz_a_id  == gpr_read1_address;
+wire            doa_hit_b  = hz_b_id  == gpr_read0_address;
+wire            dob_hit_b  = hz_b_id  == gpr_read1_address;
+wire            doa_hit_st = hz_st_id == gpr_read0_address;
+wire            dob_hit_st = hz_st_id == gpr_read1_address;
 
 //Source resolution WITHOUT the addr_op overrides (doa > dob > early; an MA-forward
 //or WB hit falls through to the early leg). An EX-forward or load hit no longer
 //steers here: the stale RAM/early word lands in idex.src_* and the EX-head lane
 //overrides it at the consumer's EX, so this cone carries no idex/ex compare.
-wire        src_doa_a  = !ma_take_a  && !wb_hit_a  && doa_hit_a;
-wire        src_dob_a  = !ma_take_a  && !wb_hit_a  && !doa_hit_a  && dob_hit_a;
-wire        src_doa_b  = !ma_take_b  && !wb_hit_b  && doa_hit_b;
-wire        src_dob_b  = !ma_take_b  && !wb_hit_b  && !doa_hit_b  && dob_hit_b;
-wire        src_doa_st = !ma_take_st && !wb_hit_st && doa_hit_st;
-wire        src_dob_st = !ma_take_st && !wb_hit_st && !doa_hit_st && dob_hit_st;
+wire            src_doa_a  = !ma_take_a  && !wb_hit_a  && doa_hit_a;
+wire            src_dob_a  = !ma_take_a  && !wb_hit_a  && !doa_hit_a  && dob_hit_a;
+wire            src_doa_b  = !ma_take_b  && !wb_hit_b  && doa_hit_b;
+wire            src_dob_b  = !ma_take_b  && !wb_hit_b  && !doa_hit_b  && dob_hit_b;
+wire            src_doa_st = !ma_take_st && !wb_hit_st && doa_hit_st;
+wire            src_dob_st = !ma_take_st && !wb_hit_st && !doa_hit_st && dob_hit_st;
 
 //addr_op overrides. GBR-INDEX redirects src_b onto SOURCE A's resolution (the R0 forward,
 //old ovr_b_val=fwd_result_a) - done by steering b's SELECTS to a's, so no extra level.
 //All REGISTERED pd bits (fetch-time addr-op class, asserted above): the id_decode.addr_op
 //forms kept the live ifid.inst case cone on every sel_a/sel_b/sel_st leg (fit4).
-wire        addr_a_gbr  = ifid.pd.agbr;
-wire        addr_a_pc   = ifid.pd.apc;
-wire        addr_a_ovr  = addr_a_gbr || addr_a_pc;
-wire        addr_b_gbrx = ifid.pd.gbrx;
-wire        addr_b_pdec = ifid.pd.pdec;
-wire        st_use_imm  = ifid.pd.gbrx || !ifid.pd.st_used;
+wire            addr_a_gbr  = ifid.pd.agbr;
+wire            addr_a_pc   = ifid.pd.apc;
+wire            addr_a_ovr  = addr_a_gbr || addr_a_pc;
+wire            addr_b_gbrx = ifid.pd.gbrx;
+wire            addr_b_pdec = ifid.pd.pdec;
+wire            st_use_imm  = ifid.pd.gbrx || !ifid.pd.st_used;
 
 //Final-mux selects (2-bit priority encoders, EARLY) and the collapsed early legs.
 //The ld_word input is GONE (2'd0 unreachable): the load word deposits into the
 //EX-head shadow register instead, so only the two GPR BRAM words remain late.
-wire [1:0]  sel_a  = (!addr_a_ovr && src_doa_a) ? 2'd1 :
-                     (!addr_a_ovr && src_dob_a) ? 2'd2 : 2'd3;
-wire [31:0] early_a_final  = addr_a_gbr ? i_GBR :
-                             addr_a_pc  ? 32'd0 : early_src_a;    //PC-rel addr rides the immediate
+wire    [1:0]   sel_a = (!addr_a_ovr && src_doa_a) ? 2'd1 :
+                        (!addr_a_ovr && src_dob_a) ? 2'd2 : 2'd3;
+wire    [31:0]  early_a_final = addr_a_gbr ? i_GBR :
+                                addr_a_pc  ? 32'd0 : early_src_a;    //PC-rel addr rides the immediate
 
-wire [1:0]  sel_b  = addr_b_pdec                                          ? 2'd3 :
-                     (addr_b_gbrx ? src_doa_a : ifid.pd.b_used && src_doa_b) ? 2'd1 :
-                     (addr_b_gbrx ? src_dob_a : ifid.pd.b_used && src_dob_b) ? 2'd2 : 2'd3;
-wire [31:0] early_b_final  = addr_b_pdec    ? (~id_mem_step + 32'd1) :    //-step for @-Rn
-                             addr_b_gbrx    ? early_src_a :
-                             ifid.pd.b_used ? early_src_b : id_decode.immediate;
+wire    [1:0]   sel_b =  addr_b_pdec                                          ? 2'd3 :
+                        (addr_b_gbrx ? src_doa_a : ifid.pd.b_used && src_doa_b) ? 2'd1 :
+                        (addr_b_gbrx ? src_dob_a : ifid.pd.b_used && src_dob_b) ? 2'd2 : 2'd3;
+wire    [31:0]  early_b_final = addr_b_pdec    ? (~id_mem_step + 32'd1) :    //-step for @-Rn
+                                addr_b_gbrx    ? early_src_a :
+                                ifid.pd.b_used ? early_src_b : id_decode.immediate;
 
-wire [1:0]  sel_st = (!st_use_imm && src_doa_st) ? 2'd1 :
-                     (!st_use_imm && src_dob_st) ? 2'd2 : 2'd3;
-wire [31:0] early_st_final = st_use_imm ? id_decode.immediate : early_src_st;
+wire    [1:0]   sel_st = (!st_use_imm && src_doa_st) ? 2'd1 :
+                         (!st_use_imm && src_dob_st) ? 2'd2 : 2'd3;
+wire    [31:0]  early_st_final = st_use_imm ? id_decode.immediate : early_src_st;
 
 //Flat muxes as EXPLICIT case statements (one always_comb per source) so each maps to a
 //single ALM level per bit. BOTH late words (the GPR BRAM ports) are direct data inputs.
@@ -1566,23 +1581,23 @@ logic   [31:0]  shdyn_result;         //final SHAD/SHLD result in natural bit or
 //drained under a held consumer - fwd_wbsel_* REGISTERS that decision at the drain
 //edge), then from the deposited shadow. Selects are single FFs and the data legs
 //are FFs, so the hot G0/G1/idex legs cross ONE 4:1 level and the WB leg two.
-wire [31:0] fwd_mawb_word_a  = fwd_lane_a  == FWD_EXMA_G1 ? mawb.gpr1_data : mawb.gpr0_data;
-wire [31:0] fwd_mawb_word_b  = fwd_lane_b  == FWD_EXMA_G1 ? mawb.gpr1_data : mawb.gpr0_data;
-wire [31:0] fwd_mawb_word_st = fwd_lane_st == FWD_EXMA_G1 ? mawb.gpr1_data : mawb.gpr0_data;
-wire [31:0] fwd_wb_a  = fwd_dep_a  ? fwd_shadow_a  : fwd_mawb_word_a;
-wire [31:0] fwd_wb_b  = fwd_dep_b  ? fwd_shadow_b  : fwd_mawb_word_b;
-wire [31:0] fwd_wb_st = fwd_dep_st ? fwd_shadow_st : fwd_mawb_word_st;
+wire    [31:0]  fwd_mawb_word_a  = fwd_lane_a  == FWD_EXMA_G1 ? mawb.gpr1_data : mawb.gpr0_data;
+wire    [31:0]  fwd_mawb_word_b  = fwd_lane_b  == FWD_EXMA_G1 ? mawb.gpr1_data : mawb.gpr0_data;
+wire    [31:0]  fwd_mawb_word_st = fwd_lane_st == FWD_EXMA_G1 ? mawb.gpr1_data : mawb.gpr0_data;
+wire    [31:0]  fwd_wb_a  = fwd_dep_a  ? fwd_shadow_a  : fwd_mawb_word_a;
+wire    [31:0]  fwd_wb_b  = fwd_dep_b  ? fwd_shadow_b  : fwd_mawb_word_b;
+wire    [31:0]  fwd_wb_st = fwd_dep_st ? fwd_shadow_st : fwd_mawb_word_st;
 //AGU-cluster twins of the a/b WB folds, from the (* preserve *) duplicates, so
 //the address mux places at the adder (32-bit data legs are shared nets).
-wire [31:0] agu_wb_a = fwd_dep_a_agu ? fwd_shadow_a :
-                       (fwd_lane_a_agu == FWD_EXMA_G1 ? mawb.gpr1_data : mawb.gpr0_data);
-wire [31:0] agu_wb_b = fwd_dep_b_agu ? fwd_shadow_b :
-                       (fwd_lane_b_agu == FWD_EXMA_G1 ? mawb.gpr1_data : mawb.gpr0_data);
+wire    [31:0]  agu_wb_a = fwd_dep_a_agu ? fwd_shadow_a :
+                          (fwd_lane_a_agu == FWD_EXMA_G1 ? mawb.gpr1_data : mawb.gpr0_data);
+wire    [31:0]  agu_wb_b = fwd_dep_b_agu ? fwd_shadow_b :
+                          (fwd_lane_b_agu == FWD_EXMA_G1 ? mawb.gpr1_data : mawb.gpr0_data);
 //Cache-index-slice twins of the same folds ([11:0] only), from the _idx duplicates.
-wire [11:0] agu_wb_a_idx = fwd_dep_a_idx ? fwd_shadow_a[11:0] :
-                           (fwd_lane_a_idx == FWD_EXMA_G1 ? mawb.gpr1_data[11:0] : mawb.gpr0_data[11:0]);
-wire [11:0] agu_wb_b_idx = fwd_dep_b_idx ? fwd_shadow_b[11:0] :
-                           (fwd_lane_b_idx == FWD_EXMA_G1 ? mawb.gpr1_data[11:0] : mawb.gpr0_data[11:0]);
+wire    [11:0]  agu_wb_a_idx = fwd_dep_a_idx ? fwd_shadow_a[11:0] :
+                              (fwd_lane_a_idx == FWD_EXMA_G1 ? mawb.gpr1_data[11:0] : mawb.gpr0_data[11:0]);
+wire    [11:0]  agu_wb_b_idx = fwd_dep_b_idx ? fwd_shadow_b[11:0] :
+                              (fwd_lane_b_idx == FWD_EXMA_G1 ? mawb.gpr1_data[11:0] : mawb.gpr0_data[11:0]);
 always_comb begin
     case(fwd_wbsel_a ? FWD_WB : fwd_lane_a)
         FWD_EXMA_G0: ex_a = exma.gpr0_data;      //producer result, one stage ahead
@@ -1774,22 +1789,22 @@ always_comb begin
     shift_t_we    = 1'b0;
     shift_t_value = 1'b0;
     case(idex.alu_op)
-        ALU_SHLL:  begin shift_result = {ex_a[30:0], 1'b0};   shift_t_we = 1'b1; shift_t_value = ex_a[31]; end
-        ALU_SHLR:  begin shift_result = {1'b0, ex_a[31:1]};   shift_t_we = 1'b1; shift_t_value = ex_a[0]; end
-        ALU_SHAR:  begin shift_result = {ex_a[31], ex_a[31:1]}; shift_t_we = 1'b1; shift_t_value = ex_a[0]; end
+        ALU_SHLL:  begin shift_result = {ex_a[30:0], 1'b0};     shift_t_we = 1'b1; shift_t_value = ex_a[31]; end
+        ALU_SHLR:  begin shift_result = {1'b0, ex_a[31:1]};     shift_t_we = 1'b1; shift_t_value = ex_a[0];  end
+        ALU_SHAR:  begin shift_result = {ex_a[31], ex_a[31:1]}; shift_t_we = 1'b1; shift_t_value = ex_a[0];  end
         ALU_ROTL:  begin shift_result = {ex_a[30:0], ex_a[31]}; shift_t_we = 1'b1; shift_t_value = ex_a[31]; end
-        ALU_ROTR:  begin shift_result = {ex_a[0], ex_a[31:1]};  shift_t_we = 1'b1; shift_t_value = ex_a[0]; end
-        ALU_ROTCL: begin shift_result = {ex_a[30:0], ex_t};   shift_t_we = 1'b1; shift_t_value = ex_a[31]; end
-        ALU_ROTCR: begin shift_result = {ex_t, ex_a[31:1]};   shift_t_we = 1'b1; shift_t_value = ex_a[0]; end
-        ALU_SHLL2:  shift_result = ex_a << 2;
-        ALU_SHLL8:  shift_result = ex_a << 8;
-        ALU_SHLL16: shift_result = ex_a << 16;
-        ALU_SHLR2:  shift_result = ex_a >> 2;
-        ALU_SHLR8:  shift_result = ex_a >> 8;
-        ALU_SHLR16: shift_result = ex_a >> 16;
-        ALU_SHAD:   shift_result = shdyn_result; //arithmetic dynamic shift; fill via shdyn_fill
-        ALU_SHLD:   shift_result = shdyn_result; //logical dynamic shift; zero fill
-        default: shift_result = ex_a;
+        ALU_ROTR:  begin shift_result = {ex_a[0], ex_a[31:1]};  shift_t_we = 1'b1; shift_t_value = ex_a[0];  end
+        ALU_ROTCL: begin shift_result = {ex_a[30:0], ex_t};     shift_t_we = 1'b1; shift_t_value = ex_a[31]; end
+        ALU_ROTCR: begin shift_result = {ex_t, ex_a[31:1]};     shift_t_we = 1'b1; shift_t_value = ex_a[0];  end
+        ALU_SHLL2:       shift_result = ex_a << 2;
+        ALU_SHLL8:       shift_result = ex_a << 8;
+        ALU_SHLL16:      shift_result = ex_a << 16;
+        ALU_SHLR2:       shift_result = ex_a >> 2;
+        ALU_SHLR8:       shift_result = ex_a >> 8;
+        ALU_SHLR16:      shift_result = ex_a >> 16;
+        ALU_SHAD:        shift_result = shdyn_result; //arithmetic dynamic shift; fill via shdyn_fill
+        ALU_SHLD:        shift_result = shdyn_result; //logical dynamic shift; zero fill
+        default:         shift_result = ex_a;
     endcase
 end
 
@@ -1815,14 +1830,14 @@ always_comb begin
     ceu_t_we    = 1'b0;
     ceu_t_value = 1'b0;
     case(idex.alu_op)
-        ALU_TST:    begin ceu_t_we = 1'b1; ceu_t_value = (ex_a & ex_b) == 32'd0; end
-        ALU_CMP_EQ: begin ceu_t_we = 1'b1; ceu_t_value = ex_a == ex_b; end
-        ALU_CMP_HS: begin ceu_t_we = 1'b1; ceu_t_value = ex_a >= ex_b; end
-        ALU_CMP_GE: begin ceu_t_we = 1'b1; ceu_t_value = $signed(ex_a) >= $signed(ex_b); end
-        ALU_CMP_HI: begin ceu_t_we = 1'b1; ceu_t_value = ex_a > ex_b; end
-        ALU_CMP_GT: begin ceu_t_we = 1'b1; ceu_t_value = $signed(ex_a) > $signed(ex_b); end
-        ALU_CMP_PZ: begin ceu_t_we = 1'b1; ceu_t_value = !ex_a[31]; end
-        ALU_CMP_PL: begin ceu_t_we = 1'b1; ceu_t_value = !ex_a[31] && ex_a != 32'd0; end
+        ALU_TST:     begin ceu_t_we = 1'b1; ceu_t_value = (ex_a & ex_b) == 32'd0; end
+        ALU_CMP_EQ:  begin ceu_t_we = 1'b1; ceu_t_value = ex_a == ex_b; end
+        ALU_CMP_HS:  begin ceu_t_we = 1'b1; ceu_t_value = ex_a >= ex_b; end
+        ALU_CMP_GE:  begin ceu_t_we = 1'b1; ceu_t_value = $signed(ex_a) >= $signed(ex_b); end
+        ALU_CMP_HI:  begin ceu_t_we = 1'b1; ceu_t_value = ex_a > ex_b; end
+        ALU_CMP_GT:  begin ceu_t_we = 1'b1; ceu_t_value = $signed(ex_a) > $signed(ex_b); end
+        ALU_CMP_PZ:  begin ceu_t_we = 1'b1; ceu_t_value = !ex_a[31]; end
+        ALU_CMP_PL:  begin ceu_t_we = 1'b1; ceu_t_value = !ex_a[31] && ex_a != 32'd0; end
         ALU_CMP_STR: begin
             ceu_t_we    = 1'b1;
             ceu_t_value = (ex_a[31:24] == ex_b[31:24]) || (ex_a[23:16] == ex_b[23:16]) ||
@@ -1917,7 +1932,7 @@ end
 //Built from the preserved *_agu duplicates: the AGU is its only consumer.
 assign  ma_second_pending_agu = ma_second_access_agu && !data_req_sent_agu;
 //index-slice twin of the same gate, off the _idx duplicates (sole load: l_addr_idx cone)
-wire    ma_second_pending_idx = ma_second_access_idx && !data_req_sent_idx;
+wire            ma_second_pending_idx = ma_second_access_idx && !data_req_sent_idx;
 
 //SHALLOW "data access presented this cycle" (was the o_D_REQ_RAW sideband). Drives the L bus
 //req_fetch: a fetch is presented only when this is 0 (DATA priority). The AGU time-share select
@@ -1925,8 +1940,8 @@ wire    ma_second_pending_idx = ma_second_access_idx && !data_req_sent_idx;
 //idex.is_data = (valid && mem_op!=NONE) is PRE-DECODED in ID (a flop), so the AGU base-select sees
 //flop + one OR, NOT the mem_op decode - keeps the mem_op->l_is_data->agu_x cone off the 5 ns cen_n
 //bram_addr path. ma_second_access is live MA-seq state (MAC/RMW 2nd access) and cannot pre-register.
-wire    l_is_data     = idex.is_data || ma_second_access;
-wire    l_is_data_agu = idex_is_data_agu || ma_second_access_agu; //AGU-only copy (i_USE_BASE/i_EN_MODE)
+wire            l_is_data     = idex.is_data || ma_second_access;
+wire            l_is_data_agu = idex_is_data_agu || ma_second_access_agu; //AGU-only copy (i_USE_BASE/i_EN_MODE)
 
 //Shared time-shared AGU (agu.sv) - the SINGLE address source for the L bus. On a data cycle
 //(l_is_data=1) i_USE_BASE=1 selects agu_base_q (EA base, or the held EA2/write addr while a 2nd
@@ -1976,6 +1991,7 @@ wire            agu_en_idx    = (l_is_data_idx && !ma_second_pending_idx) && ide
 wire    [11:0]  agu_x_idx     = l_is_data_idx ? ea_base_idx : fetch_pc[11:0];
 wire    [11:0]  l_addr_idx    = agu_x_idx + (agu_en_idx ? ea_addend_idx : 12'd0);
 
+`ifdef HS3_TEST
 // synthesis translate_off
 //Index-slice equivalence: the twin must equal the shared AGU's low bits every cycle -
 //proves the _idx duplicate set and the 12-bit slice against the original cone.
@@ -1985,6 +2001,7 @@ always_comb begin
                l_addr_idx, ea_addr_sum[11:0]);
 end
 // synthesis translate_on
+`endif
 
 always_comb begin
     //Convert the register value into normalized 32-bit memory lanes.
@@ -2171,9 +2188,9 @@ end
 logic   [31:0]  load_value;
 logic   [7:0]   selected_byte; //addressed byte from the returned longword
 logic   [31:0]  memory_read_addr;
-logic   [7:0]   sel_byte_hit,  sel_byte_miss;  //per-source addressed byte
-logic   [15:0]  sel_word_hit,  sel_word_miss;  //per-source addressed halfword
-logic   [31:0]  load_hit,      load_miss;      //per-source aligned/extended load word
+logic   [7:0]   sel_byte_hit, sel_byte_miss;  //per-source addressed byte
+logic   [15:0]  sel_word_hit, sel_word_miss;  //per-source addressed halfword
+logic   [31:0]  load_hit,     load_miss;      //per-source aligned/extended load word
 
 //DUAL ALIGNER: lane-select + sign-extend computed ONCE PER SOURCE (the CEN_n-late cache
 //hit word and the CEN_p-early registered miss word), and the hit select re-applied at the
@@ -2189,9 +2206,11 @@ function automatic logic [7:0] pick_byte(input logic [31:0] w, input logic [1:0]
         default: pick_byte = BIG_ENDIAN ? w[7:0] : w[31:24];
     endcase
 endfunction
+
 function automatic logic [15:0] pick_word(input logic [31:0] w, input logic a1);
     pick_word = (BIG_ENDIAN ^ a1) ? w[31:16] : w[15:0];
 endfunction
+
 function automatic logic [31:0] ld_extend(
     input logic [31:0] w,       //full source word
     input logic [7:0]  b,       //its addressed byte
@@ -2229,9 +2248,11 @@ end
 //copy it can place at the DSP columns (fit8: byp_q/bram_addr -> dsp_b, 13/20 top paths).
 wire    [15:0]  mac_word_sel = L_BUS.rsp_hit_d ? sel_word_hit : sel_word_miss;
 (* keep *) wire [31:0] mac_load_value =
-    exma.mem_size == SIZE_WORD
-        ? (exma.load_signed ? {{16{mac_word_sel[15]}}, mac_word_sel} : {16'd0, mac_word_sel})
-        : (L_BUS.rsp_hit_d ? L_BUS.rsp_rdata_hit : L_BUS.rsp_rdata_miss);
+    exma.mem_size == SIZE_WORD ? 
+                         (exma.load_signed ? 
+                             {{16{mac_word_sel[15]}}, mac_word_sel} : 
+                              {16'd0, mac_word_sel}) : 
+                         (L_BUS.rsp_hit_d ? L_BUS.rsp_rdata_hit : L_BUS.rsp_rdata_miss);
 
 //MA sequencer: owns the second-access phase and builds the one D request. The
 //first access of every memory op is the EX primary (ex_req); the sequencer issues
@@ -2301,40 +2322,44 @@ assign  i_rsp_ready = fetch_pending &&
                       (fetch_drop || ((!ifid.valid || id_issue) && !pair_ready) ||
                        i_REDIRECT_VALID || branch_redirect);
 assign  if_accept   = i_rsp_valid && i_rsp_ready;
+
 //A usable pair rides the live fetch response: the same-edge request fire MUST be
 //suppressed - fetch_pc is the sibling's own PC, which the pair slot satisfies.
 //Kill-gated only (NOT insert-gated: an unconsumed paired response keeps suppressing);
 //under a redirect the fire is the TARGET fetch and proceeds (drop_d marks wrong-path).
-wire    rsp_pair_ok = i_rsp_valid && L_BUS.rsp_pair && !i_rsp_fault &&
-                      fetch_pending && !fetch_drop &&
-                      !i_REDIRECT_VALID && !branch_redirect && !wb_fault_kill;
+wire            rsp_pair_ok = i_rsp_valid && L_BUS.rsp_pair && !i_rsp_fault &&
+                              fetch_pending && !fetch_drop &&
+                              !i_REDIRECT_VALID && !branch_redirect && !wb_fault_kill;
+
 //Pipelined fetch "want to issue". A wrong-path fetch is marked via fetch_drop and its
 //line fill aborted (o_I_SQUASH).
 assign  early_i_req_raw_valid = (!fetch_pending || if_accept) && !rsp_pair_ok &&
                                 !i_REDIRECT_VALID && !fault_hold && !wb_fault_kill;
 assign  i_req_fire  = early_i_req_raw_valid && !l_is_data && L_BUS.req_ready;
 
-wire    ifid_clr  = branch_redirect ||
-                    (branch_event && !branch_delayed && branch_taken);
-wire    ifid_ld   = !i_REDIRECT_VALID && !wb_fault_kill && !ifid_clr &&
-                    if_accept && !fetch_drop;               //response insert into IF/ID
+wire            ifid_clr  = branch_redirect ||
+                            (branch_event && !branch_delayed && branch_taken);
+wire            ifid_ld   = !i_REDIRECT_VALID && !wb_fault_kill && !ifid_clr &&
+                            if_accept && !fetch_drop;               //response insert into IF/ID
 (* keep *) wire ifid_ld_dat = !i_REDIRECT_VALID && !wb_fault_kill && !ifid_clr &&
                     if_accept && !fetch_drop;   //data-cluster CE duplicate (placement-local)
+
 //Pair slot events. Capture = the response inserts into IF/ID this edge AND pairs
 //(ifid_ld already folds every kill term); at that edge fetch_pc == the sibling's PC
 //(it only advances on fire/capture, and any redirect in between killed the capture).
 //Serve = IF/ID can take the held sibling (kill terms mirror ifid_ld; exclusive with
 //ifid_ld by the i_rsp_ready gate above).
-wire    pair_capture = ifid_ld && L_BUS.rsp_pair;
-wire    pair_serve   = pair_ready && !i_REDIRECT_VALID && !wb_fault_kill && !ifid_clr &&
-                       (!ifid.valid || id_issue);
-wire    ifid_zero = i_REDIRECT_VALID || wb_fault_kill || ifid_clr ||
-                    (id_issue && !ifid_ld && !pair_serve);  //every '0 load of the IF/ID packet
-wire    fpc_ce    = i_REDIRECT_VALID || branch_redirect || i_req_fire ||
-                    pair_capture;             //capture advances fetch_pc PAST the sibling
-wire    fpc_selbr = branch_redirect;      //fetch_pc source: branch target (over pc+2)
-wire    fp_ce     = i_req_fire || if_accept;                //fetch_pending capture
-wire    drop_ce   = i_REDIRECT_VALID || wb_fault_kill || branch_redirect || if_accept;
+wire            pair_capture = ifid_ld && L_BUS.rsp_pair;
+wire            pair_serve   = pair_ready && !i_REDIRECT_VALID && !wb_fault_kill && !ifid_clr &&
+                               (!ifid.valid || id_issue);
+wire            ifid_zero = i_REDIRECT_VALID || wb_fault_kill || ifid_clr ||
+                            (id_issue && !ifid_ld && !pair_serve);  //every '0 load of the IF/ID packet
+wire            fpc_ce    = i_REDIRECT_VALID || branch_redirect || i_req_fire ||
+                            pair_capture;             //capture advances fetch_pc PAST the sibling
+wire            fpc_selbr = branch_redirect;      //fetch_pc source: branch target (over pc+2)
+wire            fp_ce     = i_req_fire || if_accept;                //fetch_pending capture
+wire            drop_ce   = i_REDIRECT_VALID || wb_fault_kill || branch_redirect || if_accept;
+
 //accept arm: a request FIRED at a branch-redirect edge still carries the old fetch_pc
 //(the target loads at this edge) - mark it dropped, else its response inserts as if it
 //were the branch target and a wrong-path instruction RETIRES (found by the cacheable
@@ -2352,6 +2377,7 @@ wire    agu_ce    = agu_hold_sel || idex_allow;       //agu_base_q capture (hold
 //must address the read captured at its own commit edge, one cycle before i_SR shows them.
 wire            sr_wr_wb  = wb_valid && !i_REDIRECT_VALID && !mawb.fault &&
                             mawb.ctrl_dst == CTRL_SR;
+
 //An RTE restores SR from SSR with NO external redirect (its PC redirect is
 //internal, and the serialized target WAITS live in IF/ID), so the mirror must
 //snoop the restore like the LDC arm - found by the RB-flip SR-race sweep and the
@@ -2378,6 +2404,7 @@ always_ff @(posedge i_CLK or negedge i_RST_n) begin
         r_bank1 <= bank1_nx;
     end end
 end
+
 //NEXT-ifid instruction/predecode: what IF/ID will hold during the read-data cycle.
 //Pair-serve leads: pair_inst/pair_pd are REGISTERS, so that arm is shallower than
 //the live response arm (exclusive with ifid_ld by construction). Feeds the hz_*
