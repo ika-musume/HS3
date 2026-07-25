@@ -836,21 +836,3 @@ the controller's leisure.
 - OOC re-check after integration (plateau-tax history: every new change
   shape costs −0.3..−0.7 ns until proven otherwise); route the new HS3
   ports in the hand OOC top.
-
-## 11. Decision log
-
-| # | Decision | Rationale |
-|---|---|---|
-| 0 | FIRST PRINCIPLE: existing SH3 bus cycles and pipeline IPC never change | the port observes and copies — it must cost the machine nothing; laws bit-exact + identical IPC is the gate |
-| 1 | One `o_MEM_*` family is the single transaction view — no separate sideband, no level-held request rail | single consumer surface; REQ = commitment semantics |
-| 2 | DE = a 1 `i_CLK` pulse per beat | direct synchronous-FIFO enable; a CKIO-cycle window would double-pop |
-| 3 | Ordinary-read pop at the final T-state's CKIO fall (the sample edge) | WAIT-truth instant; pop-after-consume removes the same-edge race |
-| 4 | SDRAM-read pop at the capture rise; no WAIT — the controller meets the programmed pin schedule | the MCR timing fields are the latency budget |
-| 5 | Write push at the internal accept edge; count contractual, cadence not | earliest committed instant for the data; the FIFO fills CKIO cycles ahead of the pins |
-| 6 | WDATA is the only per-beat rail; WSTRB stays unit-held | partial strobes occur only on single-beat units |
-| 7 | LEN = physical beat count | pop truth for reads; no consumer-side SIZE×width tables |
-| 8 | Narrow-area writes push logically (one 32-bit beat) | the FIFO wants data+strobes, not pin lane replays (A8); FIFO-backed areas should be 32-bit |
-| 9 | SADDR units: count-only push, source data pin-latched from the DACK frame | the data never enters the BSC (fig 11.10a) |
-| 10 | FWFT read FIFO + "WAIT_n low while the outstanding read's head is not valid" level rule | zero pin-protocol decode in the adapter's flow control; WAIT machinery kept bit-exact |
-| 11 | Refresh/MRS/dummy areas stay port-silent | an SoC controller owns its memory's housekeeping (spec R2) |
-| 12 | Consumer domain = core `i_CLK` (102.4 MHz in CV1k) | one clock domain — no phase alignment in the consumer |
