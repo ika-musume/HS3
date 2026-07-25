@@ -19,25 +19,22 @@ module HS3_ooc_top (
     output  wire            o_CKIO,
     input   wire            i_EXTAL2,   //RTC 32.768 kHz clock - own async domain (SDC cuts it)
 
-    /* GENERIC MEMORY PORT */
+    /* TRANSACTION PORT (docs/Early_Monitor_Guide.md) */
     output  wire            o_MEM_REQ,
     output  wire            o_MEM_WR,
     output  wire            o_MEM_BURST,
     output  wire    [1:0]   o_MEM_SIZE,
     output  wire    [28:0]  o_MEM_ADDR,
+    output  wire    [4:0]   o_MEM_LEN,
+    output  wire            o_MEM_SADDR,
     output  wire    [6:0]   o_MEM_CS_n,
     output  wire    [3:0]   o_MEM_WSTRB,
+    output  wire            o_MEM_DE,
+    output  wire    [31:0]  o_MEM_WDATA,
     input   wire            i_MEM_READY,
     input   wire            i_MEM_RSP_VALID,
     input   wire            i_MEM_FAULT,
     output  wire            o_MEM_RSP_READY,
-
-    /* EARLY-TRANSACTION SIDEBAND (sh3_sideband.md) */
-    output  wire            o_MON_REQ,
-    output  wire            o_MON_WR,
-    output  wire    [28:0]  o_MON_ADDR,
-    output  wire    [1:0]   o_MON_SIZE,
-    output  wire            o_MON_BURST,
 
     /* BSC PHYSICAL PINS (shared external bus, table 10.1) */
     output  wire    [25:0]  o_A,
@@ -129,22 +126,20 @@ module HS3_ooc_top (
         .i_EXTAL2               (i_EXTAL2                   ),
 
         .o_MEM_REQ              (o_MEM_REQ                  ),
-        .o_MEM_WR            (o_MEM_WR                ),
+        .o_MEM_WR               (o_MEM_WR                   ),
         .o_MEM_BURST            (o_MEM_BURST                ),
         .o_MEM_SIZE             (o_MEM_SIZE                 ),
         .o_MEM_ADDR             (o_MEM_ADDR                 ),
+        .o_MEM_LEN              (o_MEM_LEN                  ),
+        .o_MEM_SADDR            (o_MEM_SADDR                ),
         .o_MEM_CS_n             (o_MEM_CS_n                 ),
         .o_MEM_WSTRB            (o_MEM_WSTRB                ),
+        .o_MEM_DE               (o_MEM_DE                   ),
+        .o_MEM_WDATA            (o_MEM_WDATA                ),
         .i_MEM_READY            (i_MEM_READY                ),
         .i_MEM_RSP_VALID        (i_MEM_RSP_VALID            ),
         .i_MEM_FAULT            (i_MEM_FAULT                ),
         .o_MEM_RSP_READY        (o_MEM_RSP_READY            ),
-
-        .o_MON_REQ               (o_MON_REQ                   ),
-        .o_MON_WR                (o_MON_WR                    ),
-        .o_MON_ADDR              (o_MON_ADDR                  ),
-        .o_MON_SIZE              (o_MON_SIZE                  ),
-        .o_MON_BURST             (o_MON_BURST                 ),
 
         .o_A                    (o_A                        ),
         .o_D_O                  (o_D_O                      ),

@@ -28,7 +28,7 @@ module intc (
     input   wire            i_RST_n,
     input   wire            i_CLK,
     input   wire            i_CEN,
-    input   wire            i_PCEN,         //P-phi enable (i_CEN-qualified): IRQ edge / IRL samplers
+    input   wire            i_PERI_PCEN,    //P-phi enable (i_CEN-qualified): IRQ edge / IRL samplers
 
     /* INTERFACES */
     IBus_2.slave            REG_HI,         //0xFFFFFEE0-EF: ICR0/IPRA/IPRB
@@ -181,9 +181,9 @@ always_ff @(posedge i_CLK or negedge i_RST_n) begin
         irq_pend <= '0;
     end
     else begin if(i_CEN) begin
-        if(i_PCEN) irq_smp <= irq_sync;
+        if(i_PERI_PCEN) irq_smp <= irq_sync;
         for(int n = 0; n < 6; n++) begin
-            if(i_PCEN && irq_edge_set[n]) irq_pend[n] <= 1'b1;  //edge outranks a same-cycle clear
+            if(i_PERI_PCEN && irq_edge_set[n]) irq_pend[n] <= 1'b1;  //edge outranks a same-cycle clear
             else if(irr0_wr && !REG_LO.wdata[n]) irq_pend[n] <= 1'b0;
         end
     end end
@@ -203,7 +203,7 @@ always_ff @(posedge i_CLK or negedge i_RST_n) begin
         irl_smp <= '1; irl_cln <= '1; irls_smp <= '1; irls_cln <= '1;
     end
     else begin if(i_CEN) begin
-        if(i_PCEN) begin
+        if(i_PERI_PCEN) begin
             irl_smp  <= irq_sync[3:0];
             irls_smp <= irls_sync;
             if(irl_smp  == irq_sync[3:0]) irl_cln  <= irq_sync[3:0];

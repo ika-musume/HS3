@@ -31,7 +31,7 @@ module tmu (
     input   wire            i_RST_n,
     input   wire            i_CLK,
     input   wire            i_CEN,
-    input   wire            i_PCEN,         //P-phi enable (i_CEN-qualified) from the CPG
+    input   wire            i_PERI_PCEN,    //P-phi enable (i_CEN-qualified) from the CPG
 
     /* INTERFACES */
     IBus_2.slave            REG_BUS,        //P bus window 0xFFFFFE90-B8 (behind the BSC)
@@ -78,14 +78,14 @@ logic   [7:0]   psc;
 always_ff @(posedge i_CLK or negedge i_RST_n) begin
     if(!i_RST_n) psc <= 8'd0;
     else begin if(i_CEN) begin
-        if(i_PCEN) psc <= psc + 8'd1;
+        if(i_PERI_PCEN) psc <= psc + 8'd1;
     end end
 end
 
-wire            tick4   = i_PCEN & (psc[1:0] == 2'h3);
-wire            tick16  = i_PCEN & (psc[3:0] == 4'hF);
-wire            tick64  = i_PCEN & (psc[5:0] == 6'h3F);
-wire            tick256 = i_PCEN & (psc[7:0] == 8'hFF);
+wire            tick4   = i_PERI_PCEN & (psc[1:0] == 2'h3);
+wire            tick16  = i_PERI_PCEN & (psc[3:0] == 4'hF);
+wire            tick64  = i_PERI_PCEN & (psc[5:0] == 6'h3F);
+wire            tick256 = i_PERI_PCEN & (psc[7:0] == 8'hFF);
 
 //TCLK: 2FF sync at core rate, then P-phi two-sample edge detect (the INTC
 //IRQ sampler pattern = the 1.5-Pcyc minimum pulse width of p.403)
@@ -97,12 +97,12 @@ always_ff @(posedge i_CLK or negedge i_RST_n) begin
     else begin if(i_CEN) begin
         tclk_ff   <= i_TCLK;
         tclk_sync <= tclk_ff;
-        if(i_PCEN) tclk_smp <= tclk_sync;
+        if(i_PERI_PCEN) tclk_smp <= tclk_sync;
     end end
 end
 
-wire            tclk_rise = i_PCEN & ~tclk_smp &  tclk_sync;
-wire            tclk_fall = i_PCEN &  tclk_smp & ~tclk_sync;
+wire            tclk_rise = i_PERI_PCEN & ~tclk_smp &  tclk_sync;
+wire            tclk_fall = i_PERI_PCEN &  tclk_smp & ~tclk_sync;
 
 
 

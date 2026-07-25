@@ -3,14 +3,16 @@
 /*
     CPG + WDT (SH7709S section 9, pp.203-218; STBCR/STBCR2 section 8.2,
     pp.183-186). FPGA adaptation: one architectural clock, no PLLs - FRQCR is
-    bookkeeping plus a REAL peripheral-clock divider: o_PCEN pulses at the
-    I:P ratio implied by the IFC/PFC fields (every legal table-9.4 pair gives
-    an integer ratio in {1,2,3,4,6}). The CPG also owns the bus clock: o_BCEN
-    paces the BSC's SDRAM engine and the o_CKIO pin drives the board (p.207:
-    modes 0-2 generate the system clock from the chip's CKIO output). The WDT
-    counts on o_PCEN through the CKS prescaler taps and implements both
-    modes: interval (ITI interrupt, code 0x560) and watchdog (internal reset
-    request per RSTS).
+    bookkeeping plus a REAL peripheral-clock divider: o_PERI_PCEN pulses at
+    the I:P ratio implied by the IFC/PFC fields (every legal table-9.4 pair
+    gives an integer ratio in {1,2,3,4,6}). The CPG also owns the bus clock
+    and is its SINGLE source: o_BUS_PCEN (CKIO rise) and o_BUS_NCEN (CKIO
+    fall) pace every bus-domain consumer - nobody re-derives a phase from
+    i_CEN downstream - and the o_CKIO pin drives the board (p.207: modes 0-2
+    generate the system clock from the chip's CKIO output). The WDT counts on
+    o_PERI_PCEN through the CKS prescaler taps and implements both modes:
+    interval (ITI interrupt, code 0x560) and watchdog (internal reset request
+    per RSTS).
 
     Reset domains (pp.211,214-215): WTCNT/WTCSR and the counters reset ONLY by
     the pin POR (RESETP) and are retained across WDT-caused internal resets;
@@ -33,11 +35,10 @@ module cpg_wdt (
     IBus_2.slave            REG_BUS,        //window 0xFFFFFF80-8F
 
     /* CLOCK/INTERRUPT/RESET FANOUT */
-    output  wire            o_PCEN,         //peripheral clock (P-phi) enable, i_CEN-qualified
-    output  wire            o_BCEN,         //bus clock (B-phi) enable - the SDRAM engine pace
+    output  wire            o_PERI_PCEN,    //peripheral clock (P-phi) enable, i_CEN-qualified
+    output  wire            o_BUS_PCEN,     //bus clock rising-edge enable  - CKIO rises here
+    output  wire            o_BUS_NCEN,     //bus clock falling-edge enable - CKIO falls here
     output  wire            o_CKIO,         //bus clock output pin (B-phi square wave)
-    output  wire            o_CKIO_PCEN,
-    output  wire            o_CKIO_NCEN,
     output  wire            o_ITI_REQ,      //WDT interval interrupt request (level = IOVF)
     output  wire            o_WDT_RST_POR_n,//watchdog reset request, RSTS=0 (16-cycle pulse)
     output  wire            o_WDT_RST_MAN_n //watchdog reset request, RSTS=1
@@ -123,8 +124,8 @@ always_ff @(posedge i_CLK or negedge i_POR_n) begin
     end end
 end
 
-wire            pcen = (pdiv_cnt == 3'd0);          //reset default: /4 (FRQCR 0x0102)
-assign  o_PCEN = i_CEN & pcen;
+wire            peri_ph = (pdiv_cnt == 3'd0);       //reset default: /4 (FRQCR 0x0102)
+assign  o_PERI_PCEN = i_CEN & peri_ph;
 
 
 
@@ -137,7 +138,7 @@ assign  o_PCEN = i_CEN & pcen;
     rate and FRQCR only re-paces I-phi/P-phi around it (table 9.4); with no
     FPGA PLLs the /2 is wired. The SH7709S FRQCR has NO CKOEN bit (bit 8 is
     reserved-1, p.212), so CKIO always drives in the output modes 0-2
-    (p.207). DATASHEET PHASE: the pin RISES at the BCEN-enabled command
+    (p.207). DATASHEET PHASE: the pin RISES at the BUS_PCEN-enabled command
     edges - every bus pin changes at the CKIO rise and the mid-state shapes
     (RD/WEn, WAIT sampling) sit at the fall, as figs 10.14/23.16 draw them.
     Board note: a synchronous device clocked straight off this pin samples
@@ -145,9 +146,15 @@ assign  o_PCEN = i_CEN & pcen;
     device clock (output-delay constraint or a small trace/clock-tree skew,
     ~1/4 cycle) exactly as with the real chip's tOD window. Raw-pin POR
     domain: the SDRAM engine phase must survive manual resets (p.297).
+
+    ONE source, one name: the phase flop makes the two bus enables and the
+    pin is its own flop clocked off them. Consumers take BUS_PCEN/BUS_NCEN
+    and never re-derive a phase (no "i_CEN && !enable" downstream), so a
+    single grid drives the engine, the pads, the WAIT/DREQ samplers and the
+    monitor windows.
 */
 
-logic           ckio_ph;
+logic           ckio_ph;                        //1 = CKIO low half, so the next edge rises it
 always_ff @(posedge i_CLK or negedge i_POR_n) begin
     if(!i_POR_n) ckio_ph <= 1'b0;
     else begin if(i_CEN) begin
@@ -155,10 +162,27 @@ always_ff @(posedge i_CLK or negedge i_POR_n) begin
     end end
 end
 
-assign  o_BCEN = i_CEN & ckio_ph;
-assign  o_CKIO = ~ckio_ph;      //rises at the command edges (datasheet phase)
-assign  o_CKIO_PCEN = ~o_CKIO & i_CEN;
-assign  o_CKIO_NCEN =  o_CKIO & i_CEN;
+wire            bus_pcen = i_CEN &  ckio_ph;    //CKIO rise: commands, pin updates
+wire            bus_ncen = i_CEN & ~ckio_ph;    //CKIO fall: mid-state, WAIT/DREQ sampling
+
+//the pin itself: rises at the command edges (datasheet phase), holds when the
+//architectural enable is low. Reset high - the phase counter starts on a fall.
+//(one-hot case, not "unique if": Quartus 17.0 takes unique only on a case)
+logic           ckio;
+always_ff @(posedge i_CLK or negedge i_POR_n) begin
+    if(!i_POR_n) ckio <= 1'b1;
+    else begin
+        unique case({bus_pcen, bus_ncen})       //the two enables are exclusive
+            2'b10:   ckio <= 1'b1;              //command edge: rise
+            2'b01:   ckio <= 1'b0;              //mid-state edge: fall
+            default: ckio <= ckio;              //i_CEN low: hold the level
+        endcase
+    end
+end
+
+assign  o_BUS_PCEN = bus_pcen;
+assign  o_BUS_NCEN = bus_ncen;
+assign  o_CKIO     = ckio;
 
 
 
@@ -171,7 +195,7 @@ logic   [11:0]  presc;
 always_ff @(posedge i_CLK or negedge i_POR_n) begin
     if(!i_POR_n) presc <= 12'd0;
     else begin if(i_CEN) begin
-        if(pcen) presc <= presc + 12'd1;
+        if(peri_ph) presc <= presc + 12'd1;
     end end
 end
 
@@ -189,7 +213,7 @@ always_comb begin
     endcase
 end
 
-wire            wt_count    = i_CEN & pcen & tap & wt_tme & ~wr_wtcnt;  //software write wins
+wire            wt_count    = i_CEN & peri_ph & tap & wt_tme & ~wr_wtcnt;  //software write wins
 wire            wt_overflow = wt_count & (wtcnt == 8'hFF);
 
 //WTCNT/WTCSR: pin-POR domain ONLY - retained across WDT-caused internal resets (p.215)

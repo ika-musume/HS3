@@ -9,7 +9,7 @@
          address windows (0xFFFFD000/0xFFFFE000, p.252);
       2. the ORIGINAL SDRAM interface - areas 2/3 when BCR1.DRAMTP selects
          synchronous DRAM (p.234). Command timing is register-programmed
-         (MCR/WCR2) and runs on the 50 MHz bus enable i_BCEN, reproducing the
+         (MCR/WCR2) and runs on the 50 MHz bus enable i_BUS_PCEN, reproducing the
          real chip's natural latency (figs 10.14-10.28). Burst-read/single-
          write, BL=1: a cache line moves as 4 pipelined READ/WRIT commands
          (8 half-word beats on a 16-bit BCR2 bus width). Address multiplexing
@@ -32,7 +32,7 @@
          latency law); P-window accesses never touch the external pins.
 
     Front-end/register file tick on i_CEN (100 MHz core rate); only the
-    PCB-facing SDRAM engine + refresh timer tick on i_BCEN. Same clock, so
+    PCB-facing SDRAM engine + refresh timer tick on i_BUS_PCEN. Same clock, so
     the flag exchange is plain registers - no synchronizers (user decision).
 
     Reset domains (p.228 note, p.297): ALL BSC registers and the SDRAM
@@ -96,7 +96,8 @@ module bsc #(
     input   wire            i_CLK,
     input   wire            i_CEN,      //core enable - front-end / register file / generic leg
     (* direct_enable *)
-    input   wire            i_BCEN,     //bus enable (50 MHz) - SDRAM engine + refresh timer
+    input   wire            i_BUS_PCEN, //bus enable (50 MHz) at CKIO rises - engine + refresh
+    input   wire            i_BUS_NCEN, //same grid, CKIO falls - mid-state (WAIT) sampling
 
     /* INTERFACES */
     IBus_1.slave            I_BUS,      //from the splitter's external leg
@@ -152,19 +153,30 @@ module bsc #(
     /* IRQOUT contribution (p.321): refresh request pending, cycle not run */
     output  wire            o_REF_PEND,
 
-    /* GENERIC MEMORY PORT - address/control view only: ALL data rides the
-       physical D pins (user rule). Every external access is mirrored here;
-       ordinary accesses are held for their timed bus cycle. EITHER
-       i_MEM_READY or i_MEM_RSP_VALID completes an ordinary access early -
-       always as one full 32-bit D-bus transfer, bypassing the width split -
-       so tying both low leaves i_WAIT_n in sole control. */
-    output  wire            o_MEM_REQ,
-    output  wire            o_MEM_WR,
-    output  wire            o_MEM_BURST,    //beat of a 16-byte line transfer
-    output  wire    [1:0]   o_MEM_SIZE,
+    /* TRANSACTION PORT (spec: docs/Early_Monitor_Guide.md) - the complete
+       transaction view of the external bus, in parallel with the unchanged
+       pins. REQ = one registered 1-cycle pulse per committed external UNIT
+       at its accept edge; fields load with it and hold until the next unit.
+       DE = one 1-cycle pulse per data beat: read units pop-confirm AT the
+       BSC's own consume edge (ordinary T2 fall / SDRAM capture rise / hsk
+       completion), write units push WDATA at each accepted beat - CKIO
+       cycles before the pins. Read data still enters on i_D_I (an FWFT
+       FIFO head); EITHER i_MEM_READY or i_MEM_RSP_VALID completes an
+       ordinary access early - always as one full 32-bit D-bus transfer,
+       bypassing the width split - so tying both low leaves i_WAIT_n in
+       sole control. All rails are dedicated FFs: no accept/engine cone
+       loading, no pre-accept pend visibility (REQ = commitment). */
+    output  wire            o_MEM_REQ,      //1-cycle pulse at the unit accept edge
+    output  wire            o_MEM_WR,       //1 = write (early direction, held)
+    output  wire            o_MEM_BURST,    //16-byte unit / burst-ROM envelope
+    output  wire    [1:0]   o_MEM_SIZE,     //I_BUS size encoding
     output  wire    [28:0]  o_MEM_ADDR,     //physical (A31-29 shadow stripped, p.232)
-    output  wire    [6:0]   o_MEM_CS_n,     //area strobes; bit n = area n (bit 1 never asserts)
-    output  wire    [3:0]   o_MEM_WSTRB,    //32-bit-lane byte enables (control view)
+    output  wire    [4:0]   o_MEM_LEN,      //physical beat count (= read pop count)
+    output  wire            o_MEM_SADDR,    //single-address DMAC unit: WDATA not sourced
+    output  wire    [6:0]   o_MEM_CS_n,     //held area decode; bit n = area n (bit 1 never asserts)
+    output  wire    [3:0]   o_MEM_WSTRB,    //32-bit-lane byte enables (held; partial only on single-beat units)
+    output  wire            o_MEM_DE,       //1-cycle pulse per beat: read pop / write push
+    output  wire    [31:0]  o_MEM_WDATA,    //write beat payload, valid under a WR push
     input   wire            i_MEM_READY,
     input   wire            i_MEM_RSP_VALID,
     input   wire            i_MEM_FAULT,
@@ -177,18 +189,6 @@ module bsc #(
        tri-state the write data path (fig 11.10a). SDRAM-area DACK/single
        cycles are NOT implemented (ordinary/burst-ROM areas only). */
     output  wire    [1:0]   o_DACK_WIN,     //[0]=DACK0 window, [1]=DACK1 window
-
-    /* TRANSACTION MONITOR - MON (early-transaction sideband "fast main",
-       ikacore_CV1k sh3_sideband.md):
-       advisory-with-guarantees strobe for an external memory controller -
-       ONE registered pulse per committed external transaction UNIT at its
-       internal accept edge, fields valid only under the pulse. Nothing is
-       received back; the external protocol is the unchanged contract. */
-    output  wire            o_MON_REQ,       //1-cycle pulse, one per external unit
-    output  wire            o_MON_WR,        //1 = write
-    output  wire    [28:0]  o_MON_ADDR,      //physical, [28:26] = CS area (o_MEM_ADDR encoding)
-    output  wire    [1:0]   o_MON_SIZE,      //I_BUS size encoding
-    output  wire            o_MON_BURST,     //16-byte unit / burst-ROM envelope
 
     /* REFRESH TIMER INTERRUPTS (table 6.4 REF entries) */
     output  wire            o_RCMI_REQ,     //compare match  (INTEVT 0x580)
@@ -294,7 +294,7 @@ wire            fe_b_head = I_BUS.req_write ? !b_wr_act : !b_rd_act;
 wire            fe_b_cont = fe_sdram && ((b_rd_act && !I_BUS.req_write) ||
                                          (b_wr_act &&  I_BUS.req_write));
 
-//engine request slot (single outstanding; consumed by the engine at a BCEN edge)
+//engine request slot (single outstanding; consumed by the engine at a BUS_PCEN edge)
 logic           eng_go;
 wire            eng_busy;           //engine FSM outside E_IDLE
 logic           self_active;        //self-refresh entered; requests stall until exit
@@ -364,14 +364,11 @@ end
 ////
 
 /*
-    ALL external areas are exposed on the port (user rule: the external
-    controller masks by address + its own map). BSC-owned areas (SDRAM 2/3,
-    dummy 1/7) appear as a ONE-CYCLE strobe at their internal accept edge -
-    one pulse = one committed access, observation only. Ordinary/burst-ROM
-    accesses are HELD on the port (latched fields, level o_MEM_REQ) for the
-    whole register-timed bus cycle so a raw memory can decode them like a
-    real external bus; a handshake controller instead pulses i_MEM_RSP_VALID
-    to complete early (the IPC-parity fast path).
+    The transaction-port REQUEST view lives in its own section (registered
+    pulse + held fields - no live request export). This leg keeps only the
+    external COMPLETION handshake: i_MEM_RSP_VALID / i_MEM_READY finish an
+    ordinary access early (the IPC-parity fast path), paced by
+    o_MEM_RSP_READY; posted/prefetched envelope beats self-accept.
 */
 
 //ordinary bus cycle in flight: the port carries the latched access
@@ -386,13 +383,6 @@ logic           ord_dack;           //DMAC sideband: frame DACK on this cycle's 
 logic           ord_dack_ch;        //  which pin: 0 = DACK0, 1 = DACK1
 logic           ord_saddr;          //  single-address cycle: a write leaves D undriven (fig 11.10a)
 
-assign  o_MEM_REQ       = ord_busy ? 1'b1            :
-                          (I_BUS.req_valid & ~fe_p4 & (fe_gen | I_BUS.req_ready));
-assign  o_MEM_WR     = ord_busy ? ord_write       : I_BUS.req_write;
-assign  o_MEM_BURST     = ord_busy ? ord_burst       : I_BUS.req_burst;
-assign  o_MEM_SIZE      = ord_busy ? ord_size        : I_BUS.req_size;
-assign  o_MEM_ADDR      = ord_busy ? ord_addr[28:0]  : fa[28:0];
-assign  o_MEM_WSTRB     = ord_busy ? ord_wstrb       : I_BUS.req_wstrb;
 //posted/prefetched envelope beats SELF-ACCEPT their external completion
 //("accept pacing is always internal"): a pulse no call is waiting on must
 //not wedge the external controller's response handshake
@@ -400,12 +390,6 @@ wire            ord_self_acc = (ordb_act && !(ob_wait && ordb_cnt == ordp_cnt)) 
                                ((ordw_act || ord_wr_ack || ow_last_wait) &&
                                 !(ow_last_wait && ordp_cnt == 2'd3));
 assign  o_MEM_RSP_READY = (I_BUS.rsp_ready & (owner_q == OWN_GEN)) | ord_self_acc;
-
-wire    [2:0]   cs_area = ord_busy ? ord_area : fe_area;
-genvar gi;
-generate for(gi = 0; gi < 7; gi = gi + 1) begin : g_cs
-    assign o_MEM_CS_n[gi] = ~(o_MEM_REQ && cs_area == gi[2:0]);
-end endgenerate
 
 //response mux back to the cache: the generic owner completes on the external
 //handshake (READY or RSP_VALID, one full 32-bit D-bus transfer - the parity
@@ -449,7 +433,7 @@ wire            fe_rsp_done = I_BUS.rsp_valid && I_BUS.rsp_ready;
 ////
 
 /*
-    Bus cycles tick on i_BCEN (the 50 MHz CKIO view). A first access runs
+    Bus cycles tick on i_BUS_PCEN (the 50 MHz CKIO view). A first access runs
     T1 + n Tw + T2 = 2 + WCR2-first-wait states, read data sampled at the
     mid-T2 fall (figs 10.6/10.10, 23.16). The WAIT pin stretches the Tw
     region when enabled for the area (nonzero wait setting; a 0-wait area
@@ -589,7 +573,7 @@ endfunction
 wire            ord_idle_ok_nx = idle_ok(fe_area, I_BUS.req_write);   //at the accept edge
 wire            ord_idle_ok_q  = idle_ok(ord_area, ord_write);        //at a held launch
 
-//pin data-cycle end events (BCEN edges): ord close of the LAST sub-cycle,
+//pin data-cycle end events (BUS_PCEN edges): ord close of the LAST sub-cycle,
 //engine last CL landing, engine last write beat. Refresh/MRS move no data.
 //A handshake-completed (generic port) access never drove the D pins: skipped.
 //every datum now closes through its T2 state; an envelope ends at the
@@ -605,7 +589,7 @@ always_ff @(posedge i_CLK or negedge i_POR_n) begin
         turn_read <= 1'b0;
         turn_gap  <= 2'd3;
     end
-    else begin if(i_BCEN) begin
+    else begin if(i_BUS_PCEN) begin
         if(ord_end_tk) begin
             turn_area <= ord_area;
             turn_read <= !ord_write;
@@ -676,7 +660,7 @@ wire            ord_hi16  = ord_ba[1] ^ BIG_ENDIAN;             //1: word lanes 
 //silicon - HS3 keeps the legacy boundary-edge sample as its defined behavior
 logic           wait_smp;
 always_ff @(posedge i_CLK) begin
-    if(i_CEN && !i_BCEN) wait_smp <= i_WAIT_n;
+    if(i_BUS_NCEN) wait_smp <= i_WAIT_n;
 end
 wire            wait_ok_now = wcr1[15] ? wait_smp : i_WAIT_n;
 
@@ -709,7 +693,7 @@ always_ff @(posedge i_CLK or negedge i_RST_n) begin
         if(i_CEN && fe_acc && fe_gen && !ord_bcont) begin   //HEAD/single latched at the
             ord_busy  <= 1'b1;                          //accept edge; pins assert on the
             ord_done  <= 1'b0;                          //bus-clock grid (an off-grid accept
-            ord_run   <= i_BCEN && ord_idle_ok_nx;      //waits <=1 core cycle; WCR1 idles
+            ord_run   <= i_BUS_PCEN && ord_idle_ok_nx;  //waits <=1 core cycle; WCR1 idles
             ord_cnt   <= ord_first;                     //hold the launch). Head beat =
             //continuation beats/subs: burst pitch on a BCR1 burst-ROM area  //first-access
             //(total states = pitch, so count = pitch - 1), first-access again on plain
@@ -788,10 +772,10 @@ always_ff @(posedge i_CLK or negedge i_RST_n) begin
             end
             else ordp_stall <= 1'b1;        //datum not queued yet (see below)
         end
-        else if(i_BCEN && ord_busy && !ord_run) begin
+        else if(i_BUS_PCEN && ord_busy && !ord_run) begin
             if(ord_idle_ok_q) ord_run <= 1'b1;          //grid-align + WCR1 idle gap
         end
-        else if(i_BCEN && ord_busy && !ord_done) begin
+        else if(i_BUS_PCEN && ord_busy && !ord_done) begin
             ord_bs_n <= 1'b1;                           //BS covers each sub's first cycle
             if(ordp_stall) begin
                 //write envelope paused between beats: the next datum was not
@@ -855,7 +839,7 @@ always_ff @(posedge i_CLK or negedge i_RST_n) begin
         //lets the device release data the moment RD rises, so sampling any
         //later is unbuildable. Inside a burst-ROM READ run only the strobe
         //re-pulses; CSn stays low until the run's last datum (p.304, fig 23.19)
-        else if(i_CEN && !i_BCEN && ord_busy && ord_run && !ord_done) begin
+        else if(i_BUS_NCEN && ord_busy && ord_run && !ord_done) begin
             if(!ord_bs_n) ord_stb <= 1'b1;              //mid-launch (BS marks that state)
             if(ord_t2) begin                            //data mid: sample, then negate
                 ord_stb <= 1'b0;
@@ -883,7 +867,7 @@ always_ff @(posedge i_CLK) begin if(i_CEN) begin
     end
     else if(gen_ext_done && ordp_env && ord_busy && !ordp_stall && !ord_write)
         obuf[ordp_cnt] <= i_D_I;
-    else if(i_BCEN && ord_busy && !ord_done && !ordp_stall && ord_t2 &&
+    else if(i_BUS_PCEN && ord_busy && !ord_done && !ordp_stall && ord_t2 &&
             ord_subs == 2'd0 && ordp_env && !ord_write)
         obuf[ordp_cnt] <= ord_data;
 end end
@@ -905,7 +889,7 @@ always_ff @(posedge i_CLK or negedge i_RST_n) begin
             obuf_v[ordp_cnt] <= 1'b1;
             obuf_f[ordp_cnt] <= i_MEM_FAULT;    //buffered fault: reported on ITS call
         end
-        else if(i_BCEN && ord_busy && !ord_done && !ordp_stall && ord_t2 &&
+        else if(i_BUS_PCEN && ord_busy && !ord_done && !ordp_stall && ord_t2 &&
                 ord_subs == 2'd0 && ordp_env && !ord_write)
             obuf_v[ordp_cnt] <= 1'b1;
     end end
@@ -1046,13 +1030,13 @@ wire            eng_wr_pend  = (eng_go && eng_op_write) ||
                                             est == E_ACTV    || est == E_RCD || est == E_WR));
 wire            fe_eng_start = fe_acc_eng && (!fe_b_cont ||
                                               (I_BUS.req_write && !eng_wr_pend));
-wire            eng_start_tk;                   //engine takes the op (BCEN edge)
+wire            eng_start_tk;                   //engine takes the op (BUS_PCEN edge)
 
 always_ff @(posedge i_CLK or negedge i_RST_n) begin
     if(!i_RST_n) eng_go <= 1'b0;
     else begin if(i_CEN) begin
         if(fe_eng_start)      eng_go <= 1'b1;
-        else if(eng_start_tk) eng_go <= 1'b0;   //i_BCEN implies i_CEN
+        else if(eng_start_tk) eng_go <= 1'b0;   //i_BUS_PCEN implies i_CEN
     end end
 end
 
@@ -1088,32 +1072,62 @@ end
 
 
 ///////////////////////////////////////////////////////////
-//////  Transaction Monitor - MON (early-transaction sideband, CV1k fast main)
+//////  Transaction Port - REQ + fields + write push (docs/Early_Monitor_Guide.md)
 ////
 
 /*
-    One registered pulse per committed external transaction UNIT, launched
-    the core cycle after its accept edge (dedicated FFs: the port never
-    loads the accept cone with external routing). Unit mapping:
+    One registered pulse per committed external transaction UNIT at its
+    accept edge (dedicated FFs: the port never loads the accept cone with
+    external routing); fields load with the pulse and hold until the next
+    unit. Unit mapping:
       - SDRAM head/single op = fe_eng_start. A line fill strobes ONCE; a
         write drain resumed after a mid-burst yield re-arms through a fresh
         continuation accept, so the resumed op strobes AGAIN carrying the
-        first remaining beat's address (write envelopes may end early -
-        read fills never split, E_RD runs all beats).
-      - ordinary/burst-ROM = envelope head (continuation calls ride it).
+        first remaining beat's address and remaining LEN (write envelopes
+        may end early - read fills never split, E_RD runs all beats).
+      - ordinary/burst-ROM = envelope head (continuation calls ride it -
+        their write beats appear as DE pushes).
     Exemptions (consumer pin-decodes them, spec R2): CBR/self-refresh and
-    BRQ_PALL (no front-end request), MRS via the SDMR window (init class).
-    A manual reset drops an accepted-undispatched op (eng_go clears), so
-    the consumer flushes its match queue on any reset assertion (R10).
+    BRQ_PALL (no front-end request), MRS via the SDMR window (init class),
+    P-bus / local / dummy areas. A manual reset drops an accepted-
+    undispatched op (eng_go clears), so the consumer flushes its FIFOs and
+    match queue on any reset assertion (R10).
+    LEN = PHYSICAL beat count: longwords in the unit x sub-beats per
+    longword (the area's BCR2 port width; SDRAM: 16-bit mode pops halves).
+    Write beats push {DE, WDATA} at their own accept edges; the read-pop
+    half of DE lives after the engine (it needs rd_lat).
 */
 
 logic           mon_req_q;
-logic           mon_wr_q, mon_burst_q;
+logic           mon_wr_q, mon_burst_q, mon_saddr_q;
 logic   [1:0]   mon_size_q;
 logic   [28:0]  mon_addr_q;
+logic   [4:0]   mon_len_q;
+logic   [3:0]   mon_wstrb_q;
+logic   [6:0]   mon_csn_q;
+logic   [31:0]  mon_wdata_q;
 
 wire            mon_fire = (fe_eng_start && !fe_sdmr) ||
                           (fe_acc && fe_gen && !ord_bcont);
+
+//physical beat count at the accept edge: shift = log2(sub-beats per datum)
+//from the area's port width; line beats are longwords, a resumed drain
+//counts only the remaining slots (fa[3:2] = first remaining beat)
+wire            mon_pw16  = fe_eng ? ((fe_area == 3'd3) ? sd16_a3 : sd16_a2)
+                                   : ord_w16_c;
+wire            mon_pw8   = !fe_eng && ord_w8_c;
+wire    [1:0]   mon_dsz   = I_BUS.req_burst ? 2'd2 : I_BUS.req_size;
+wire    [1:0]   mon_psh   = mon_pw8 ? mon_dsz :
+                            {1'b0, mon_pw16 && (mon_dsz == 2'd2)};
+wire    [2:0]   mon_lw    = !I_BUS.req_burst ? 3'd1 :
+                            fe_b_cont ? (3'd4 - {1'b0, fa[3:2]}) : 3'd4;
+wire    [4:0]   mon_len_c = {2'b00, mon_lw} << mon_psh;
+
+//write-beat push: one DE pulse + payload per accepted external write beat
+//(gen single + every envelope call; SDRAM head + wr_buf continuations).
+//SADDR units push too (count framing) - their WDATA is never sourced
+wire            mon_wpush = fe_acc && I_BUS.req_write &&
+                            (fe_gen || (fe_eng && !fe_sdmr));
 
 always_ff @(posedge i_CLK or negedge i_RST_n) begin
     if(!i_RST_n) mon_req_q <= 1'b0;
@@ -1124,15 +1138,28 @@ always_ff @(posedge i_CLK or negedge i_RST_n) begin
             mon_burst_q <= I_BUS.req_burst;
             mon_size_q  <= I_BUS.req_size;
             mon_addr_q  <= fa[28:0];
+            mon_len_q   <= mon_len_c;
+            mon_saddr_q <= I_BUS.req_saddr;
+            mon_wstrb_q <= I_BUS.req_wstrb;
+            mon_csn_q   <= ~(7'b000_0001 << fa[28:26]);  //held area decode
         end
     end end
 end
 
-assign  o_MON_REQ   = mon_req_q;
-assign  o_MON_WR    = mon_wr_q;
-assign  o_MON_ADDR  = mon_addr_q;
-assign  o_MON_SIZE  = mon_size_q;
-assign  o_MON_BURST = mon_burst_q;
+always_ff @(posedge i_CLK) begin if(i_CEN) begin
+    if(mon_wpush) mon_wdata_q <= I_BUS.req_wdata;   //valid under the push pulse
+end end
+
+assign  o_MEM_REQ   = mon_req_q;
+assign  o_MEM_WR    = mon_wr_q;
+assign  o_MEM_ADDR  = mon_addr_q;
+assign  o_MEM_SIZE  = mon_size_q;
+assign  o_MEM_BURST = mon_burst_q;
+assign  o_MEM_LEN   = mon_len_q;
+assign  o_MEM_SADDR = mon_saddr_q;
+assign  o_MEM_WSTRB = mon_wstrb_q;
+assign  o_MEM_CS_n  = mon_csn_q;
+assign  o_MEM_WDATA = mon_wdata_q;
 
 
 
@@ -1253,12 +1280,12 @@ assign  REG_DMAC.wdata = pbs_wdata_q;
 
 
 ///////////////////////////////////////////////////////////
-//////  SDRAM Engine (i_BCEN domain - the natural-latency machine)
+//////  SDRAM Engine (i_BUS_PCEN domain - the natural-latency machine)
 ////
 
 /*
     Commands on {CS,RAS,CAS,WE} (p.276); one command per 20 ns bus cycle.
-    Pin registers update at BCEN edges; the PCB clock rises mid-cycle (180
+    Pin registers update at BUS_PCEN edges; the PCB clock rises mid-cycle (180
     degrees), giving 10 ns setup/hold either side. Spacing counts (TPC after
     a precharge, RCD after ACTV) are command-to-command distances: value 1
     means back-to-back commands, so wait states = value - 1. Duration counts
@@ -1482,7 +1509,7 @@ assign          bus_held = brq | bus_rel;
 
 always_ff @(posedge i_CLK or negedge i_POR_n) begin
     if(!i_POR_n) bus_rel <= 1'b0;
-    else begin if(i_BCEN) begin
+    else begin if(i_BUS_PCEN) begin
         if(!brq)                                       bus_rel <= 1'b0;
         else if((est == E_IDLE || est == E_SLF) &&
                 !ord_busy && !eng_go && ba_v == 4'd0 &&
@@ -1507,7 +1534,7 @@ wire            eng_idle_ok    = idle_ok(eng_cs3 ? 3'd3 : 3'd2, eng_op_write);
 wire            eng_dispatch_ok = !ord_busy && !(brq && ba_v != 4'd0) &&
                                   !(ref_ok && !bus_held) && !(self_req && !bus_held) &&
                                   eng_idle_ok;
-assign  eng_start_tk = (est == E_IDLE) && i_BCEN && eng_go && eng_dispatch_ok;
+assign  eng_start_tk = (est == E_IDLE) && i_BUS_PCEN && eng_go && eng_dispatch_ok;
 //E_SLF is a PARKED state: the SDRAM sits in self-refresh on CKE alone and
 //the shared bus is free for ordinary cycles (a new SDRAM op is still held
 //off by self_active). Everything else counts as bus ownership.
@@ -1524,7 +1551,7 @@ wire            wr_last     = e_sd16 ? (e_burst ? (ebeat == 3'd7) :
                                      : (!e_burst || ebeat[1:0] == 2'd3);
 wire            wr_hi       = ebeat[0] ^ BIG_ENDIAN;    //16-bit half: word lanes 31:16
 wire    [1:0]   wr_slot     = e_burst ? (e_sd16 ? ebeat[2:1] : ebeat[1:0]) : e_addr[3:2];
-assign  eng_wr_done = (est == E_WR) && i_BCEN && wr_v[wr_slot] && wr_last;
+assign  eng_wr_done = (est == E_WR) && i_BUS_PCEN && wr_v[wr_slot] && wr_last;
 
 //16-bit-bus read DQM pair (DQMLU/DQMLL rails; tables 10.8/10.11 strobe map)
 wire    [1:0]   rd16_dqml   = (e_burst || e_size != 2'd0) ? 2'b00 :
@@ -1559,7 +1586,7 @@ always_ff @(posedge i_CLK or negedge i_POR_n) begin
         sd_cke    <= 1'b1;
         sd_dq_o   <= 32'd0; sd_dq_oe <= 1'b0;
     end
-    else begin if(i_BCEN) begin
+    else begin if(i_BUS_PCEN) begin
         rst_z <= i_RST_n;
 
         //every cycle defaults to NOP/deselect; op arms below override.
@@ -1946,7 +1973,7 @@ end
 //landing capture: whole words on a 32-bit bus; a 16-bit bus assembles each
 //word from two D15-D0 halves (lane placement per tables 10.8/10.11)
 always_ff @(posedge i_CLK) begin
-    if(i_BCEN && rd_lat) begin
+    if(i_BUS_PCEN && rd_lat) begin
         if(!e_sd16)      rd_buf[rd_latw]        <= i_D_I;
         else if(rd_lath) rd_buf[rd_latw][31:16] <= i_D_I[15:0];
         else             rd_buf[rd_latw][15:0]  <= i_D_I[15:0];
@@ -1959,14 +1986,61 @@ always_ff @(posedge i_CLK or negedge i_RST_n) begin
     if(!i_RST_n) wv <= 4'd0;
     else begin
         if(i_CEN && fe_acc_eng && !I_BUS.req_write && !fe_sdmr && !fe_b_cont) wv <= 4'd0;
-        else if(i_BCEN && rd_lat && rd_latf) wv[rd_latw] <= 1'b1;
+        else if(i_BUS_PCEN && rd_lat && rd_latf) wv[rd_latw] <= 1'b1;
     end
 end
 
 
 
 ///////////////////////////////////////////////////////////
-//////  Refresh Timer (i_BCEN domain, CKIO-based; pp.253-257)
+//////  Transaction Port - DE (per-beat pulse: read pop / write push)
+////
+
+/*
+    o_MEM_DE: ONE i_CLK pulse per data beat, rising AT the edge where the
+    beat changes hands (Early_Monitor_Guide.md section 4):
+      - SDRAM read:  the capture rise itself (i_BUS_PCEN && rd_lat) - one
+        pulse per PHYSICAL beat (16-bit mode pops per half).
+      - ordinary/burst-ROM read: the data-state mid fall where i_D_I is
+        sampled (tRDH1 = 0); an hsk completion consumes at its own core
+        edge instead (envelope beat or single, off-grid). When both land
+        on one edge the hsk branch wins in the ord FSM - the OR still
+        yields one pulse for the one consumed beat.
+      - write beats: the accept edge (mon_wpush + WDATA, REQ+fields
+        section) - CKIO cycles before the pins; the pin-time launch
+        generates nothing here.
+    Registered mirror of the BSC's own consume/accept enables: no
+    prediction, no cone loading; wait states move the pulse automatically.
+    Prefetched-beat CALL drains (ob_rsp_v off obuf_v) are NOT consume
+    events - their pop fired at the pin sample that filled the slot.
+*/
+
+logic           mon_de_q;
+
+wire            mon_hsk_bt = gen_ext_done && ordp_env && ord_busy && !ordp_stall;
+wire            mon_pop_sd = i_BUS_PCEN && rd_lat;               //SDRAM capture rise
+wire            mon_pop_ot = i_BUS_NCEN && ord_busy && ord_run &&
+                             !ord_done && ord_t2 && !ord_write &&
+                             !mon_hsk_bt;                        //timed T2-fall sample
+wire            mon_pop_hb = mon_hsk_bt && !ord_write;           //hsk envelope beat
+wire            mon_pop_hs = gen_ext_done && fe_rsp_done && ord_busy &&
+                             !gen_bctx && !ord_write &&
+                             (owner_q == OWN_GEN);               //hsk single completion
+
+always_ff @(posedge i_CLK or negedge i_RST_n) begin
+    if(!i_RST_n) mon_de_q <= 1'b0;
+    else begin if(i_CEN) begin
+        mon_de_q <= mon_wpush || mon_pop_sd || mon_pop_ot ||
+                    mon_pop_hb || mon_pop_hs;
+    end end
+end
+
+assign  o_MEM_DE = mon_de_q;
+
+
+
+///////////////////////////////////////////////////////////
+//////  Refresh Timer (i_BUS_PCEN domain, CKIO-based; pp.253-257)
 ////
 
 //prescaler taps: CKS 001=/4 010=/16 011=/64 100=/256 101=/1024 110=/2048 111=/4096
@@ -1987,7 +2061,7 @@ end
 
 always_ff @(posedge i_CLK or negedge i_POR_n) begin
     if(!i_POR_n) presc <= 12'd0;
-    else begin if(i_BCEN) begin
+    else begin if(i_BUS_PCEN) begin
         presc <= presc + 12'd1;
     end end
 end
@@ -2054,7 +2128,7 @@ always_ff @(posedge i_CLK or negedge i_POR_n) begin
     if(!i_POR_n) rtcnt <= 8'd0;
     else begin
         if(i_CEN && wr_rtcnt)   rtcnt <= wr_w[7:0];
-        else if(i_BCEN) begin
+        else if(i_BUS_PCEN) begin
             if(rt_match)        rtcnt <= 8'd0;
             else if(presc_tick) rtcnt <= rtcnt + 8'd1;
         end
@@ -2079,7 +2153,7 @@ always_ff @(posedge i_CLK or negedge i_POR_n) begin
             cmf_clr_arm <= !wr_w[7];                    //write-1 never changes CMF
             rtcsr[2]    <= rtcsr[2] & wr_w[2];          //OVF: write-0 clears now
         end
-        else if(i_BCEN) begin
+        else if(i_BUS_PCEN) begin
             if(ref_done && cmf_clr_arm) begin           //the armed clear is consumed
                 rtcsr[7]    <= rt_match;
                 cmf_clr_arm <= 1'b0;
@@ -2096,14 +2170,14 @@ always_ff @(posedge i_CLK or negedge i_POR_n) begin
     if(!i_POR_n) rfcr <= 10'd0;
     else begin
         if(i_CEN && wr_rfcr)        rfcr <= wr_w[9:0];
-        else if(i_BCEN && ref_done) rfcr <= (rfcr == rfcr_lim) ? 10'd0 : rfcr + 10'd1;
+        else if(i_BUS_PCEN && ref_done) rfcr <= (rfcr == rfcr_lim) ? 10'd0 : rfcr + 10'd1;
     end
 end
 
 //refresh request: latched at compare match, cleared when the REF cycle runs
 always_ff @(posedge i_CLK or negedge i_POR_n) begin
     if(!i_POR_n) ref_req <= 1'b0;
-    else begin if(i_BCEN) begin
+    else begin if(i_BUS_PCEN) begin
         if(rt_match && rfsh && !rmode) ref_req <= 1'b1;
         else if(ref_done)              ref_req <= 1'b0;
     end end
@@ -2112,7 +2186,7 @@ end
 //self-refresh entry tracker for the front-end request stall
 always_ff @(posedge i_CLK or negedge i_POR_n) begin
     if(!i_POR_n) self_active <= 1'b0;
-    else begin if(i_BCEN) begin
+    else begin if(i_BUS_PCEN) begin
         if(est == E_SLF_CMD)                       self_active <= 1'b1;
         else if(est == E_SLF_EXIT && ecnt <= 4'd1) self_active <= 1'b0;
     end end
@@ -2131,7 +2205,7 @@ assign  o_ROVI_REQ = rtcsr[2] & rtcsr[1];       //OVF & OVIE
 logic   [2:0]   apu_cnt;
 always_ff @(posedge i_CLK or negedge i_POR_n) begin
     if(!i_POR_n) apu_cnt <= 3'd0;
-    else begin if(i_BCEN) begin
+    else begin if(i_BUS_PCEN) begin
         if(!bus_rel)             apu_cnt <= 3'd0;
         else if(apu_cnt != 3'd4) apu_cnt <= apu_cnt + 3'd1;
     end end
@@ -2190,7 +2264,7 @@ assign  o_MCS0_CS0 = ~mcscr[0][6];      //area-0 decode: CS0 pad may switch (p.3
 
 /*
     Ordinary bus cycles (ord_busy, latched in the front-end) and SDRAM engine
-    cycles (sd_* regs, BCEN domain) never overlap - one outstanding
+    cycles (sd_* regs, BUS_PCEN domain) never overlap - one outstanding
     transaction - so every shared pin is a plain 2:1 mux of registers.
     Idle levels match silicon: strobes high, address holds, D released.
 */
