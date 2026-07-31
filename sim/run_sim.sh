@@ -30,7 +30,7 @@ shift 2
 [ -f "$TB_FILE" ]  || { echo "error: testbench '$TB_FILE' not found"  >&2; exit 1; }
 
 TOP="$(basename "$TB_FILE" .sv)"
-OBJ_DIR="$SIM_DIR/obj_dir_$TOP"
+OBJ_DIR="$SIM_DIR/obj_dir_$TOP${VLT_DEFINES:+_def}"    #defines get their own build dir
 
 #gather sources: design tree + sim/ support files, minus every *_tb.sv
 #(the target tb is appended explicitly), minus build outputs
@@ -42,7 +42,10 @@ mapfile -t SOURCES < <(
 
 #lint waivers are scoped to tb/vendor files (see verilator_waivers.vlt);
 #warnings in design sources still fail the build
+#VLT_DEFINES: optional extra -D switches (e.g. VLT_DEFINES=-DHS3_RDW_HOSTILE_CACHE
+#builds the adversarial M10K DONT_CARE collision model for the RDW audit)
 verilator --binary -j 0 -O3 --sv \
+    ${VLT_DEFINES:-} \
     "$SIM_DIR/verilator_waivers.vlt" \
     --top-module "$TOP" \
     -Mdir "$OBJ_DIR" \

@@ -1182,7 +1182,14 @@ wire            ma_inflight   = data_req_sent || (exma.valid && !exma.fault && m
 
 //The pipe OWNS the whole acceptance-boundary invariant and exports ONE bit; the
 //exception handler no longer reassembles it from three raw pipeline signals.
-assign  o_INT_BOUNDARY = o_RETIRE_VALID && !retire_int_defer && !ma_inflight;
+//ma_inflight only watches EX/MA. A memory op that has LEFT MA but not yet committed sits
+//in MA/WB with its external access already accepted (a store is a notify: it went out at
+//the EX/MA edge; a load's response is consumed). Killing it there re-runs the access after
+//the handler - invisible on ordinary memory, a duplicated transaction on any device
+//register with side effects. Defer one edge, the same idiom as retire_int_defer.
+wire            wb_mem_done   = mawb.valid && mawb.mem_done;
+
+assign  o_INT_BOUNDARY = o_RETIRE_VALID && !retire_int_defer && !ma_inflight && !wb_mem_done;
 
 //!i_REDIRECT_VALID: the packet in WB at an interrupt-redirect edge is KILLED (its
 //retirement and every other commit lane are suppressed) - without this gate its GPR
@@ -2103,6 +2110,7 @@ always_comb begin
     ex_result.dbr           = idex.branch_delayed;  //interrupt-defer marker (pair atomicity)
     ex_result.nd_taken      = idex.branch_op != BR_NONE && !idex.branch_delayed &&
                               branch_taken;         //commit successor = redirect target
+    ex_result.pair_taken    = idex.pair_taken;      //taken-pair slot marker (see arch_next_pc)
     ex_result.mem_size      = idex.mem_size;
     ex_result.load_signed   = idex.load_signed;
     ex_result.byte_op       = idex.byte_op;
@@ -2538,34 +2546,33 @@ assign  o_I_SQUASH = fetch_drop;
 //PC. The old scan needed one patched arm per frontier state (taken-branch loss,
 //dropped-fetch, held pair - two of those shipped as bugs); the register makes the
 //whole class unreachable. Update per retiring packet X:
-//  X.nd_taken                  -> the EX redirect target (taken non-delayed BT/BF)
-//  X.delay_slot && pair_taken  -> the EX redirect target (slot of a TAKEN pair)
-//  otherwise                   -> X.pc + 2
+//  X.nd_taken                    -> the EX redirect target (taken non-delayed BT/BF)
+//  X.delay_slot && X.pair_taken  -> the EX redirect target (slot of a TAKEN pair)
+//  otherwise                     -> X.pc + 2
 //rdir_target_q holds the ONE outstanding EX redirect target: in-order EX with the
 //1-deep fetch cannot resolve a second taken branch before the first's consumer
 //commits (the target's first instruction reaches EX no earlier than that edge; a
-//same-edge re-arm is read-old/write-new safe). pair_taken_q marks a taken DELAYED
-//pair in flight; kills clear it (the pair re-executes and re-arms). Acceptance is
-//legal only on a retire pulse, so the register is always fresh at a boundary, and
-//interrupts never split a pair, so a mid-pair value is never consumed.
+//same-edge re-arm is read-old/write-new safe). pair_taken is a PER-PACKET bit set
+//on the slot at issue, the same edge its branch resolves in EX. Its predecessor -
+//a shared in-flight flag armed at EX and cleared at any slot commit - was cleared
+//by an OLDER NOT-taken pair's slot committing one edge after a younger taken
+//branch armed it (bt/s-not-taken then bra, back to back at IPC 1): an interrupt
+//at the bra-slot boundary then restarted at slot.pc+2, and one at the not-taken
+//slot boundary jumped to the young target early (the ibara/vec_0 crash, see
+//hs3_vec0_repro.md). Packet state dies with kills, so no cross-pair coupling.
 logic   [31:0]  arch_next_pc;   //next PC to execute, as of the last commit
 logic   [31:0]  rdir_target_q;  //last EX branch-redirect target (single outstanding)
-logic           pair_taken_q;   //taken delayed pair in flight (slot commit consumes)
 
 wire            commit_fire = wb_valid && !i_REDIRECT_VALID && !mawb.fault;
 always_ff @(posedge i_CLK or negedge i_RST_n) begin
     if(!i_RST_n) begin
         arch_next_pc  <= RESET_PC;
         rdir_target_q <= RESET_PC;
-        pair_taken_q  <= 1'b0;
     end
     else begin if(cen) begin
         if(branch_redirect) rdir_target_q <= branch_target;
-        if(i_REDIRECT_VALID || wb_fault_kill)            pair_taken_q <= 1'b0; //pair re-executes
-        else if(branch_redirect && idex.branch_delayed)  pair_taken_q <= 1'b1; //arm beats consume
-        else if(commit_fire && mawb.delay_slot)          pair_taken_q <= 1'b0;
         if(commit_fire) begin
-            arch_next_pc <= (mawb.nd_taken || (mawb.delay_slot && pair_taken_q))
+            arch_next_pc <= (mawb.nd_taken || (mawb.delay_slot && mawb.pair_taken))
                             ? rdir_target_q : mawb.pc + 32'd2;
         end
     end end
@@ -2586,6 +2593,9 @@ always_comb begin
     ma_result.delay_slot    = exma.delay_slot;
     ma_result.dbr           = exma.dbr;
     ma_result.nd_taken      = exma.nd_taken;
+    ma_result.pair_taken    = exma.pair_taken;
+    //Interrupt-defer marker for the WB stage: the access is already on the bus.
+    ma_result.mem_done      = exma.valid && !exma.fault && exma.mem_op != MEM_NONE;
     ma_result.gpr0_we       = exma.gpr0_we;
     ma_result.gpr0_dst      = exma.gpr0_dst;
     ma_result.gpr0_data     = exma.mem_op == MEM_LOAD ? load_value : exma.gpr0_data;
@@ -2741,6 +2751,7 @@ always_ff @(posedge i_CLK or negedge i_RST_n) begin
         ifid.pd          <= '0;
         idex.valid          <= 1'b0;
         idex.delay_slot     <= 1'b0;
+        idex.pair_taken     <= 1'b0;
         fwd_lane_a          <= FWD_NONE;   //EX-head lane picks (shadow words = R7 strip)
         fwd_lane_b          <= FWD_NONE;
         fwd_lane_st         <= FWD_NONE;
@@ -3074,7 +3085,14 @@ always_ff @(posedge i_CLK or negedge i_RST_n) begin
                                    ((id_decode.src_a_id == id_decode.src_b_id)
                                         ? {id_mem_step[30:0], 1'b0} : id_mem_step) :
                                32'd0;
-                if(id_issue && branch_event && branch_delayed) idex.delay_slot <= 1'b1;
+                //Slot marking, same edge its branch resolves in EX (a delayed branch
+                //cannot leave EX without the slot issuing - see ex_complete). The taken
+                //bit rides the PACKET: shared in-flight state was cleared by an older
+                //NOT-taken pair's slot commit (the vec_0 wrong-resume bug).
+                if(id_issue && branch_event && branch_delayed) begin
+                    idex.delay_slot <= 1'b1;
+                    idex.pair_taken <= branch_taken;
+                end
             end
             //Operand captures on the PER-CLUSTER idex_allow duplicates (identical value,
             //placement-local enables). Written after the main load so they own the field.

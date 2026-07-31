@@ -165,6 +165,10 @@ logic   [7:0]   d_fault_widx;
 integer         d_latency;       //extra response-wait cycles for MA-wait tests
 integer         i_latency;       //extra response-wait cycles on INSTRUCTION reads (fill-stretch knob)
 integer         data_request_count;
+//Accepted external WRITE transactions to byte address 0x400. The architectural
+//store detectors elsewhere watch GPR side effects, which a kill+re-execute reverts
+//and redoes identically - only a BUS-transaction count sees a store issued twice.
+integer         store_txn_400;
 
 //Unified external memory model. The cache now drives ONE bus, so instruction
 //fetches and data accesses are serialised here. They are told apart with a
@@ -204,6 +208,7 @@ always_ff @(posedge clk_p or negedge rst_n) begin
         MEM_BUS.rsp_rdata  <= 32'd0;
         MEM_BUS.rsp_fault  <= 1'b0;
         data_request_count <= 0;
+        store_txn_400      <= 0;
         for(i = 0; i < 256; i = i + 1) dmem[i] <= 32'd0;
     end
     else begin if(1'b1) begin
@@ -213,6 +218,8 @@ always_ff @(posedge clk_p or negedge rst_n) begin
             mem_is_data <= req_is_data;
             if(req_is_data) begin
                 data_request_count <= data_request_count + 1;
+                if(MEM_BUS.req_write && MEM_BUS.req_addr == 32'h0000_0400)
+                    store_txn_400 <= store_txn_400 + 1;
                 mem_is_fault <= d_fault_en && (MEM_BUS.req_addr[9:2] == d_fault_widx);
                 mem_wait_cnt <= d_latency;
                 //A faulting access leaves memory unchanged, matching no-commit behavior.
@@ -479,6 +486,28 @@ integer         squash_fill_hits = 0;       //cycles with I_SQUASH high during a
 integer         entry_cache_busy = 0;       //interrupt/exception entries with the cache FSM mid-excursion
 integer         entry_state_cov [0:31];     //entries per cache FSM state (acceptance-coverage histogram)
 integer         int_arm_cov [0:6];          //interrupt acks per o_INT_NEXT_PC restart-PC source arm
+integer         ack_kills_wb_store = 0;     //acks that killed a WB-resident (already-issued) store
+integer         store_wb_window    = 0;     //cycles the boundary was OPEN with such a store in WB
+integer         swb_a=0, swb_b=0, swb_c=0, swb_d=0;  //window breakdown: total / retire / defer / inflight
+//Suite-wide exposure probe. mawb_t drops mem_op, so shadow it: this bit says the packet
+//currently in MA/WB already performed an external data access (its request was accepted
+//in EX, its response consumed) but has NOT yet committed. ma_inflight is EX/MA-scoped and
+//stops tracking exactly here, so an acceptance edge in this state kills an access that
+//already escaped to the bus - and re-runs it after the handler.
+logic           wb_mem_shadow = 1'b0;
+integer         ack_on_wb_mem = 0;      //acks landing on such a packet, whole suite
+integer         wb_mem_open   = 0;      //boundary-open cycles in that state, whole suite
+
+always @(posedge clk) begin
+    if(!rst_n) wb_mem_shadow <= 1'b0;
+    else if(u_dut.u_int_pipe.cen) begin
+        if(u_dut.u_int_pipe.i_REDIRECT_VALID)  wb_mem_shadow <= 1'b0;
+        else if(u_dut.u_int_pipe.ma_complete)  wb_mem_shadow <= u_dut.u_int_pipe.exma.valid &&
+                                                               !u_dut.u_int_pipe.exma.fault &&
+                                                               u_dut.u_int_pipe.exma.mem_op != MEM_NONE;
+        else                                   wb_mem_shadow <= 1'b0;
+    end
+end
 
 integer         lbus_dreq_pends  = 0;       //unaccepted-and-held D-request cycles observed
 integer         lbus_dreq_viol   = 0;       //D-request field mutated while pending
@@ -602,6 +631,26 @@ always @(posedge clk) begin
         //(4b) Restart-PC source coverage: which o_INT_NEXT_PC mux arm each interrupt
         //acceptance actually used (mirrors the priority in int_pipe). Proves the
         //sweeps reach the deep arms (held pair / pending fetch), not just mawb.
+        //(4c) The window this probe cares about: an acceptance edge that KILLS a
+        //WB-resident store whose bus write has already been accepted externally.
+        //(mawb_t drops mem_op, so key on the probe program's own store opcode 0x2322.)
+        if((int_ack_w || nmi_ack_w) && u_dut.u_int_pipe.mawb.valid &&
+           u_dut.u_int_pipe.mawb.inst == 16'h2322)
+            ack_kills_wb_store = ack_kills_wb_store + 1;
+        //Does the window even EXIST? Boundary open with an already-issued store still
+        //uncommitted in WB. Zero here means the hardware closes it, not that we missed it.
+        if(u_dut.u_int_pipe.o_INT_BOUNDARY && u_dut.u_int_pipe.mawb.valid &&
+           u_dut.u_int_pipe.mawb.inst == 16'h2322)
+            store_wb_window = store_wb_window + 1;
+        if(u_dut.u_int_pipe.o_INT_BOUNDARY && wb_mem_shadow) wb_mem_open = wb_mem_open + 1;
+        if((int_ack_w || nmi_ack_w) && wb_mem_shadow)        ack_on_wb_mem = ack_on_wb_mem + 1;
+        if(u_dut.u_int_pipe.mawb.valid && u_dut.u_int_pipe.mawb.inst == 16'h2322) begin
+            swb_a = swb_a + 1;
+            if(u_dut.u_int_pipe.o_RETIRE_VALID) swb_b = swb_b + 1;
+            if(u_dut.u_int_pipe.retire_int_defer) swb_c = swb_c + 1;
+            if(u_dut.u_int_pipe.ma_inflight) swb_d = swb_d + 1;
+        end
+
         if(int_ack_w || nmi_ack_w) begin
             if     (u_dut.u_int_pipe.mawb.valid)  int_arm_cov[0] = int_arm_cov[0] + 1;
             else if(u_dut.u_int_pipe.exma.valid)  int_arm_cov[1] = int_arm_cov[1] + 1;
@@ -2133,6 +2182,67 @@ task automatic test_int_timing_sweep;
     end
 endtask
 
+//GOLDEN W - the ibara/vec_0 wrong-resume bug (hs3_vec0_repro.md, 2026-07-29). A NOT-taken
+//delayed pair's slot commit one edge after a younger taken branch resolved in EX cleared
+//the shared pair_taken flag, so an interrupt at the taken pair's slot boundary restarted
+//at slot.pc+2 (fall-through); the not-taken slot's own boundary conversely read the young
+//arm and skipped the taken pair early. Loop tail is the game idiom bt/s(not-taken)+slot
+//then bra+slot, streamed at IPC 1 from the cache; the sweep walks acceptance across every
+//boundary. Laws: fall-through never runs, both increment chains intact, exactly one entry.
+task automatic test_int_pairtaken_hazard;
+    integer off, w;
+    begin
+        begin_test("Interrupt vs back-to-back delayed pairs: not-taken bt/s then bra (vec_0 resume)");
+        for(off = 0; off < 32; off = off + 1) begin
+            cacheable_bootstrap(8'h09);
+            imem['h20] = 16'hE860;  // MOV    #0x60,R8 ; BL-clear prologue (IMASK=0)
+            imem['h21] = 16'h4818;  // SHLL8  R8
+            imem['h22] = 16'h4828;  // SHLL16 R8
+            imem['h23] = 16'h480E;  // LDC    R8,SR
+            imem['h24] = 16'hED00;  // MOV   #0,R13   ; handler entry counter
+            imem['h25] = 16'hE308;  // MOV   #8,R3    ; loop count
+            imem['h26] = 16'hE200;  // MOV   #0,R2    ; body increments
+            imem['h27] = 16'hEC00;  // MOV   #0,R12   ; fall-through marker
+            imem['h28] = 16'hEE00;  // MOV   #0,R14   ; bra-slot increments
+            //loop: body, then the hazard tail - NOT-taken BT/S pair right before a BRA pair
+            imem['h29] = 16'h7201;  // ADD   #1,R2
+            imem['h2A] = 16'h4310;  // DT    R3
+            imem['h2B] = 16'h8D03;  // BT/S  exit     ; taken only on the last iteration
+            imem['h2C] = 16'h0009;  //   slot
+            imem['h2D] = 16'hAFFA;  // BRA   loop
+            imem['h2E] = 16'h7E01;  //   slot: ADD #1,R14 (lost if the bra pair is skipped)
+            imem['h2F] = 16'hEC55;  // MOV   #0x55,R12 ; fall-through: must never execute
+            imem['h30] = 16'h0009;  // exit: sentinel
+            imem['h31] = 16'hAFFE;  // guard
+            imem['h32] = 16'h0009;
+            //handler at VBR+0x600: count the entry and return
+            imem['h300] = 16'h7D01; // ADD   #1,R13
+            imem['h301] = 16'h0009;
+            imem['h302] = 16'h002B; // RTE
+            imem['h303] = 16'h0009; //   delay slot
+            do_reset;
+            run_until_retire('h24, 20000);        //R13 initialized: loop is starting
+            repeat(off) @(posedge clk);
+            int_level_q = 4'd8;
+            int_code_q  = 12'h600;
+            int_valid_q = 1'b1;
+            //Sticky-counter keyed level drop, same rationale as the timing sweep above.
+            w = 0;
+            while(entry_count == 0 && w < 2000) begin @(posedge clk); w = w + 1; end
+            @(posedge clk);
+            int_valid_q = 1'b0;
+            run_until_retire('h302, 20000);
+            run_until_retire('h30, 20000);
+            chk($sformatf("off=%0d: exactly one entry", off), gpr(13), 32'd1);
+            chk($sformatf("off=%0d: fall-through never executed", off), gpr(12), 32'd0);
+            chk($sformatf("off=%0d: body count intact", off), gpr(2), 32'd8);
+            chk($sformatf("off=%0d: bra-slot count intact", off), gpr(14), 32'd7);
+        end
+        do_reset;
+        end_test;
+    end
+endtask
+
 //GOLDEN V - interrupt vs miss/fill/drain machinery. The old timing sweep runs at zero
 //latency where cached hits respond combinationally, so an acceptance edge almost never
 //overlaps an in-flight cache excursion. Here the loop walks EIGHT same-set (set 6)
@@ -2657,6 +2767,76 @@ task automatic test_squash_victim_drain;
             chk($sformatf("wrong-path poison never retired (i=%0d)", l), gpr(10), 32'd0);
         end
         i_latency = 0;
+        do_reset;
+        end_test;
+    end
+endtask
+
+//PROBE - store exactly-once as seen ON THE BUS. Eight NOP-spaced stores to ONE fixed
+//address run under a held level-8 request, acceptance swept across every phase. Every
+//other store law in this bench watches an architectural side effect (the pre-decrement
+//pointer, the memory word), and a kill + re-execute reverts and redoes those identically
+//- only counting accepted external WRITE transactions can see a store issued twice.
+//NOP spacing matters: back-to-back stores keep req_sent (ma_inflight) high and close the
+//boundary themselves, so the exposed window only opens behind a non-memory instruction.
+task automatic test_int_store_bus_once;
+    integer off, k, w;
+    begin
+        begin_test("Interrupt vs plain store: exactly one BUS write per store (offset sweep)");
+        for(off = 0; off < 60; off = off + 1) begin
+            //WRITE-THROUGH cacheable: every store still writes through to the bus, but the
+            //SECOND loop iteration runs entirely out of cache. Bypass mode cannot reach the
+            //window at all - its bubbles always separate a commit from the store's WB cycle.
+            cacheable_bootstrap(8'h0B);
+            imem['h20] = 16'hE860;  // MOV    #0x60,R8 ; BL-clear prologue (MD,RB / BL=0 / IMASK=0)
+            imem['h21] = 16'h4818;  // SHLL8  R8
+            imem['h22] = 16'h4828;  // SHLL16 R8
+            imem['h23] = 16'h480E;  // LDC    R8,SR
+            imem['h24] = 16'hED00;  // MOV   #0,R13   ; handler counter
+            imem['h25] = 16'hE304;  // MOV   #4,R3
+            imem['h26] = 16'h4318;  // SHLL8 R3       ; R3 = 0x400 (dmem word 0)
+            imem['h27] = 16'hE25A;  // MOV   #0x5A,R2
+            imem['h28] = 16'hEC02;  // MOV   #2,R12   ; two passes: warm, then measured
+            imem['h29] = 16'hEE00;  // MOV   #0,R14
+            for(k = 0; k < 8; k = k + 1) begin
+                imem['h2A + 3*k]     = 16'h2322;  // MOV.L R2,@R3 ; same address, same data
+                imem['h2A + 3*k + 1] = 16'h0009;  // NOP          ; opens the WB-resident window
+                imem['h2A + 3*k + 2] = 16'h0009;  // NOP
+            end
+            imem['h42] = 16'h7E01;  // ADD   #1,R14   ; per-iteration marker (arm point)
+            imem['h43] = 16'h4C10;  // DT    R12
+            imem['h44] = 16'h8FE4;  // BF/S  loop ('h2A)
+            imem['h45] = 16'h0009;  //   delay slot
+            imem['h46] = 16'h0009;  // sentinel
+            imem['h47] = 16'hAFFE;  // guard
+            imem['h48] = 16'h0009;
+            imem['h300] = 16'h7D01; // ADD   #1,R13   ; VBR+0x600 handler (no stores)
+            imem['h301] = 16'h002B; // RTE
+            imem['h302] = 16'h0009; //   delay slot
+            do_reset;
+            run_until_retire('h42, 30000);      //first (warming) pass done
+            repeat(off) @(posedge clk);
+            int_level_q = 4'd8;
+            int_code_q  = 12'h600;
+            int_valid_q = 1'b1;
+            w = 0;
+            while(int_ack_count == 0 && w < 20000) begin @(posedge clk); w = w + 1; end
+            @(posedge clk);
+            int_valid_q = 1'b0;
+            run_until_retire('h46, 30000);
+            w = 0;
+            while(gpr(13) == 32'd0 && w < 20000) begin @(posedge clk); w = w + 1; end
+            run_cycles(30);
+            chk($sformatf("off=%0d: interrupt ack'd exactly once", off), int_ack_count, 32'd1);
+            chk($sformatf("off=%0d: handler ran once", off), gpr(13), 32'd1);
+            chk($sformatf("off=%0d: both passes ran", off), gpr(14), 32'd2);
+            chk($sformatf("off=%0d: 16 stores -> 16 bus writes", off), store_txn_400, 32'd16);
+            chk($sformatf("off=%0d: stored word", off), dmem[0], 32'h0000_005A);
+        end
+        $display("      WB-resident-store boundary-open cycles: %0d, acks landing there: %0d",
+                 store_wb_window, ack_kills_wb_store);
+        $display("      breakdown: store-in-WB cycles=%0d, of which retire_valid=%0d, defer=%0d, ma_inflight=%0d",
+                 swb_a, swb_b, swb_c, swb_d);
         do_reset;
         end_test;
     end
@@ -3688,6 +3868,8 @@ task automatic test_property_summary;
         begin_test("Suite-wide properties: LRU divergence, L-bus/MEM-bus contracts, lock pairs, int acks");
         $display("      LRU: %0d update checks, %0d victim checks; L-bus: %0d req-pend, %0d rsp-pend cycles; MEM-bus: %0d pend cycles",
                  lru_upd_checks, lru_vic_checks, lbus_dreq_pends, lbus_drsp_pends, mbus_req_pends);
+        $display("      acceptance edges landing on an already-accessed, uncommitted WB packet: %0d (open cycles %0d)",
+                 ack_on_wb_mem, wb_mem_open);
         $display("      locked RMW pairs completed: %0d; interrupt acks cross-checked: %0d",
                  lock_pairs_checked, ack_checks);
         chk_true("LRU checker exercised", (lru_upd_checks > 100) && (lru_vic_checks > 20));
@@ -5814,6 +5996,7 @@ initial begin
     if($test$plusargs("focus")) begin
         group("focus: interrupt/exception machinery subset");
         test_int_timing_sweep;
+        test_int_pairtaken_hazard;
         test_int_miss_sweep;
         test_int_tas_atomic;
         test_exc_int_collision;
@@ -5952,10 +6135,12 @@ initial begin
     group("12. Pipeline state: LDC-SR spacing, interrupt timing/machinery, exc collision, random oracle");
     test_cached_ldcsr_tight;
     test_int_timing_sweep;
+    test_int_pairtaken_hazard;
     test_int_miss_sweep;
     test_int_tas_atomic;
     test_exc_int_collision;
     test_exc_int_collision2;
+    test_int_store_bus_once;
     test_int_sr_race;
     test_int_bl_nested;
     test_int_flush_collision;

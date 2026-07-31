@@ -604,3 +604,132 @@ Levers that COULD move the plateau (all bigger / need a decision):
 - Verdict: **NEUTRAL, KEPT** — same shape as the o_SB strobe and o_MON_DE
   precedents (dedicated FFs off already-registered state). Campaign remains
   closed at R4; this is a bookkeeping re-measure, not a round.
+
+## 2026-07-28 — interrupt-boundary WB guard (`mawb.mem_done`) re-measure (3 seeds) — NEUTRAL/POSITIVE
+
+- Change: `o_INT_BOUNDARY` gained a fourth term, `!wb_mem_done`. `ma_inflight` is
+  EX/MA-scoped, so a memory op that has LEFT MA but not yet committed sat in MA/WB
+  with its external access already accepted (a store is a notify, issued at the
+  EX/MA edge; a load's response is already consumed). An acceptance edge there
+  killed the WB packet and SPC pointed at it, so the access was RE-ISSUED after the
+  handler — invisible in architectural state, a duplicated bus transaction on any
+  device register with side effects. One new `mawb_t` bit (`mem_done`) set in
+  `ma_result`, one AND at the boundary. Functional detail in the tb note below.
+- Verification: cpu_core_tb 104/104 (new golden [93] counts BUS writes, not GPR side
+  effects: 60-offset sweep, WT-cacheable so the pipeline actually runs back-to-back)
+  + HS3_tb 85/85, zero law movement. IPC 0.401 / 0.974 / 0.554 — unchanged.
+  Suite-wide window census: 79 acceptance edges over 2405 open cycles BEFORE,
+  **0 / 0 AFTER**. NOTE: the bug does NOT reproduce on the bypass path — low IPC
+  always bubbles between a commit and the store's WB cycle, so a bypass-only probe
+  passes vacuously (0 window cycles). This is why 103 prior tests never saw it.
+- Baseline discipline: HEAD re-fit in the SAME session reproduced the 2026-07-25
+  numbers EXACTLY (dse -2.720, s4 -2.641, s5 -2.982), so the flow is deterministic
+  per seed and these deltas are attributable, not seed noise.
+- Worst multicorner slack @ 10 ns (same-session baseline -> change):
+  dse -2.720 -> **-2.351 (+0.369)**, s4 -2.641 -> -2.729 (-0.088),
+  s5 -2.982 -> **-2.796 (+0.186)**. Mean -2.781 -> **-2.625 (+0.156)**.
+  Restricted Fmax 78.62/79.11/77.03 -> **80.97**/78.56/78.15 MHz.
+- Cones: `mem_done` / `int_boundary` / `retire_int_defer` in **0/20 on all three
+  seeds**. Headliners both sides are the catalogued plateau families re-rolled:
+  advance front (`fwd_lane_*`/`fwd_wbsel_*`/`mawb.gpr0_data`/`second_access`/
+  `req_sent`) into {S_IDLE, fetch_pending_pc, pair_pc, exma.gpr0_data, o_EXPEVT,
+  bram_addr}. Direct TimeQuest probe on the dse netlist (no refit): exactly ONE
+  `mawb.mem_done` FF, worst path FROM it **-0.189**, worst path TO it **+2.413** —
+  ~2.2 ns clear of the headline.
+- Resources: registers 7,963 / 7,879 / 7,888 (was 7,901 / 7,898 / 7,932),
+  memory bits 158,336 (=).
+- Verdict: **NEUTRAL, arguably positive** — and notably the FIRST change shape in
+  this log that did not pay the -0.3..-0.7 plateau tax; dse's -2.351 is the best
+  dse fit recorded. Read conservatively: 2-of-3 seeds better at +0.156 mean is
+  inside the seed spread, so the claim is "no measurable cost", not "faster".
+  Campaign remains closed at R4. **UNCOMMITTED at the user's instruction.**
+
+## 2026-07-29 — per-packet `pair_taken` (ibara/vec_0 wrong-resume fix) — RTL LANDED, OOC re-measure PENDING
+
+- Change: the interrupt restart-PC machinery's shared `pair_taken_q` register is
+  DELETED; taken-ness now rides the packet as a `pair_taken` bit in
+  idex_t/exma_t/mawb_t, set on the slot at issue (the same edge its branch
+  resolves in EX — `ex_complete` guarantees same-edge) and read at that packet's
+  own commit in the `arch_next_pc` mux. Root cause (probe ring, vendor stack
+  t=253,306,315..355 ns): the shared flag, armed by a young taken `bra` in EX,
+  was consumed one edge later by an OLDER not-taken `bt/s` pair's slot commit —
+  the loop-tail idiom `bt/s`(not-taken)+slot then `bra`+slot at IPC 1. An
+  interrupt at the `bra`-slot boundary then resumed at slot.pc+2; one boundary
+  earlier it jumped to the young target early (skipping the pair). Every
+  ibara/vec_0 symptom (the "wrong-word/wrong-line load", poisoned ADDR, lost
+  DBG_MBX store, phantom fill, EXPEVT 0x100 detonation) was fall-through from
+  that one wrong SPC — no data path was ever wrong. See
+  ikacore_CV1k/docs/hs3_vec0_repro.md (RESOLVED section).
+- Verification: cpu_core_tb **105/105** (suite renumbered: the mem_done golden
+  [93] is now [94]). New golden [89] `test_int_pairtaken_hazard` — the
+  bt/s-not-taken + bra loop tail under an interrupt offset sweep — fails BOTH
+  polarities on the HEAD core (fall-through executed / body+slot counts lost)
+  and is clean on the fix; [94] re-confirmed red on HEAD (17 bus writes for 16
+  stores). HS3_tb **85/85**, zero law movement, IPC 0.401/0.974/0.554 unchanged.
+  CV1k vec_0 12M-insn re-runs CLEAN on BOTH stacks (`v0_fix_run.log`,
+  `ms_vec0_fix_run.log`): 12M cap reached at t=608 ms (2.4x past the old
+  fatal), no pump %Fatal, probe canary 0 hits, zero `8c000100` entries and zero
+  `0c0029a4` fall-throughs in the traces. The EXACT pre-fix alignment recurs at
+  retire ~2.577M (TMU0 accepted at the bra+slot boundary) and RTE now resumes
+  at the branch target 0c00291c.
+- OOC: **NOT yet measured.** Expected shape: three pipeline-register bits on
+  already-enabled edges (idex/exma/mawb loads), no new commit-mux depth (the
+  select swaps a dedicated register read for a mawb field read), one register
+  DELETED. Same dedicated-FF-off-registered-state family as the o_SB / o_MON_DE
+  / mem_done precedents (all 0/20-cone neutral). Run the 3-seed ritual with a
+  same-session HEAD re-anchor before quoting numbers; log the result here.
+  **MEASURED 2026-07-30** (incidental: the RDW session's v1 s7 fit = this RTL
+  plus a no-op attribute drop): worst **−2.394** — inside the flown family and
+  the best recent s7. The full 3-seed exists only for the union with the RDW
+  OLD_DATA change (next entry) — also neutral. Considered CLOSED.
+- Verdict: **CORRECTNESS FIX, KEPT** (SH7709S interrupt semantics are law; the
+  IPC-first rule is not in tension — no bubbles, no handshake beats, no new
+  stall terms). Campaign remains closed at R4.
+  **UNCOMMITTED at the user's instruction, alongside mem_done.**
+
+## 2026-07-30 — cache data-bank RDW = DONT_CARE (ibara bug #3) — OLD_DATA altsyncram LANDED, 3-seed NEUTRAL
+
+- Change: `cache_data_bank_wt` consumed the RAM q on a same-edge write/read
+  collision — the UN-strobed lanes of a sub-word store — while
+  `ramstyle "M10K, no_rw_check"` fitted the altsyncram with mixed-port RDW =
+  **DONT_CARE** (map/fit parameter tables). Verilator models old-data, so the
+  divergence is invisible to every simulator by construction: this is ibara
+  bug #3 (CV1k `docs/bug3_audit_report.md` — silicon-only random corrupted
+  reads, identical across two placements AND a −15% underclock, survives
+  pair_taken + mem_done). The file's own claim "the colliding RAM lanes are
+  never consumed" was false for sub-word stores. Fix v1 (drop the attribute)
+  is a DEAD END: Quartus classes the template dual-clock (warning 276027) and
+  still fits DONT_CARE — inference cannot express mixed-port OLD_DATA (its
+  only matching tool, pass-through, is new-data). Fix v2 LANDED: the banks
+  instantiate `altsyncram` directly (`DUAL_PORT`, byte_size 8, M10K,
+  `read_during_write_mode_mixed_ports("OLD_DATA")`) under an
+  `ifdef VERILATOR` split; the behavioral twin is lane-equivalent incl. the
+  clocken-stall corner (masked lanes never change in the array).
+- Verification: adversarial in-tree models (`HS3_RDW_HOSTILE_CACHE` /
+  `HS3_RDW_HOSTILE_GPR` ifdefs invert exactly the uncovered collision lanes;
+  `VLT_DEFINES` hook in run_sim.sh, `RDWHOSTILE=1` arm in CV1k build_sim.sh).
+  Hostile-cache turns cpu_core_tb RED on the selfmod sweep k=3 (a MOV.W
+  poke's commit edge colliding with the fetch of the same cell — the measured
+  I-side consumer; GOLDEN D is the D-side spec of the same reliance).
+  Hostile-GPR **105/105 GREEN** — the gpr_2r2w "shadow forward upstream"
+  no_rw_check claim is empirically total, attribute KEPT there. Tag/LRU are
+  proof-safe (full-entry bypass ⇒ colliding q dead), attribute KEPT. All 14
+  fitted RAMs audited (BSC obuf = Quartus auto pass-through). Normal suites
+  on the v2 split: cpu_core_tb **105/105**, HS3_tb **85/85**, bit-identical.
+  CV1k FASTBOOT ibara control-vs-hostile traces byte-IDENTICAL at 2M AND 20M
+  — but the collision counters read **6,079 exposed-collision read cycles in
+  20M insns** (per way 1255/1087/1315/2422): the game hits the write/read
+  same-cell alignment ~every 3.3k instructions, and consumption (same line +
+  same way + lanes used) is the rare tail — the field-rate shape exactly.
+- OOC (3 seeds, same-session v1 s7 re-anchor −2.394): s1 **−2.158 / 82.25
+  MHz** (ties the all-time best −2.149), s7 **−2.846**, s5 **−3.312 / 75.12
+  MHz** vs baseline family −2.61..−3.20 → **NEUTRAL** (plateau placement
+  noise). OLD_DATA parameter verified in the map tables at every seed; banks
+  in M10K (26 blocks total), fit legal, zero errors; no RAM path in any
+  top-20. The OLD_DATA mode itself prices at zero here.
+- Verdict: **CORRECTNESS FIX, KEPT.** Campaign remains closed at R4. Sim can
+  never re-confirm this class — remaining gates are CV1k-side: srcs/rtl
+  sync, refit, **ibara board soak**. Lesson for every future RAM: the fit
+  report's RDW parameter is the only truth; every no_rw_check needs a
+  written non-consumption proof (the hostile ifdefs are the audit harness).
+  **UNCOMMITTED at the user's instruction, alongside pair_taken/mem_done.**

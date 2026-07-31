@@ -77,13 +77,28 @@ always_ff @(posedge i_CLK) if(i_EN) begin
     sel_r1 <= lvt[i_RADDR1];
 end
 
+`ifdef HS3_RDW_HOSTILE_GPR
+//tb-only ADVERSARIAL silicon model (never synthesized): no_rw_check makes a same-edge
+//write/read collision DONT_CARE in silicon. Invert the colliding q - if the upstream
+//shadow-forward claim is total, no consumer ever sees these lanes and suites stay green.
+logic   col_b0r0, col_b0r1, col_b1r0, col_b1r1;
+always_ff @(posedge i_CLK) if(i_EN) begin
+    col_b0r0 <= i_WE0 && (i_WADDR0 == i_RADDR0);
+    col_b0r1 <= i_WE0 && (i_WADDR0 == i_RADDR1);
+    col_b1r0 <= i_WE1 && (i_WADDR1 == i_RADDR0);
+    col_b1r1 <= i_WE1 && (i_WADDR1 == i_RADDR1);
+end
+assign  o_RDATA0 = sel_r0 ? (col_b1r0 ? ~q_b1r0 : q_b1r0) : (col_b0r0 ? ~q_b0r0 : q_b0r0);
+assign  o_RDATA1 = sel_r1 ? (col_b1r1 ? ~q_b1r1 : q_b1r1) : (col_b0r1 ? ~q_b0r1 : q_b0r1);
+`else
+assign  o_RDATA0 = sel_r0 ? q_b1r0 : q_b0r0;
+assign  o_RDATA1 = sel_r1 ? q_b1r1 : q_b0r1;
+`endif
+
 always_ff @(posedge i_CLK) if(i_EN) begin
     if(i_WE0) lvt[i_WADDR0] <= 1'b0;
     if(i_WE1) lvt[i_WADDR1] <= 1'b1;
 end
-
-assign  o_RDATA0 = sel_r0 ? q_b1r0 : q_b0r0;
-assign  o_RDATA1 = sel_r1 ? q_b1r1 : q_b0r1;
 
 // synthesis translate_off
 //Behavioral mirror for testbench probing (cpu_core_tb gpr()/bank checks read .ram).

@@ -235,6 +235,8 @@ typedef struct packed {
     logic   [31:0]  pc;
     logic   [15:0]  inst;
     logic           delay_slot;
+    logic           pair_taken;  //slot of a TAKEN delayed branch; set at issue, the
+                                 //edge its branch resolves in EX (see arch_next_pc)
 
     //Bank-qualified identities support hazards; values follow the E1 BRAM read
     logic           src_a_used;
@@ -308,6 +310,8 @@ typedef struct packed {
                                  //before an interrupt is accepted; see 4.5.3 pp.98-100)
     logic           nd_taken;    //non-delayed TAKEN branch (BT/BF): its commit-time
                                  //successor is the redirect target, not pc+2
+    logic           pair_taken;  //slot of a TAKEN delayed branch: commit-time successor
+                                 //is the redirect target (per-packet, see arch_next_pc)
 
     //Forwardable GPR results
     logic           gpr0_we;
@@ -370,6 +374,10 @@ typedef struct packed {
     logic           delay_slot;
     logic           dbr;         //delayed branch (interrupt-defer marker, see exma_t)
     logic           nd_taken;    //non-delayed taken branch (see exma_t)
+    logic           pair_taken;  //slot of a TAKEN delayed branch (see exma_t)
+    logic           mem_done;    //this packet ALREADY performed its external data access;
+                                 //discarding it now would re-issue that access (see
+                                 //o_INT_BOUNDARY - ma_inflight is EX/MA-scoped only)
 
     //Final GPR commit values
     logic           gpr0_we;

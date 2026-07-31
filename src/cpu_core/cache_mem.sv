@@ -24,7 +24,19 @@
     and the write word are REGISTERED at the capture edge, and o_DO muxes the
     held write data over the RAM q per lane. One 2:1 after the RAM output;
     identical netlist in simulation and synthesis (no sim/synth split needed).
-    no_rw_check stays: the colliding RAM lanes are never consumed.
+
+    RDW contract (ibara bug #3, 2026-07-30): the DATA bank consumes the RAM q
+    on a collision - the UN-strobed lanes of a sub-word store (goldens D/E) -
+    so its mixed-port RDW must be OLD_DATA in silicon. no_rw_check fitted
+    DONT_CARE and silicon served garbage on exactly those lanes (sim models
+    old-data, so no simulator can ever see it); dropping the attribute only
+    surfaced warning 276027 (template inferred as DUAL-CLOCK RAM, RDW
+    undefined) and still fitted DONT_CARE - Quartus inference cannot express
+    OLD_DATA. The bank therefore instantiates altsyncram directly with
+    read_during_write_mode_mixed_ports=OLD_DATA (Verilator keeps the
+    behavioral twin - identical semantics on every consumed lane). Tag/LRU
+    keep inference + no_rw_check: their bypass is full-entry, the colliding
+    q is provably dead there.
 */
 
 /* verilator lint_off DECLFILENAME */
@@ -44,14 +56,14 @@ module cache_data_bank_wt (
     output  wire    [31:0]  o_DO
 );
 
-//Packed lane array = the Quartus byte-enable M10K template. A sub-word store writes
-//only its strobed lanes, so the controller needs no read-modify-write merge word.
-(* ramstyle = "M10K, no_rw_check" *) logic [3:0][7:0] ram [0:1023];
-
-logic   [31:0]  rd_q;       //RAM read word (old data on a collision)
+logic   [31:0]  rd_q;       //RAM read word (OLD data on a collision - contracted)
 logic   [3:0]   byp_q;      //per-lane collision: this edge wrote the cell being read
 logic   [31:0]  di_q;       //held write word for the bypass lanes
 
+`ifdef VERILATOR
+//Behavioral twin of the altsyncram below. Old-data on collision is now the
+//CONTRACTED silicon behavior, so sim and silicon agree on every consumed lane.
+logic [3:0][7:0] ram [0:1023];      //byte lanes; lane b <-> i_DI[8b+7:8b]
 always_ff @(posedge i_CLK) if(i_EN) begin
     if(i_WE) begin                              //write port - independent address
         if(i_BWE[0]) ram[i_WADDR][0] <= i_DI[ 7: 0];
@@ -60,15 +72,69 @@ always_ff @(posedge i_CLK) if(i_EN) begin
         if(i_BWE[3]) ram[i_WADDR][3] <= i_DI[31:24];
     end
     rd_q  <= ram[i_RADDR];                      //read port - registered address/old data
+end
+`else
+//Direct altsyncram: the ONLY way to pin mixed-port RDW = OLD_DATA (inference
+//classes this template dual-clock, warning 276027, and fits DONT_CARE).
+//Masked (un-strobed) lanes read old data on a collision - the consumed case.
+altsyncram #(
+    .operation_mode                     ("DUAL_PORT"),
+    .width_a                            (32),
+    .widthad_a                          (10),
+    .numwords_a                         (1024),
+    .width_byteena_a                    (4),
+    .byte_size                          (8),
+    .width_b                            (32),
+    .widthad_b                          (10),
+    .numwords_b                         (1024),
+    .address_reg_b                      ("CLOCK0"),
+    .outdata_reg_b                      ("UNREGISTERED"),
+    .read_during_write_mode_mixed_ports ("OLD_DATA"),
+    .ram_block_type                     ("M10K"),
+    .intended_device_family             ("Cyclone V"),
+    .lpm_type                           ("altsyncram")
+) u_ram (
+    .clock0     (i_CLK),
+    .clocken0   (i_EN),                 //gates BOTH the write and the read-address capture
+    .wren_a     (i_WE),
+    .address_a  (i_WADDR),
+    .data_a     (i_DI),
+    .byteena_a  (i_BWE),
+    .address_b  (i_RADDR),
+    .q_b        (rd_q)
+);
+`endif
+
+always_ff @(posedge i_CLK) if(i_EN) begin
     byp_q <= {4{i_WE && (i_WADDR == i_RADDR)}} & i_BWE;   //same-edge RDW, per strobed lane
     di_q  <= i_DI;
 end
 
+`ifdef HS3_RDW_HOSTILE_CACHE
+//tb-only ADVERSARIAL silicon model (never synthesized): replays the PRE-FIX netlist
+//contract (no_rw_check -> mixed-port RDW = DONT_CARE), where silicon guarantees
+//NOTHING for the collision lanes the bypass does not cover. Invert them so any
+//consumer goes loudly wrong in sim - the un-strobed lanes of a sub-word store.
+logic   [3:0]   col_q;      //collision lanes NOT covered by the write-through bypass
+logic   [31:0]  col_cnt = 0;//exposed-collision read cycles (diagnostic, printed at exit)
+always_ff @(posedge i_CLK) if(i_EN) begin
+    col_q <= {4{i_WE && (i_WADDR == i_RADDR)}} & ~i_BWE;
+    if(|col_q) col_cnt <= col_cnt + 32'd1;
+end
+final $display("[rdw_hostile] %m: %0d exposed-collision read cycles", col_cnt);
+wire    [31:0]  rd_eff = { col_q[3] ? ~rd_q[31:24] : rd_q[31:24],
+                           col_q[2] ? ~rd_q[23:16] : rd_q[23:16],
+                           col_q[1] ? ~rd_q[15: 8] : rd_q[15: 8],
+                           col_q[0] ? ~rd_q[ 7: 0] : rd_q[ 7: 0] };
+`else
+wire    [31:0]  rd_eff = rd_q;
+`endif
+
 //Write-through compose: bypassed lanes take the held write byte, others the RAM q.
-assign  o_DO[ 7: 0] = byp_q[0] ? di_q[ 7: 0] : rd_q[ 7: 0];
-assign  o_DO[15: 8] = byp_q[1] ? di_q[15: 8] : rd_q[15: 8];
-assign  o_DO[23:16] = byp_q[2] ? di_q[23:16] : rd_q[23:16];
-assign  o_DO[31:24] = byp_q[3] ? di_q[31:24] : rd_q[31:24];
+assign  o_DO[ 7: 0] = byp_q[0] ? di_q[ 7: 0] : rd_eff[ 7: 0];
+assign  o_DO[15: 8] = byp_q[1] ? di_q[15: 8] : rd_eff[15: 8];
+assign  o_DO[23:16] = byp_q[2] ? di_q[23:16] : rd_eff[23:16];
+assign  o_DO[31:24] = byp_q[3] ? di_q[31:24] : rd_eff[31:24];
 
 endmodule
 
