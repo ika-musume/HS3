@@ -722,7 +722,7 @@ walls — confirmed by name-search over every top-20 path across seeds.
 
 **The RTL lever catalog is exhausted** (R4 was the last kept entry and R5 the
 last measured attempt; the full round history lives in
-`eval_ooc/cache_wall_campaign.md`). What remains toward 100 MHz is physical, not
+`eval_ooc/timing_campaign_log.md`). What remains toward 100 MHz is physical, not
 structural: a LogicLock floorplan pinning the AGU/request cluster next to the
 cache banks (unlicensed in the current docker Quartus flow), a C6 speed grade, or
 wide seed/DSE harvesting (seed 4 shows what a lucky placement yields). Explicitly

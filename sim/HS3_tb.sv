@@ -84,6 +84,12 @@ wire    [3:0]   mon_wstrb_p;
 wire    [6:0]   mon_csn;
 wire    [31:0]  mon_wdata;
 wire            mon_de;          //per-beat pulse: read pop / write push
+wire            mon_ereq;        //combinational: REQ pulses next edge
+wire    [28:0]  mon_eaddr;
+wire            mon_ewr;
+wire            mon_pend;        //pre-accept pend level
+wire    [28:0]  mon_paddr;
+wire            mon_pwr;
 
 //the chip's physical external bus (table 10.1) + the one true bidirectional
 //net (controls stay unidirectional; the inout lives only at board level)
@@ -124,6 +130,12 @@ HS3 #(
     .o_MEM_BURST               (mon_burst),
     .o_MEM_SIZE                (mon_size),
     .o_MEM_ADDR                (mon_addr),
+    .o_MEM_EREQ                (mon_ereq),
+    .o_MEM_EADDR               (mon_eaddr),
+    .o_MEM_EWR                 (mon_ewr),
+    .o_MEM_PEND                (mon_pend),
+    .o_MEM_PADDR               (mon_paddr),
+    .o_MEM_PWR                 (mon_pwr),
     .o_MEM_LEN                 (mon_len),
     .o_MEM_SADDR               (mon_saddr),
     .o_MEM_CS_n                (mon_csn),
@@ -1072,6 +1084,118 @@ always @(posedge clk) begin
         mon_est_z    = mon_est_v;
     end
     mon_rst_z  = u_dut.u_bsc.i_RST_n;
+end
+
+/*
+    MEM early/pend oracle (docs/HS3_Transaction_Port_Guide.md EREQ/PEND
+    tiers): passive whole-run checks of the pre-accept rails.
+      (E1) EREQ(T) <=> REQ(T+1), BOTH directions - exact pairing, no
+           cancels, no unannounced units
+      (E2) every pair carries EADDR/EWR(T) == ADDR/WR(T+1) bit-exactly
+      (P1) REQ never pulses with PEND still high (a pend resolves - ready
+           rises - one full cycle before its REQ pulse)
+      (P2) PEND(T) && REQ(T+1) -> PADDR/PWR(T) == ADDR/WR(T+1), UNLESS the
+           ibus arb flipped owners within the last two edges (documented
+           head REPLACEMENT at an idle boundary - counted, not failed)
+      (P3) rails dead across a held reset (R10: pend legitimately dropped)
+    Single writer; results checked in test_bus_monitors.
+*/
+
+logic           mep_ereq_z  = 1'b0;     //EREQ one sample back (the pair check)
+logic   [28:0]  mep_eaddr_z = 29'd0;
+logic           mep_ewr_z   = 1'b0;
+logic           mep_pend_z  = 1'b0;     //PEND one sample back
+logic   [28:0]  mep_paddr_z = 29'd0;
+logic           mep_pwr_z   = 1'b0;
+logic           mep_own_z   = 1'b0;     //arb owner history (flip exemption window)
+logic           mep_own_zz  = 1'b0;
+logic           mep_rst_z   = 1'b0;
+integer         mep_err     = 0;        //failures (must end 0)
+integer         mep_pairs   = 0;        //EREQ->REQ pairs seen (coverage)
+integer         mep_pcov    = 0;        //REQs with PEND shown the cycle before
+integer         mep_flips   = 0;        //owner-flip exemptions taken (P2)
+integer         mep_gcov    = 0;        //golden-class checks performed (E3)
+
+always @(posedge clk) begin
+    if(!u_dut.u_bsc.i_RST_n) begin
+        //(P3) skip the assertion instant itself (blocking rst_n race, as the
+        //DE oracle's check 6); a dropped pend never pairs - by design (R10)
+        if(!mep_rst_z && (mon_ereq || mon_pend)) begin
+            $display("      [FAIL] MEM E/P: EREQ/PEND alive under reset");
+            mep_err = mep_err + 1;
+        end
+        mep_ereq_z = 1'b0;
+        mep_pend_z = 1'b0;
+    end
+    else begin
+        //(E1) exact pairing, both directions
+        if(mon_req !== mep_ereq_z) begin
+            $display("      [FAIL] MEM E/P: EREQ/REQ pair broken (ereq_z=%b req=%b)",
+                     mep_ereq_z, mon_req);
+            mep_err = mep_err + 1;
+        end
+        else if(mon_req) begin
+            mep_pairs = mep_pairs + 1;
+            //(E2) announced fields == the unit's captured fields
+            if(mep_eaddr_z !== mon_addr || mep_ewr_z !== mon_wr) begin
+                $display("      [FAIL] MEM E/P: EADDR/EWR mismatch got=%h/%b exp=%h/%b",
+                         mep_eaddr_z, mep_ewr_z, mon_addr, mon_wr);
+                mep_err = mep_err + 1;
+            end
+            //(P1) the pend view must have dropped on the accept cycle
+            if(mon_pend) begin
+                $display("      [FAIL] MEM E/P: REQ pulses with PEND still high");
+                mep_err = mep_err + 1;
+            end
+            //(P2) a covered pend announced this unit's address
+            if(mep_pend_z) begin
+                if((u_dut.u_arb.own_dma !== mep_own_z) ||
+                   (mep_own_z !== mep_own_zz)) begin
+                    mep_flips = mep_flips + 1;      //head replaced: exempt
+                end
+                else if(mep_paddr_z !== mon_addr || mep_pwr_z !== mon_wr) begin
+                    $display("      [FAIL] MEM E/P: PADDR/PWR mismatch got=%h/%b exp=%h/%b",
+                             mep_paddr_z, mep_pwr_z, mon_addr, mon_wr);
+                    mep_err = mep_err + 1;
+                end
+                else mep_pcov = mep_pcov + 1;
+            end
+        end
+
+        //(E3) GOLDEN CLASS: whenever the cache package is up (CPU-owned head),
+        //its registered class/direction must equal a fresh decode of the LIVE
+        //head address on the bus - kills address-map vacuity (the wb_pa
+        //bit-offset bug passed E1 here but failed on the CV1k address map)
+        if(u_dut.u_cpu.u_cache.mon_pk_vld && !u_dut.u_arb.own_dma) begin
+            if(u_dut.u_cpu.u_cache.mon_pk_cls !==
+               {(u_dut.u_bsc.fa[31:29] != 3'b111 &&
+                 u_dut.u_bsc.fa[28:26] != 3'd1 && u_dut.u_bsc.fa[28:26] != 3'd7 &&
+                 !(u_dut.u_bsc.fa[28:26] == 3'd2 && u_dut.u_bsc.a2_sdram) &&
+                 !(u_dut.u_bsc.fa[28:26] == 3'd3 && u_dut.u_bsc.a3_sdram)),
+                (u_dut.u_bsc.fa[31:29] != 3'b111 &&
+                 ((u_dut.u_bsc.fa[28:26] == 3'd2 && u_dut.u_bsc.a2_sdram) ||
+                  (u_dut.u_bsc.fa[28:26] == 3'd3 && u_dut.u_bsc.a3_sdram)))}) begin
+                $display("      [FAIL] MEM E/P: package class != golden(fa) cls=%b fa=%h",
+                         u_dut.u_cpu.u_cache.mon_pk_cls, u_dut.u_bsc.fa);
+                mep_err = mep_err + 1;
+            end
+            if(u_dut.u_cpu.u_cache.mon_pk_wr !== u_dut.u_arb.mon_wr_c) begin
+                $display("      [FAIL] MEM E/P: package wr != live head wr");
+                mep_err = mep_err + 1;
+            end
+            mep_gcov = mep_gcov + 1;
+        end
+
+        mep_ereq_z  = mon_ereq;
+        mep_eaddr_z = mon_eaddr;
+        mep_ewr_z   = mon_ewr;
+        mep_own_zz  = mep_own_z;
+        mep_own_z   = u_dut.u_arb.own_dma;
+        mep_pend_z  = mon_pend;
+        mep_paddr_z = mon_paddr;
+        mep_pwr_z   = mon_pwr;
+    end
+    mep_rst_z = u_dut.u_bsc.i_RST_n;
 end
 
 
@@ -3504,6 +3628,14 @@ task automatic test_bus_monitors;
         chk_true("no DE oracle failures",           mon_de_err == 0);
         chk_true("DE cycle coverage nonzero",       mon_de_cyc > 1000);
         chk_true("count-checked unit coverage",     mon_u_units > 200);
+        end_test;
+        begin_test("MEM early/pend oracle: EREQ<->REQ exact pairing, PEND head pairing (whole run)");
+        $display("      (info) %0d EREQ pairs, %0d pend-covered REQs, %0d owner-flip exemptions, %0d golden-class checks",
+                 mep_pairs, mep_pcov, mep_flips, mep_gcov);
+        chk_true("no early/pend failures",          mep_err == 0);
+        chk_true("EREQ pair coverage nonzero",      mep_pairs > 1000);
+        chk_true("pend-covered REQ coverage",       mep_pcov > 100);
+        chk_true("golden-class coverage nonzero",   mep_gcov > 1000);
         end_test;
     end
 endtask

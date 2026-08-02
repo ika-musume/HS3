@@ -19,6 +19,14 @@ module cpu_core #(
 
     /* I BUS 1 - the cache is the single master; BSC/bridge slave it outside (Fig 1.1, p.6) */
     IBus_1.master           I_BUS,
+    /* transaction-port registered package (cache tracker; chip EREQ launch) */
+    output  wire            o_MON_VLD,
+    output  wire            o_MON_CGEN,
+    output  wire            o_MON_CSDR,
+    output  wire            o_MON_WR,
+    output  wire            o_MON_BST,
+    input   wire            i_MON_A2SDR,    //BSC DRAMTP decode (quasi-static)
+    input   wire            i_MON_A3SDR,
 
     /* ALREADY-PRIORITIZED EXTERNAL INTERRUPTS */
     // External INTC supplies source code and priority; see section 6, pp.117-148.
@@ -275,6 +283,13 @@ cache #(
     .i_PIPE_D_PREF          (pipe_d_pref                            ),
 
     .I_BUS                  (I_BUS                                  ),
+    .o_MON_VLD              (o_MON_VLD                              ),
+    .o_MON_CGEN             (o_MON_CGEN                             ),
+    .o_MON_CSDR             (o_MON_CSDR                             ),
+    .o_MON_WR               (o_MON_WR                               ),
+    .o_MON_BST              (o_MON_BST                              ),
+    .i_MON_A2SDR            (i_MON_A2SDR                            ),
+    .i_MON_A3SDR            (i_MON_A3SDR                            ),
 
     //exc_handler group on the do_d output-flop mux: read line in, fire-and-forget write pulse out
     .i_LMMIO_EXC_HIT        (lmmio_exc_hit                          ),

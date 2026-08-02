@@ -40,7 +40,33 @@ module ibus_arb (
     IBus_1.master           CORE_BUS,   //to the splitter
 
     /* DMAC transfer-unit hold: keep ownership across the unit's accesses */
-    input   wire            i_DMA_HOLD
+    input   wire            i_DMA_HOLD,
+
+    /* TRANSACTION-PORT EADDR image (docs/HS3_Transaction_Port_Guide.md):
+       dedicated copy of the request mux so the o_MEM_EADDR/EWR route never
+       loads the live fabric nets - same one-level shape, kept apart */
+    /* transaction-port sidebands (docs/HS3_Transaction_Port_Guide.md).
+       The registered PACKAGE {vld, cls, wr, bst} feeds the BSC's EREQ
+       launch: CPU bits ride the cache's FSM-tracking registers, DMAC bits
+       are one LUT off its registered sequencer/address; the mux select is
+       the registered owner - every leg launches at register depth. The
+       splitter's hit_brg gate is provably redundant here (its windows are
+       P4 or area 1, class 00). o_MON_ADDR/o_MON_WR stay the LIVE EADDR/EWR
+       export (dedicated copy of the request mux). */
+    input   wire            i_MON_CPU_VLD,
+    input   wire            i_MON_CPU_CGEN,
+    input   wire            i_MON_CPU_CSDR,
+    input   wire            i_MON_CPU_WR,
+    input   wire            i_MON_CPU_BST,
+    input   wire            i_MON_A2SDR,    //BSC DRAMTP decode (quasi-static)
+    input   wire            i_MON_A3SDR,
+    output  wire    [28:0]  o_MON_ADDR,     //the address the next REQ will carry (live)
+    output  wire            o_MON_WR,       //its direction (live)
+    output  wire            o_MON_VLD,      //package: head valid pre-accept
+    output  wire            o_MON_CGEN,     //package: generic/ordinary unit class
+    output  wire            o_MON_CSDR,     //package: SDRAM unit class
+    output  wire            o_MON_WRC,      //package: head direction
+    output  wire            o_MON_BSTC      //package: head is a line burst
 );
 
 ///////////////////////////////////////////////////////////
@@ -127,6 +153,34 @@ assign  CORE_BUS.req_lock  = own_dma ? DMA_BUS.req_lock  : CPU_BUS.req_lock;
 assign  CORE_BUS.req_dack    = own_dma ? DMA_BUS.req_dack    : CPU_BUS.req_dack;
 assign  CORE_BUS.req_dack_ch = own_dma ? DMA_BUS.req_dack_ch : CPU_BUS.req_dack_ch;
 assign  CORE_BUS.req_saddr   = own_dma ? DMA_BUS.req_saddr   : CPU_BUS.req_saddr;
+
+//transaction-port export copy of the address/direction mux (kept: the
+//splitter passes both fields through untouched, so this equals the BSC's fa)
+(* keep *) wire [28:0]  mon_addr_c = own_dma ? DMA_BUS.req_addr[28:0]
+                                             : CPU_BUS.req_addr[28:0];
+(* keep *) wire         mon_wr_c   = own_dma ? DMA_BUS.req_write : CPU_BUS.req_write;
+assign  o_MON_ADDR = mon_addr_c;
+assign  o_MON_WR   = mon_wr_c;
+
+//DMAC package leg: one LUT off the registered sequencer/address (class
+//kernel = P4/area map x DRAMTP, areas 1/7 and P4 encode 00 = never unit)
+wire            dma_p4  = DMA_BUS.req_addr[31:29] == 3'b111;
+wire            dma_sdr = !dma_p4 && ((DMA_BUS.req_addr[28:26] == 3'd2 && i_MON_A2SDR) ||
+                                      (DMA_BUS.req_addr[28:26] == 3'd3 && i_MON_A3SDR));
+wire            dma_gen = !dma_p4 && DMA_BUS.req_addr[28:26] != 3'd1 &&
+                          DMA_BUS.req_addr[28:26] != 3'd7 && !dma_sdr;
+
+//package mux: registered owner selects between the masters' register-depth legs
+(* keep *) wire mon_vld_c  = own_dma ? DMA_BUS.req_valid : i_MON_CPU_VLD;
+(* keep *) wire mon_cgen_c = own_dma ? dma_gen           : i_MON_CPU_CGEN;
+(* keep *) wire mon_csdr_c = own_dma ? dma_sdr           : i_MON_CPU_CSDR;
+(* keep *) wire mon_wrc_c  = own_dma ? DMA_BUS.req_write : i_MON_CPU_WR;
+(* keep *) wire mon_bstc_c = own_dma ? DMA_BUS.req_burst : i_MON_CPU_BST;
+assign  o_MON_VLD  = mon_vld_c;
+assign  o_MON_CGEN = mon_cgen_c;
+assign  o_MON_CSDR = mon_csdr_c;
+assign  o_MON_WRC  = mon_wrc_c;
+assign  o_MON_BSTC = mon_bstc_c;
 
 //CPU leg is a bare AND (zero-cost idle path; the cache self-serializes);
 //the DMA leg additionally waits out its own outstanding response so a

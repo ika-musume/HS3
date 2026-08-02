@@ -403,12 +403,13 @@ end
 
 //The registered bank mirror must equal the live SR-derived select on every live packet
 //(staleness may exist only inside redirect shadows, where IF/ID holds no instruction).
-//Exception: during an RTE restore the mirror legally LEADS the committed SR by the two
-//snoop cycles (rte_wr_wb lookahead + the o_RTE_VALID commit cycle) - the held target's
-//read must already use the restored bank while SR still shows the handler's.
+//Exception: while an RTE is in flight the mirror legally LEADS the committed SR
+//(rte_pre_wb slot arm + rte_wr_wb lookahead + the o_RTE_VALID commit cycle) - the
+//slot and the held target must already use the restored bank (sw manual p.241).
 always_comb begin
     if(ifid.valid && r_bank1 !== gpr_active_bank1 &&
-       !o_RTE_VALID && !(wb_valid && mawb.event_rte))
+       !o_RTE_VALID && !(wb_valid && mawb.event_rte) &&
+       !(idex.valid && idex.event_rte) && !(exma.valid && exma.event_rte))
         $fatal(1, "r_bank1 stale under live packet: r=%b sr=%b", r_bank1, gpr_active_bank1);
 end
 // synthesis translate_on
@@ -517,6 +518,20 @@ assign  dec_m        = ifid.inst[7:4];
 assign  dec_n_id     = active_gpr_id(dec_n, r_bank1);
 assign  dec_m_id     = active_gpr_id(dec_m, r_bank1);
 assign  dec_r0_id    = active_gpr_id(4'd0, r_bank1);
+
+//RTE-slot SR view for the ID-time STC read (sw manual 8.2.53 p.241: the slot uses
+//the RESTORED SR). Live while the RTE sits in EX (its slot is the decodee - the
+//slot cannot serialize on its own branch) and through the restore-commit pulse
+//(a late-issued slot, or a plain-slot target, captures there). The restored image
+//is exactly SSR & SR_MASK; a slot that modifies SR bits holds any later reader
+//via the id_reads_sr / sr_write_pending hazards, so this view is always exact.
+wire    [31:0]  sr_id_view = ((idex.valid && idex.event_rte) || o_RTE_VALID)
+                             ? (i_SSR & 32'h7000_13F3) : i_SR;
+
+//RTE-slot MD view for the EX privilege check (same law): the tight slot executes
+//in EX exactly while its RTE is in MA - in-order issue puts nothing else there -
+//and must be judged against the restored MD. A late slot runs after the commit.
+wire            ex_md_view = (exma.valid && exma.event_rte) ? i_SSR[30] : i_SR[30];
 assign  dec_bank_id  = inactive_bank_id(ifid.inst[6:4], r_bank1);
 
 always_comb begin
@@ -577,7 +592,7 @@ always_comb begin
                         id_decode.privileged = ifid.inst[7:4] != 4'h1;
                         id_decode.alu_op     = ALU_PASS_B;
                         id_decode.immediate  = control_read_value(ifid.inst[6:4],
-                                                                  i_SR, i_GBR, i_VBR, i_SSR, i_SPC);
+                                                                  sr_id_view, i_GBR, i_VBR, i_SSR, i_SPC);
                         id_decode.gpr0_we    = 1'b1;
                         id_decode.gpr0_dst   = dec_n_id;
                     end
@@ -926,7 +941,7 @@ always_comb begin
                         end
                         else begin
                             id_decode.immediate = control_read_value(ifid.inst[6:4],
-                                                                     i_SR, i_GBR, i_VBR, i_SSR, i_SPC);
+                                                                     sr_id_view, i_GBR, i_VBR, i_SSR, i_SPC);
                         end
                     end
                     else if(ifid.inst[3:0] == 4'hF) begin
@@ -1110,6 +1125,9 @@ always_comb begin
     if(id_decode.gpr0_we && id_decode.gpr1_we && id_decode.gpr0_dst == id_decode.gpr1_dst) begin
         id_decode.gpr1_we = 1'b0;
     end
+
+    //Illegal-slot detection lives at the ISSUE-TIME slot marking (the idex
+    //override below) - ifid carries no slot flag at decode time.
 
     case(id_decode.mem_size)
         SIZE_BYTE: id_mem_step = 32'd1;
@@ -2044,7 +2062,7 @@ always_comb begin
     //EX assembles the primary (first) data request. u_ma_seq phase-selects it
     //against its own second access onto the single D bus.
     early_ex_fault = idex.fetch_fault || idex.illegal ||
-                     (idex.privileged && !i_SR[30]) || address_error;
+                     (idex.privileged && !ex_md_view) || address_error;
     //Request-valid base: everything except the exma_allow qualifier, which carries the
     //cache late bits and is ANDed in per rail (see the 4-rail block below u_ma_seq).
     //!i_REDIRECT_VALID: a D request granted AT a kill edge runs wrong-path and its
@@ -2154,7 +2172,7 @@ always_comb begin
         ex_result.fault_write = 1'b0;
         ex_result.fault_addr  = idex.pc;
     end
-    else if(idex.privileged && !i_SR[30]) begin
+    else if(idex.privileged && !ex_md_view) begin
         ex_result.fault       = 1'b1;
         ex_result.fault_cause = EXC_PRIVILEGE;
         ex_result.fault_write = 1'b0;
@@ -2400,7 +2418,19 @@ wire            sr_wr_wb  = wb_valid && !i_REDIRECT_VALID && !mawb.fault &&
 //restore commits". SSR is stable across both cycles (nothing else commits).
 wire            rte_wr_wb = wb_valid && !i_REDIRECT_VALID && !mawb.fault &&
                             mawb.event_rte;
-wire            bank1_nx  = (rte_wr_wb || o_RTE_VALID)
+//RTE-slot bank lookahead (sw manual 8.2.53 p.241: the slot uses the restored SR,
+//RB/MD included): the slot's GPR read is ADDRESSED while its RTE occupies
+//ID-issue/EX/MA, long before the WB arms. In-order issue means every read
+//addressed under these terms belongs to the slot - or to the serialized target,
+//for which the restored bank is equally the architectural one. A killed RTE
+//flushes IF/ID and r_bank1 re-converges off the live SR before any refetch.
+//The ID arm keys on the SHALLOW decode field, not id_issue (the deep hazard cone
+//must stay off the GPR address path): while the RTE occupies IF/ID the only
+//meaningful read addressed is its pair-sibling slot's, at the issue edge.
+wire            rte_pre_wb = (ifid.valid  && id_decode.event_rte) ||
+                             (idex.valid && idex.event_rte)       ||
+                             (exma.valid && exma.event_rte);
+wire            bank1_nx  = (rte_pre_wb || rte_wr_wb || o_RTE_VALID)
                                         ? (i_SSR[30] && i_SSR[29]) :
                             sr_wr_wb    ? (mawb.ctrl_data[30] && mawb.ctrl_data[29]) :
                                           gpr_active_bank1;
@@ -2428,7 +2458,7 @@ wire    [4:0]   nx_bank_id = inactive_bank_id(nx_inst[6:4], bank1_nx);
 wire    [4:0]   nx_r0_id   = active_gpr_id(4'd0, bank1_nx);
 
 //GPR read-address TAIL LATE-SELECT (advance-loop/Wall A headline class, see
-//eval_ooc/cache_wall_campaign.md): pair_serve/ifid_ld carry the whole advance loop
+//eval_ooc/timing_campaign_log.md): pair_serve/ifid_ld carry the whole advance loop
 //(idex_allow, fo 346) and the cache hit resolve (if_accept), yet used to cross the
 //id-map LUTs plus the rib/need_a muxes before the M10K address pin. Each arm's
 //addresses now come from its OWN inst/pd (pair/hold arms fully registered; rsp arm
@@ -3059,6 +3089,21 @@ always_ff @(posedge i_CLK or negedge i_RST_n) begin
             if(ex_advance && div_mq_we[1])        r_m <= div_mq_data[1];
             if(ex_advance && div_mq_we[0])        r_q <= div_mq_data[0];
 
+            //RTE flag deposit AT THE RTE'S OWN EX EXIT: the manual orders the restore
+            //BEFORE the delay slot (sw manual 8.2.53 p.241 - "the slot uses the SR
+            //restored"), so RTE deposits the SSR flags like any EX flag writer and the
+            //slot (next in EX) reads them restored. This also fixes the ibara stale-T
+            //wrong-branch bug (hs3_interrupt_tbit_bug.md): a handler's T/S/M/Q clobber
+            //leaked into the first post-RTE consumer, one cycle ahead of the drain
+            //resync. A same-edge ALU deposit cannot coexist (one packet in EX); a later
+            //kill of the RTE heals through the i_REDIRECT_VALID resync above.
+            if(ex_advance && idex.event_rte) begin
+                r_t <= i_SSR[0];
+                r_s <= i_SSR[1];
+                r_m <= i_SSR[9];
+                r_q <= i_SSR[8];
+            end
+
             //ID/EX uses idex_allow as a direct clock-enable and loads operands
             //unconditionally; only valid is gated by id_issue. This keeps the deep
             //id_issue cone off the 32-bit operand data paths (it previously selected
@@ -3092,6 +3137,18 @@ always_ff @(posedge i_CLK or negedge i_RST_n) begin
                 if(id_issue && branch_event && branch_delayed) begin
                     idex.delay_slot <= 1'b1;
                     idex.pair_taken <= branch_taken;
+                    //Illegal-slot law (sw manual section 8, Delay_Slot): every
+                    //PC-changer - BF/BT/BRA/BSR/JMP/JSR/RTS/RTE/TRAPA/BF-S/BT-S/
+                    //BRAF/BSRF - faults BEFORE execution in a delay slot. Degrade
+                    //to a plain illegal op (branch/event effects neutralized); the
+                    //delay_slot flag just set maps it to EV_ILLEGAL_SLOT (0x1A0).
+                    if(id_decode.branch_op != BR_NONE || id_decode.event_trapa) begin
+                        idex.illegal        <= 1'b1;
+                        idex.branch_op      <= BR_NONE;
+                        idex.branch_delayed <= 1'b0;
+                        idex.event_rte      <= 1'b0;
+                        idex.event_trapa    <= 1'b0;
+                    end
                 end
             end
             //Operand captures on the PER-CLUSTER idex_allow duplicates (identical value,

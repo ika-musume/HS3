@@ -70,6 +70,15 @@ module cache #(
        every external transaction (I-fill, D-fill, store, write-back drain, and
        non-cacheable bypass), so a 32-bit DBus master suffices; see pp.110-112. */
     IBus_1.master           I_BUS,
+    /* transaction-port registered package (chip-level EREQ launch; see the
+       package section): request tracker riding the FSM arm writes */
+    output  wire            o_MON_VLD,      //a REQ-state request is (or stays) up
+    output  wire            o_MON_CGEN,     //head class: generic/ordinary unit
+    output  wire            o_MON_CSDR,     //head class: SDRAM unit
+    output  wire            o_MON_WR,       //head direction
+    output  wire            o_MON_BST,      //head is a 4-beat line burst
+    input   wire            i_MON_A2SDR,    //BSC DRAMTP decode: area 2 is SDRAM
+    input   wire            i_MON_A3SDR,    //BSC DRAMTP decode: area 3 is SDRAM
 
     /* L-BUS LOCAL EXCEPTION-REGISTER READ LINE (exc_handler group; that module owns the
        registers AND the decode) - a port on the live D response mux. */
@@ -754,6 +763,57 @@ state_t         vic_state_nx;
 assign  vic_state_nx = (victim_dirty || wb_alias) ? (wb_valid ? S_DRAIN_REQ : S_WBUF_RD)
                                                   : (bram_is_data ? S_DFILL_REQ : S_IFILL_REQ);
 
+///////////////////////////////////////////////////////////
+//////  Transaction-Port Registered Package (chip-level EREQ launch)
+////
+
+/*
+    The chip's o_MEM_EREQ pre-accept notice must launch from registers (the
+    consumer registers it on entry - launch depth is its whole budget). The
+    package {vld, cls, wr, bst} tracks I_BUS's request BY RIDING THE SAME
+    FSM ARM WRITES that move `state` into/out of the six REQ states below -
+    no transition condition is re-derived, so the package cannot drift from
+    the machine (and HS3_tb's EREQ<->REQ whole-run oracle re-proves the
+    pairing on every enabled edge of every run).
+    cls = {gen, sdr} unit-class kernel of the head address: P4 and areas
+    1/7 encode as 00 (never unit-class), so the BSC needs no live address.
+    DRAMTP config arrives quasi-static on i_MON_A2SDR/A3SDR (BCR1 is set
+    at boot, before any unit traffic).
+    MAINTENANCE: any future `state <=` write entering or leaving a REQ
+    state MUST write mon_pk_* alongside - test 86 fails on the first
+    divergent run.
+*/
+
+//{gen, sdr} class kernel from a bus-address head's top 6 bits (addr[31:26])
+function automatic logic [1:0] mon_cls(input logic [5:0] hi,
+                                       input logic a2sd, input logic a3sd);
+    logic p4, sdr;
+    p4      = (hi[5:3] == 3'b111);
+    sdr     = !p4 && ((hi[2:0] == 3'd2 && a2sd) || (hi[2:0] == 3'd3 && a3sd));
+    mon_cls = {(!p4 && hi[2:0] != 3'd1 && hi[2:0] != 3'd7 && !sdr), sdr};
+endfunction
+
+//preserve: sequentially equivalent to state-register decodes, so synthesis
+//would delete the FFs and re-derive combinationally - the exact serial
+//chain these registers exist to remove (proven on the AGU-control dups)
+(* preserve *) logic         mon_pk_vld, mon_pk_wr, mon_pk_bst;
+(* preserve *) logic [1:0]   mon_pk_cls; //{gen, sdr} of the pending/next unit
+
+//per-source payloads (feed the package FF Ds only). Drain heads ride wb_pa
+//(= addr[31:4], top 3 bits 000); fills ride fill_base except the vic_ld
+//dispatch edge where fill_base itself loads from bram_addr this edge.
+wire    [1:0]   mon_cls_drain = mon_cls(wb_pa[31:26],               i_MON_A2SDR, i_MON_A3SDR);
+wire    [1:0]   mon_cls_fill  = mon_cls(fill_base[31:26],           i_MON_A2SDR, i_MON_A3SDR);
+wire    [1:0]   mon_cls_bram  = mon_cls(bram_addr[31:26],           i_MON_A2SDR, i_MON_A3SDR);
+wire    [1:0]   mon_cls_cur   = mon_cls(cur_addr[31:26],            i_MON_A2SDR, i_MON_A3SDR);
+wire    [1:0]   mon_cls_live  = mon_cls(PIPE_L_BUS.req_addr[31:26], i_MON_A2SDR, i_MON_A3SDR);
+
+assign  o_MON_VLD  = mon_pk_vld;
+assign  o_MON_CGEN = mon_pk_cls[1];
+assign  o_MON_CSDR = mon_pk_cls[0];
+assign  o_MON_WR   = mon_pk_wr;
+assign  o_MON_BST  = mon_pk_bst;
+
 //cur_way next value, FLAT: (hit ? priority-encode(hit_w) : victim) folded to one
 //5-input LUT per bit (the encode truth table absorbs the fallback select).
 wire    [1:0]   cur_way_nx;
@@ -809,6 +869,10 @@ always_ff @(posedge i_CLK or negedge i_RST_n) begin
         drain_for_vic <= 1'b0;
         drain_to_wbuf <= 1'b0;
         mem_pending   <= 1'b0;
+        mon_pk_vld    <= 1'b0;      //package: reset drops any pended head (guide R10)
+        mon_pk_cls    <= 2'b00;
+        mon_pk_wr     <= 1'b0;
+        mon_pk_bst    <= 1'b0;
         rsp_valid_i   <= 1'b0;
         rsp_inst      <= 16'd0;
         rsp_fault_i   <= 1'b0;
@@ -926,10 +990,19 @@ always_ff @(posedge i_CLK or negedge i_RST_n) begin
                             else if(wb_valid && !acc_d_nx && !acc_i_nx) begin
                                 drain_for_vic <= 1'b0;
                                 state         <= S_DRAIN_REQ;
+                                mon_pk_vld <= 1'b1;             //package: drain head up
+                                mon_pk_cls <= mon_cls_drain;
+                                mon_pk_wr  <= 1'b1;
+                                mon_pk_bst <= 1'b1;
                             end
                         end
-                        else if(bram_write && !bram_wb_mode)
+                        else if(bram_write && !bram_wb_mode) begin
                             state <= S_DBYP_REQ;            //write-through store miss: no allocate
+                            mon_pk_vld <= 1'b1;             //package: WT-store head up
+                            mon_pk_cls <= mon_cls_bram;
+                            mon_pk_wr  <= 1'b1;
+                            mon_pk_bst <= 1'b0;
+                        end
                         else begin
                             //Read / write-allocate miss: fill (write back a dirty victim first).
                             if(victim_dirty || wb_alias) begin
@@ -951,6 +1024,10 @@ always_ff @(posedge i_CLK or negedge i_RST_n) begin
                             if(wb_valid && !acc_d_nx && !acc_i_nx) begin
                                 drain_for_vic <= 1'b0;
                                 state         <= S_DRAIN_REQ;
+                                mon_pk_vld <= 1'b1;             //package: drain head up
+                                mon_pk_cls <= mon_cls_drain;
+                                mon_pk_wr  <= 1'b1;
+                                mon_pk_bst <= 1'b1;
                             end
                         end
                         else if(i_I_SQUASH) begin
@@ -977,6 +1054,10 @@ always_ff @(posedge i_CLK or negedge i_RST_n) begin
                     //LIVE accept this edge keeps the cache free for that access's resolve.
                     drain_for_vic <= 1'b0;
                     state         <= S_DRAIN_REQ;
+                    mon_pk_vld <= 1'b1;             //package: drain head up
+                    mon_pk_cls <= mon_cls_drain;
+                    mon_pk_wr  <= 1'b1;
+                    mon_pk_bst <= 1'b1;
                 end
 
                 //LIVE dispatch site: classify-only targets of the access accepted THIS
@@ -1010,6 +1091,10 @@ always_ff @(posedge i_CLK or negedge i_RST_n) begin
                     end
                     else if(!live_cacheable_d) begin
                         state <= S_DBYP_REQ;               //non-cacheable data access
+                        mon_pk_vld <= 1'b1;                //package: live-dispatch head up
+                        mon_pk_cls <= mon_cls_live;
+                        mon_pk_wr  <= PIPE_L_BUS.req_write;
+                        mon_pk_bst <= 1'b0;
                     end
                 end
                 else if(acc_i_nx) begin
@@ -1023,7 +1108,13 @@ always_ff @(posedge i_CLK or negedge i_RST_n) begin
                             rsp_fault_i <= 1'b0;
                             rsp_valid_i <= 1'b1;
                         end
-                        else state <= S_IBYP_REQ;   //non-cacheable fetch
+                        else begin
+                            state <= S_IBYP_REQ;    //non-cacheable fetch
+                            mon_pk_vld <= 1'b1;     //package: live-dispatch head up
+                            mon_pk_cls <= mon_cls_live;
+                            mon_pk_wr  <= 1'b0;
+                            mon_pk_bst <= 1'b0;
+                        end
                     end
                 end
             end
@@ -1033,6 +1124,10 @@ always_ff @(posedge i_CLK or negedge i_RST_n) begin
             S_STORE_WR: begin
                 mem_pending <= 1'b0;
                 state       <= S_STORE_REQ;
+                mon_pk_vld <= 1'b1;                 //package: WT-store memory half up
+                mon_pk_cls <= mon_cls_cur;
+                mon_pk_wr  <= 1'b1;
+                mon_pk_bst <= 1'b0;
             end
 
             S_ALLOC_WR: begin
@@ -1053,6 +1148,12 @@ always_ff @(posedge i_CLK or negedge i_RST_n) begin
                         AW_MMTAG: state <= S_MMTAG_WR;
                         default:  state <= S_DFILL_REQ;
                     endcase
+                    if(after_wb != AW_MMTAG) begin
+                        mon_pk_vld <= 1'b1;         //package: fill head after victim copy
+                        mon_pk_cls <= mon_cls_fill;
+                        mon_pk_wr  <= 1'b0;
+                        mon_pk_bst <= 1'b1;
+                    end
                 end
                 else begin
                     wb_load_word <= wb_load_word + 2'd1;
@@ -1065,6 +1166,7 @@ always_ff @(posedge i_CLK or negedge i_RST_n) begin
                 if(I_BUS.req_valid && I_BUS.req_ready) begin
                     mem_pending <= 1'b1;
                     state       <= S_DRAIN_WAIT;
+                    mon_pk_vld  <= 1'b0;            //package: head accepted
                 end
             end
 
@@ -1080,8 +1182,13 @@ always_ff @(posedge i_CLK or negedge i_RST_n) begin
                                 wb_load_word <= 2'd0;
                                 state        <= S_WBUF_RD; //buffer free: load the new victim
                             end
-                            else    //alias-only drain: memory is fresh, go fill the miss
+                            else begin //alias-only drain: memory is fresh, go fill the miss
                                 state <= (after_wb == AW_IFILL) ? S_IFILL_REQ : S_DFILL_REQ;
+                                mon_pk_vld <= 1'b1;             //package: fill head after drain
+                                mon_pk_cls <= mon_cls_fill;
+                                mon_pk_wr  <= 1'b0;
+                                mon_pk_bst <= 1'b1;
+                            end
                         end
                         else
                             state <= S_IDLE;
@@ -1095,6 +1202,10 @@ always_ff @(posedge i_CLK or negedge i_RST_n) begin
                         //found by the fetch-pair bring-up). Background-ness only
                         //chooses WHEN the burst starts: a request-free S_IDLE edge.
                         state <= S_DRAIN_REQ;
+                        mon_pk_vld <= 1'b1;             //package: next drain beat's call
+                        mon_pk_cls <= mon_cls_drain;
+                        mon_pk_wr  <= 1'b1;
+                        mon_pk_bst <= 1'b1;
                     end
                 end
             end
@@ -1103,6 +1214,7 @@ always_ff @(posedge i_CLK or negedge i_RST_n) begin
                 if(I_BUS.req_valid && I_BUS.req_ready) begin
                     mem_pending <= 1'b1;
                     state       <= S_IFILL_WAIT;
+                    mon_pk_vld  <= 1'b0;            //package: head accepted
                 end
             end
 
@@ -1137,6 +1249,10 @@ always_ff @(posedge i_CLK or negedge i_RST_n) begin
                         else begin
                             fill_word <= fill_word + 2'd1;
                             state     <= S_IFILL_REQ;
+                            mon_pk_vld <= 1'b1;         //package: next fill beat's call
+                            mon_pk_cls <= mon_cls_fill;
+                            mon_pk_wr  <= 1'b0;
+                            mon_pk_bst <= 1'b1;
                         end
                     end
                 end
@@ -1146,6 +1262,7 @@ always_ff @(posedge i_CLK or negedge i_RST_n) begin
                 if(I_BUS.req_valid && I_BUS.req_ready) begin
                     mem_pending <= 1'b1;
                     state       <= S_DFILL_WAIT;
+                    mon_pk_vld  <= 1'b0;            //package: head accepted
                 end
             end
 
@@ -1180,6 +1297,10 @@ always_ff @(posedge i_CLK or negedge i_RST_n) begin
                         else begin
                             fill_word <= fill_word + 2'd1;
                             state     <= S_DFILL_REQ;
+                            mon_pk_vld <= 1'b1;         //package: next fill beat's call
+                            mon_pk_cls <= mon_cls_fill;
+                            mon_pk_wr  <= 1'b0;
+                            mon_pk_bst <= 1'b1;
                         end
                     end
                 end
@@ -1189,6 +1310,7 @@ always_ff @(posedge i_CLK or negedge i_RST_n) begin
                 if(I_BUS.req_valid && I_BUS.req_ready) begin
                     mem_pending <= 1'b1;
                     state       <= S_STORE_WAIT;
+                    mon_pk_vld  <= 1'b0;            //package: head accepted
                 end
             end
 
@@ -1204,6 +1326,7 @@ always_ff @(posedge i_CLK or negedge i_RST_n) begin
                 if(I_BUS.req_valid && I_BUS.req_ready) begin
                     mem_pending <= 1'b1;
                     state       <= S_IBYP_WAIT;
+                    mon_pk_vld  <= 1'b0;            //package: head accepted
                 end
             end
 
@@ -1228,6 +1351,7 @@ always_ff @(posedge i_CLK or negedge i_RST_n) begin
                 if(I_BUS.req_valid && I_BUS.req_ready) begin
                     mem_pending <= 1'b1;
                     state       <= S_DBYP_WAIT;
+                    mon_pk_vld  <= 1'b0;            //package: head accepted
                 end
             end
 
@@ -1268,6 +1392,10 @@ always_ff @(posedge i_CLK or negedge i_RST_n) begin
                             drain_for_vic <= 1'b1;
                             drain_to_wbuf <= 1'b1;      //displaced entry is dirty: buffer it
                             state         <= S_DRAIN_REQ;
+                            mon_pk_vld <= 1'b1;         //package: purge drain head up
+                            mon_pk_cls <= mon_cls_drain;
+                            mon_pk_wr  <= 1'b1;
+                            mon_pk_bst <= 1'b1;
                         end
                         else begin
                             wb_load_word <= 2'd0;
@@ -1310,7 +1438,25 @@ always_ff @(posedge i_CLK or negedge i_RST_n) begin
             mem_pending <= 1'b0;
             after_wb    <= bram_is_data ? AW_DFILL : AW_IFILL;  //D flag alone selects the site
         end
-        if(vic_ld) state <= vic_state_nx;                   //shared drain/wbuf/fill select
+        if(vic_ld) begin
+            state <= vic_state_nx;                  //shared drain/wbuf/fill select
+            //package mirror of the SAME select (runs after the case, like state):
+            //drain-first raises the drain head, wbuf copy raises nothing yet,
+            //straight fill raises the fill head (fill_base loads THIS edge, so
+            //the class rides bram_addr directly)
+            if(victim_dirty || wb_alias) begin
+                mon_pk_vld <= wb_valid;
+                mon_pk_cls <= mon_cls_drain;
+                mon_pk_wr  <= 1'b1;
+                mon_pk_bst <= 1'b1;
+            end
+            else begin
+                mon_pk_vld <= 1'b1;
+                mon_pk_cls <= mon_cls_bram;
+                mon_pk_wr  <= 1'b0;
+                mon_pk_bst <= 1'b1;
+            end
+        end
 
         ////////  Accepted-access backup - SPECULATIVE capture (cost-free recovery).
         //The descriptor tracks the LIVE request every idle edge EXCEPT when the
@@ -1364,7 +1510,6 @@ always_ff @(posedge i_CLK or negedge i_RST_n) begin
         acc_i_q <= acc_i_nx;
     end end
 end
-
 endmodule
 
 `default_nettype none

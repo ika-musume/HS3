@@ -85,7 +85,28 @@ always_ff @(posedge i_CLK or negedge i_RST_n) begin
             o_SR  <= (o_SR | SR_EXCEPTION_BITS) & SR_MASK;
         end
         else if(i_RTE_RESTORE_VALID) begin
+            //The RTE's delay slot RETIRES on this same edge, and the manual orders the
+            //restore BEFORE the slot (sw manual 8.2.53 p.241: the slot uses the restored
+            //SR) - so a slot's control/flag commit lands ON TOP of the restore instead
+            //of being dropped by the priority chain. Nonblocking order gives the RTE its
+            //OLD SSR read even when the slot rewrites SSR itself.
             o_SR <= o_SSR & SR_MASK;
+            if(i_PIPE_CTRL_WE) begin
+                unique case(i_PIPE_CTRL_DST)
+                    CTRL_SR:  o_SR  <= i_PIPE_CTRL_DATA & SR_MASK;
+                    CTRL_GBR: o_GBR <= i_PIPE_CTRL_DATA;
+                    CTRL_VBR: o_VBR <= i_PIPE_CTRL_DATA;
+                    CTRL_SSR: o_SSR <= i_PIPE_CTRL_DATA & SR_MASK;
+                    CTRL_SPC: o_SPC <= i_PIPE_CTRL_DATA;
+                    default: begin end
+                endcase
+            end
+            else begin
+                if(i_PIPE_SR_T_WE)     o_SR[0] <= i_PIPE_SR_T;
+                if(i_PIPE_SR_S_WE)     o_SR[1] <= i_PIPE_SR_S;
+                if(i_PIPE_SR_MQ_WE[0]) o_SR[8] <= i_PIPE_SR_MQ[0];
+                if(i_PIPE_SR_MQ_WE[1]) o_SR[9] <= i_PIPE_SR_MQ[1];
+            end
         end
         else if(i_PIPE_CTRL_WE) begin
             unique case(i_PIPE_CTRL_DST)

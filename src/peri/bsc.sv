@@ -153,10 +153,23 @@ module bsc #(
     /* IRQOUT contribution (p.321): refresh request pending, cycle not run */
     output  wire            o_REF_PEND,
 
-    /* TRANSACTION PORT (spec: docs/Early_Monitor_Guide.md) - the complete
-       transaction view of the external bus, in parallel with the unchanged
-       pins. REQ = one registered 1-cycle pulse per committed external UNIT
-       at its accept edge; fields load with it and hold until the next unit.
+    /* TRANSACTION PORT (spec: docs/HS3_Transaction_Port_Guide.md) - the
+       complete transaction view of the external bus, in parallel with the
+       unchanged pins. Three request tiers:
+         EREQ = combinational accept-edge view, exactly one enabled edge
+                before REQ (the very net the REQ register samples; glitchy,
+                sample on the shared edge). Launched FLAT: parallel class
+                kernels + ready rails, one final LUT - the consumer's
+                register is the cone's only sink. EADDR/EWR are exported
+                at the arb (dedicated mux copy of the request address);
+         REQ  = one registered 1-cycle pulse per committed external UNIT
+                at its accept edge; fields load with it, hold to the next;
+         PEND = registered pre-accept level: a unit-class request sitting
+                valid-but-not-ready (handback / refresh / engine busy).
+                PADDR/PWR re-capture the pend head every enabled edge; an
+                idle-boundary arb owner flip REPLACES the head (consumer
+                re-evaluates on change). An accept while PEND shows pairs
+                the next REQ with the shown PADDR.
        DE = one 1-cycle pulse per data beat: read units pop-confirm AT the
        BSC's own consume edge (ordinary T2 fall / SDRAM capture rise / hsk
        completion), write units push WDATA at each accepted beat - CKIO
@@ -164,13 +177,30 @@ module bsc #(
        FIFO head); EITHER i_MEM_READY or i_MEM_RSP_VALID completes an
        ordinary access early - always as one full 32-bit D-bus transfer,
        bypassing the width split - so tying both low leaves i_WAIT_n in
-       sole control. All rails are dedicated FFs: no accept/engine cone
-       loading, no pre-accept pend visibility (REQ = commitment). */
+       sole control. REQ/PEND/DE/field rails are dedicated FFs; the EREQ
+       tier is the one live tap (own kept LUT: the external route never
+       loads the handshake node feeding the REQ register). */
     output  wire            o_MEM_REQ,      //1-cycle pulse at the unit accept edge
     output  wire            o_MEM_WR,       //1 = write (early direction, held)
     output  wire            o_MEM_BURST,    //16-byte unit / burst-ROM envelope
     output  wire    [1:0]   o_MEM_SIZE,     //I_BUS size encoding
     output  wire    [28:0]  o_MEM_ADDR,     //physical (A31-29 shadow stripped, p.232)
+    output  wire            o_MEM_EREQ,     //combinational: REQ pulses next enabled edge
+                                            //(EADDR/EWR live at the arb: dedicated mux copy)
+    /* EREQ launch package from the arb (register-depth legs; the splitter's
+       hit_brg gate is redundant: its windows are P4 or area 1 = class 00).
+       o_MON_A2SDR/A3SDR feed the masters' class kernels (BCR1 DRAMTP,
+       quasi-static: set at boot before any unit traffic). */
+    input   wire            i_MON_VLD,      //package: head valid pre-accept
+    input   wire            i_MON_CGEN,     //package: generic/ordinary class
+    input   wire            i_MON_CSDR,     //package: SDRAM class
+    input   wire            i_MON_WRC,      //package: head direction
+    input   wire            i_MON_BSTC,     //package: head is a line burst
+    output  wire            o_MON_A2SDR,    //DRAMTP decode: area 2 is SDRAM
+    output  wire            o_MON_A3SDR,    //DRAMTP decode: area 3 is SDRAM
+    output  wire            o_MEM_PEND,     //level: unit-class request pending pre-accept
+    output  wire    [28:0]  o_MEM_PADDR,    //pend head address (may be replaced mid-pend)
+    output  wire            o_MEM_PWR,      //pend head direction
     output  wire    [4:0]   o_MEM_LEN,      //physical beat count (= read pop count)
     output  wire            o_MEM_SADDR,    //single-address DMAC unit: WDATA not sourced
     output  wire    [6:0]   o_MEM_CS_n,     //held area decode; bit n = area n (bit 1 never asserts)
@@ -216,6 +246,8 @@ logic   [15:0]  mcscr [0:7];        //MCS0-7 pin control, bookkeeping (pp.258-25
 //decoded engine timing knobs (the natural-latency law, MCR pp.245-247)
 wire            a2_sdram  = (bcr1[4:2] == 3'b011);      //DRAMTP=011: both areas SDRAM
 wire            a3_sdram  = !bcr1[4] && bcr1[3];        //DRAMTP=010 or 011
+assign  o_MON_A2SDR = a2_sdram;                         //to the masters' class kernels
+assign  o_MON_A3SDR = a3_sdram;
 //per-area SDRAM data bus width from BCR2 (p.276: 16 or 32 bits; both areas
 //must match when both are SDRAM, so global commands may use either decode)
 wire            sd16_a2   = (bcr2[5:4] == 2'b10);
@@ -1072,14 +1104,14 @@ end
 
 
 ///////////////////////////////////////////////////////////
-//////  Transaction Port - REQ + fields + write push (docs/Early_Monitor_Guide.md)
+//////  Transaction Port - REQ + fields + write push (docs/HS3_Transaction_Port_Guide.md)
 ////
 
 /*
     One registered pulse per committed external transaction UNIT at its
-    accept edge (dedicated FFs: the port never loads the accept cone with
-    external routing); fields load with the pulse and hold until the next
-    unit. Unit mapping:
+    accept edge (dedicated FFs; only the EREQ tier taps live nets, via its
+    own kept FLAT cone - see the pre-accept rail section below); fields
+    load with the pulse and hold until the next unit. Unit mapping:
       - SDRAM head/single op = fe_eng_start. A line fill strobes ONCE; a
         write drain resumed after a mid-burst yield re-arms through a fresh
         continuation accept, so the resumed op strobes AGAIN carrying the
@@ -1149,6 +1181,76 @@ end
 always_ff @(posedge i_CLK) begin if(i_CEN) begin
     if(mon_wpush) mon_wdata_q <= I_BUS.req_wdata;   //valid under the push pulse
 end end
+
+//Pre-accept rails. EREQ re-computes mon_req_q's own D-net in a FLAT kept
+//duplicate: the port pairs with the next REQ pulse BY CONSTRUCTION and the
+//external route never loads the live handshake node. The flat form exists
+//because the consumer registers EREQ on entry - its launch depth is the
+//consumer's whole budget. Same function, restructured:
+//  - fe_gen/fe_sdram collapse to fa[31:26] x DRAMTP: area 1 is wholly
+//    port/dmac/dummy and area 7 dummy, so the 20-bit fe_port/fe_dmac
+//    compares can NEVER reach a unit-class accept - they drop out;
+//  - each ready arm is one LUT over registered trackers only, evaluated
+//    in parallel instead of through the serial ready mux -> fe_acc ->
+//    fe_eng_start chain;
+//  - the final select is a single 6-input LUT.
+//PEND masks the raw valid&&!ready pend to unit classes only - a pend whose
+//eventual accept fires no REQ pulse (P-bus / local / P4 / burst-continuation
+//calls) must not show; a yielded write drain's resume beat DOES re-strobe,
+//so it shows. PADDR/PWR re-capture the live head every pend edge: an
+//idle-boundary arb owner flip REPLACES the head one edge late (the consumer
+//re-evaluates its speculation on change).
+//the head's valid/class/direction/burst arrive as the ARB PACKAGE: register-
+//depth legs from the masters (the cache's FSM-riding tracker, the DMAC's
+//sequencer decode), owner-muxed once. No live address enters this cone -
+//class 00 encodes P4 / area 1 / area 7, so no P4 term is needed either,
+//and the splitter's hit_brg windows (P4 / area 1) are excluded the same way.
+//acceptance rails (registered trackers only). eng_busy/bus_blk/eng_wr_pend
+//are re-computed flat here: the shared functional nets pack into the engine
+//FSM's own selector cones and would re-serialize the export launch
+(* keep *) wire mon_ebusy    = (est != E_IDLE) && (est != E_SLF);
+(* keep *) wire mon_blk      = (brq || bus_rel) && !(fe_lock_hold || e_lock_hold);
+(* keep *) wire mon_wrp_est  = e_write && (est == E_BA_DISP || est == E_PRE_WAIT ||
+                                           est == E_ACTV    || est == E_RCD ||
+                                           est == E_WR);
+(* keep *) wire mon_gen_ok   = !(ord_busy || ordb_act || ordw_act ||
+                                 mon_ebusy || eng_go || mon_blk);
+(* keep *) wire mon_sdh_ok   = !(eng_go || mon_ebusy || self_active || mon_blk ||
+                                 sd_rd_wait || sd_wr_ack);  //head/single op
+(* keep *) wire mon_sdc_ok   = !(sd_rd_wait || sd_wr_ack ||
+                                 (eng_go && eng_op_write) || mon_wrp_est);  //drain resume
+//per-class arms: ordinary continuation calls never strobe; an SDRAM read
+//continuation never strobes; a write continuation strobes only as a
+//yielded-drain resume (fresh op from its own beat, mon comment above)
+(* keep *) wire mon_bcont    = i_MON_BSTC && (i_MON_WRC ? ordw_act : ordb_act);
+(* keep *) wire mon_sdr_go   = i_MON_WRC ? (b_wr_act ? mon_sdc_ok : mon_sdh_ok)
+                                         : (!b_rd_act && mon_sdh_ok);
+(* keep *) wire mon_ereq_c   = i_MON_VLD && ((i_MON_CGEN && mon_gen_ok && !mon_bcont) ||
+                                             (i_MON_CSDR && mon_sdr_go));
+
+wire            mon_pend_c = I_BUS.req_valid && !I_BUS.req_ready &&
+                             ((fe_gen && !ord_bcont) ||
+                              (fe_eng && !fe_sdmr &&
+                               (!fe_b_cont || (I_BUS.req_write && !eng_wr_pend))));
+
+logic           mon_pend_q, mon_pwr_q;
+logic   [28:0]  mon_paddr_q;
+
+always_ff @(posedge i_CLK or negedge i_RST_n) begin
+    if(!i_RST_n) mon_pend_q <= 1'b0;
+    else begin if(i_CEN) begin
+        mon_pend_q <= mon_pend_c;
+        if(mon_pend_c) begin                    //live pend head, re-captured every edge
+            mon_paddr_q <= fa[28:0];
+            mon_pwr_q   <= I_BUS.req_write;
+        end
+    end end
+end
+
+assign  o_MEM_EREQ  = mon_ereq_c;
+assign  o_MEM_PEND  = mon_pend_q;
+assign  o_MEM_PADDR = mon_paddr_q;
+assign  o_MEM_PWR   = mon_pwr_q;
 
 assign  o_MEM_REQ   = mon_req_q;
 assign  o_MEM_WR    = mon_wr_q;

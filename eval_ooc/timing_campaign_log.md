@@ -1,9 +1,12 @@
-# Timing campaign — cache-side walls @ 100 MHz on Cyclone V (5CSEBA6U23I7)
+# HS3 timing campaign log — OOC fits @ 100 MHz on Cyclone V (5CSEBA6U23I7)
 
-Successor to the forwarding campaign (see memory `exhead-forward-dse` / `v3-exhead-handoff`).
-v3 EX-head forwarding is committed (`f9aae05`) and retired the forwarding classes from
-every top-20; the plateau is now set by two cache-side walls. This log tracks their
-attack. **A round that isn't logged didn't happen.**
+Durable, append-only record of every OOC fit: the cache-wall attack rounds, the
+per-feature re-measures (BSC, DMAC, transaction ports), and the RTL packages cleared
+to land against them. Started as the cache-wall campaign — successor to the forwarding
+campaign (see memory `exhead-forward-dse` / `v3-exhead-handoff`). v3 EX-head forwarding
+is committed (`f9aae05`) and retired the forwarding classes from every top-20; the
+plateau is set by the two cache-side walls below. **A round that isn't logged didn't
+happen.**
 
 ## Ground truth
 - Branch / baseline commit: `dse` @ `f9aae05` (v3 EX-head forwarding).
@@ -733,3 +736,306 @@ Levers that COULD move the plateau (all bigger / need a decision):
   report's RDW parameter is the only truth; every no_rw_check needs a
   written non-consumption proof (the hostile ifdefs are the audit harness).
   **UNCOMMITTED at the user's instruction, alongside pair_taken/mem_done.**
+
+## 2026-08-01 — transaction-port pre-accept tiers (EREQ + PEND, CV1k tRCD menu) — LANDED, 3-seed NEUTRAL
+
+- Change: `bsc.sv` transaction-port section grows the two pre-accept rails
+  from the CV1k tRCD menu (`ikacore_CV1k/docs/hs3_early_addr_notice_spec.md`,
+  reply section = the HS3 verdict): `o_MEM_EREQ/EADDR/EWR` = the REQ
+  register's own D-net exported live ((* keep *) duplicate of `mon_fire` +
+  `fa[28:0]`/`req_write` taps — exactly-1-edge-early pairing BY CONSTRUCTION),
+  and `o_MEM_PEND/PADDR/PWR` = registered pend level, class-masked to
+  REQ-pairing units (`fe_gen && !ord_bcont` | eng head/resume arm), head
+  re-captured every enabled edge (arb owner flip = documented replacement).
+  31 new FFs, zero handshake/launch/capture touches. Ports through HS3.sv +
+  the hand OOC top; guide doc now specs the three-tier request view.
+- Verification: HS3_tb **86/86** (new test 86 = early/pend whole-run oracle:
+  EREQ<=>REQ both directions + field equality over 341,575 pairs, REQ never
+  overlaps PEND, 2,337 pend-covered REQs PADDR/PWR-exact, own_dma flip
+  exemption taken 0 times this run). Match-queue count 341,575 = the
+  historical number exactly — laws bit-exact, first principle holds.
+- OOC (3 seeds vs the 2026-07-30 family −2.158/−2.846/−3.312): s1 **−2.480 /
+  80.13**, s7 **−2.415 / 80.55**, s5 **−2.277 / 81.45** — mean −2.391, the
+  best 3-seed family since R4 (−2.394), every seed inside the plateau band;
+  `mon_ereq/mon_pend/mon_paddr` in **0/20 paths on all seeds**; sta.rpt
+  mtimes verified fresh (the 17.0 stale-report trap checked). Registers
+  7996/7989/7924 — in-family. **NEUTRAL, KEPT.** Campaign remains closed at
+  R4; the pre-accept tiers price at zero.
+
+## 2026-08-01 — EREQ/EADDR flat-launch restructure (CV1k timing addendum) — LANDED at round 4, round 5 REVERTED
+
+- Ask (spec doc TIMING ADDENDUM): their first Step-A c102 fit put ~7.7 ns /
+  7+ serial LUT levels of the exported `mon_ereq_c` cone inside HS3 (cache
+  state -> arb addr muxes -> `fe_port~2/~5` -> `fe_acc` -> `fe_eng_start`);
+  same ports, same contract, launch restructured toward <=3-4 levels.
+- Change (5 measured rounds, best state kept = round 4):
+  1. `bsc.sv`: EREQ re-derived as a FLAT kept cone — class kernels collapse
+     to `fa[31:26]` x DRAMTP (area 1 is wholly port/dmac/dummy, so the
+     20-bit `fe_port`/`fe_dmac` compares provably never reach a unit-class
+     accept), parallel one-LUT ready rails (`mon_gen_ok/mon_sdh_ok/
+     mon_sdc_ok` + flat `mon_ebusy/mon_blk/mon_wrp_est` re-computes),
+     single-LUT final. Equivalence proven every enabled edge by tb oracle E1
+     (EREQ vs the registered REQ, both directions, 341,575 pairs).
+  2. `ibus_arb.sv`: `o_MON_ADDR/o_MON_WR/o_MON_VLD` = kept copies of the
+     request mux; EADDR/EWR now launch here (splitter passes addr/write
+     untouched -> value-identical to the BSC's `fa`).
+  3. raw pre-splitter valid feeds the cone (`hit_brg`'s 28-bit compare is
+     redundant: its windows are P4/area-1, never unit-class).
+  4. `cache.sv` `o_MON_IVLD` = kept flat dup of `I_BUS.req_valid` (states
+     inlined), piped cache -> cpu_core -> HS3 -> arb monitor mux.
+- Round 5 (kept LUT-half split + flat wr/burst exports end-to-end) MEASURED
+  NEGATIVE and reverted: s5 put strobe cells in 8/20 top paths (`mon_addr_c
+  [27]` fanout 36 — Quartus 17 merges functionally-identical nodes INTO the
+  kept dup, making the "dedicated" copy the shared net), s7 fell to −3.436.
+  Lesson: (* keep *) pins the net, not the cone; past ~1 dup per field the
+  merger inverts the decoupling.
+- Verification (final state): HS3_tb **86/86** + cpu_core_tb **105/105**;
+  341,575 EREQ pairs exact, laws bit-exact (match-queue = historical count).
+- OOC final (= round 4, confirmed by deterministic re-fit): s1 **−2.367 /
+  80.86**, s7 **−2.521 / 79.87**, s5 **−2.756 / 78.39** — mean −2.548, best
+  family mean of the campaign; strobes **0/20 all seeds**; sta mtimes fresh.
+  Export-cone probes (`ereq_depth.tcl` in each run dir, wrapper `_q` regs):
+  EREQ slack **+1.5/+2.3/+1.5 @ 10 ns**, 7-8 fitted levels (HS3-internal
+  launch 7.2/6.3 ns incl. OOC placement IC); EADDR **4 levels, +2.8 slack**
+  (the "near-registered image" delivered). The serial fe_port/fe_acc/
+  fe_eng_start chain is GONE from the export.
+- Residual: EREQ's 7-8 fitted levels = cache one-hot valid/write OR-trees +
+  17.0 duplicate-merging re-welding kept dups (round-5 proof). The literal
+  <=3-4-level target needs a REGISTERED launch = Tier 2 next-state mirrors
+  (mon_de idiom scaled across cache/arb/bsc) — separate decision, offered.
+
+## 2026-08-01 — Tier-2 registered EREQ launch (arm-riding packages) — LANDED at round 8 by USER DECISION (accepts s1 −0.63)
+
+- Design: each master exports a preserved request PACKAGE {vld, cls_gen,
+  cls_sdr, wr, bst}. The cache's rides the FSM itself — written alongside
+  every one of the 14 REQ-state entries, the `vic_ld` override, and the 6
+  accept exits (no condition re-derived; drift structurally impossible,
+  policed by test 86 every run). Class kernels are computed into the flop
+  Ds from REGISTERED addresses (`wb_pa`/`fill_base`/`bram_addr`/`cur_addr`;
+  only the two live-bypass sites decode the live AGU address). DMAC leg =
+  one LUT off its registered sequencer. Arb muxes packages by `own_dma`;
+  BSC final = package && one-LUT ready rails. DRAMTP decodes exported
+  quasi-static (`o_MON_A2SDR/A3SDR`). `(* preserve *)` on all 5 package
+  FFs — REQUIRED: they are sequentially equivalent to state decodes, and
+  without it Quartus deletes them and re-derives 8-level combinational
+  chains (measured, round 7).
+- Four measured rounds (3 seeds each, sims 86/86 + 105/105 green at every
+  point; laws bit-exact, 341,575 EREQ pairs exact throughout):
+  - R7 no-preserve: FFs deleted by synthesis; EREQ 8 lvl, mean −2.70. Dominated.
+  - **R8 full preserve (LANDED): EREQ 4/6/4 lvl, launch slack +1.6/+1.6/+3.2
+    @10 ns; s1 −2.994 (cls-capture family in top-20, −0.63 vs baseline),
+    s7 −2.450 / s5 −2.670 both CLEAN and better than baseline.**
+  - R9 late-select split of the live cls decode: WORSE everywhere
+    (−3.24/−2.70/−2.76, all seeds contaminated). Reverted.
+  - R10 partial preserve (cls released): −2.83/−2.85/−3.14, still
+    contaminated 2/3. Dominated.
+- Root cause of the cost: the package flops are TORN endpoints — D-cones
+  anchor to the AGU carry tail (live-bypass cls) and the tag-resolve arm
+  enables, Q-routes must reach the arb/BSC corner. Three shapings all
+  priced −0.3..−0.9 somewhere; this is a floorplan property, not a coding
+  artifact.
+- Decision: the user chose the round-8 state over the neutral Tier-1
+  combinational form (EREQ 7-8 lvl @ +1.5..+2.3) — the CV1k tRCD fix
+  gates on launch depth, and s7/s5 improved. The no-harm law is thus
+  WAIVED for s1's −0.63 on this feature by explicit user decision
+  (AskUserQuestion, 2026-08-01). Tier-1 numbers remain reproducible by
+  dropping the five (* preserve *) attributes + reverting the package (see
+  this entry + the Tier-1 entry above).
+
+## 2026-08-01 — Tier-2 drain-class bug (CV1k oracle rejection) — FIXED same day
+
+- CV1k's every-edge contract oracle killed their boot at 577 us:
+  `REQ without EREQ announce, addr=0c4d5200 wr=1 len=4 burst=1` — the
+  FIRST write-back drain. Reproduced deterministically in their sim
+  (working tree consumed live via symlink); a time-windowed probe showed
+  the package head up with `vld=1 wr=1 bst=1` but **cls=00**.
+- Root cause: `mon_cls_drain = mon_cls(wb_pa[27:22], ...)` — but `wb_pa`
+  is declared **`logic [31:4]`** (offset range; its own comment says
+  "wb_pa[31:29] is 000"), so `[27:22]` reads PA[27:22], not PA[31:26].
+  For 0x0C4D5200 those bits decode area 1 -> class 00 -> EREQ never
+  arms for the drain. Fix: `wb_pa[31:26]` (one line).
+- Why HS3_tb's 341,575-pair oracle missed it: ADDRESS-MAP VACUITY. The
+  tb's drain PAs put the wrong bits on area 0 -> class GEN, and the gen
+  arm's rails happen to track SDRAM drain-head accepts on those runs -
+  E1 held by coincidence of the map, not by correctness. Lesson recorded:
+  an oracle that only checks port-vs-port pairing can be satisfied by two
+  errors that cancel on one address map.
+- Gap closed: HS3_tb E3 GOLDEN-CLASS oracle — every cycle the cache
+  package is up (CPU-owned), its registered class/direction must equal a
+  fresh decode of the LIVE bus head address x DRAMTP (whitebox
+  `mon_pk_cls` vs golden(`u_bsc.fa`)). 377,657 checks/run; it fails on
+  the first mis-classed head on ANY map. Under the old bug it trips at
+  the first drain.
+- Verification: HS3_tb 86/86 (laws bit-exact, 341,575 pairs), cpu_core_tb
+  105/105, CV1k `MISTER=1 FASTBOOT=1` datum run clean to $finish at
+  125 ms sim (216x past the failure point). OOC 3-seed re-measure: same
+  cone shape (6 bits of the same register, different indices) — logged
+  below when complete.
+- Post-fix OOC 3-seed (the TRUE Tier-2 numbers; the round-8 figures above
+  came from the buggy netlist): s1 −2.849 / s7 −2.796 / s5 −2.924 (mean
+  −2.856; per-seed cost vs Tier-1 baseline −0.48/−0.28/−0.17, mean −0.31 —
+  same accepted trade, placement re-roll spread the `mon_pk_cls` torn-
+  endpoint family across all three panels instead of s1 alone). EREQ
+  6/6/6 fitted levels @ +1.89/+0.86/+2.60 launch slack; EADDR 5/3/4 @
+  +1.8..+2.5. sta mtimes fresh. FINAL LANDED STATE.
+
+## 2026-08-01 — ibara stale-T fix (RTE running-flag resync) + interrupt torture suite
+
+Answer to the CV1k evidence package (`ikacore_CV1k/docs/hs3_interrupt_tbit_bug.md`);
+HS3-side report kept verbatim at `docs/hs3_interrupt_tbit_fix.md`.
+
+- Root cause — one mechanism, and it is **NOT** the SSR capture. The
+  report's summary guessed "SSR captured holds the pre-writer T"; its own
+  silicon evidence disagrees (§5 row 2925: handler-restored SSR =
+  `fffffe00`, bit 0 = 0 = architecturally correct), and the new tb
+  capture-law oracle (SSR.T latched at every entry vs an architectural
+  T-map of the swept loop) PASSES on the pre-fix RTL at every boundary.
+  The real defect: EX never reads SR.T from ctrl_reg — it reads the
+  running mirrors `r_t/r_s/r_m/r_q` (`int_pipe.sv`, "Running SR.T latch"),
+  which resync only on (a) an exception-entry redirect or (b) a fully
+  drained pipe. **RTE's SR restore happens inside ctrl_reg and resynced
+  neither.** At cache-hit streaming:
+  ```
+  cycle W    RTE in WB (slot in MA)          rte_pending holds issue
+  edge  W    o_RTE_VALID pulse armed
+  cycle W+1  SR <= SSR lands in ctrl_reg     mawb = slot (no drain window)
+  edge  W+1  target issues into ID/EX
+  cycle W+2  target's FIRST instruction in EX reads r_t  <- HANDLER's T
+  edge  W+2  drained-pipe resync finally lands           <- one cycle late
+  ```
+  So whenever the interrupt's SPC lands between a T-writer and its
+  consuming branch (the `tst`/`bf` boundary — the NAND-pump geometry), the
+  first post-RTE instruction IS a T-consumer and executes with whatever T
+  the OS handler left behind. Wrong branch direction = exactly the §4 sim
+  trace. Same hole covered S/M/Q (MAC.W saturation mode, DIV1 chains).
+  `LDC Rm,SR` is NOT affected — serialization + drain resync close the
+  window one cycle earlier (proven by dedicated goldens). The §5 MACL
+  anomaly needs no second bug: with a stale-T branch the "wrong path"
+  executes **architecturally**, so its `mul` commits MACL legitimately;
+  a wrong-path-leak sweep confirms the kill gates are sound.
+- RTL: one arm in the int_pipe WB region — `if(o_RTE_VALID) r_* <=
+  i_SSR{0,1,9,8}` (exclusive with EX deposits: rte_pending holds issue
+  that cycle, so EX is guaranteed a bubble). No new stalls, no handshake
+  beats; IPC 0.401/0.974/0.554 bit-identical.
+- New torture goldens (cpu_core_tb group 12c, `+torture` subset), with the
+  pre-fix verdict of each:
+
+  | Golden | Pre-fix | Post-fix |
+  |---|---|---|
+  | RTE flag mirror x4 (SETT/CLRT poison, MOVT/branch-first) — deterministic, no interrupts | FAIL (all 4: consumer reads poisoned mirror) | PASS |
+  | LDC-SR flag mirror x2 | PASS (serialization covers it) | PASS |
+  | T-clobbering-handler sweep (SETT), ibara tst/bf-pair loop | FAIL at both spc=0x5A boundary offsets (early exit, iter=0) | PASS |
+  | T-clobbering-handler sweep (CLRT) + SSR.T-vs-SPC capture law | capture law PASS pre-fix (SSR was never wrong) | PASS |
+  | DIV1 chain vs DIV0S/SETT handler | FAIL at 11 offsets (M/Q/T corruption) | PASS |
+  | MAC.W chain vs SETS handler | PASS | PASS |
+  | Wrong-path MUL/CLRMAC/GPR leak sweep | PASS (kill gates sound) | PASS |
+  | Held-level RTE re-entry storm (12+ back-to-back entries) | PASS | PASS |
+
+  19 pre-fix failures total.
+- Verification: cpu_core_tb 117/117, HS3_tb 86/86, laws bit-exact.
+- CV1k-side expectations handed back with the fix (§8 of the report):
+  (1) datum ladder stays byte-identical — the fix is invisible without a
+  flag-clobbering handler colliding with a writer/consumer boundary;
+  (2) the 12.97 s event: mod loop must now complete (col=0, len=0x840),
+  no `TCR <= 00000000`; (3) board soak: TCR trap silent, sprite-ID /
+  asterisk / FLASH READ ERROR symptoms expected to clear together.
+- OOC: re-measured with the session-2 package — see the 2026-08-02 verdict
+  below (NEUTRAL, cleared to land). Expectation at the time was neutral:
+  the change adds a 5th 1-bit select arm to four flag registers, and `r_t`
+  cones have been absent from every top-20 panel since the re-baseline.
+
+## 2026-08-01 (session 2) — RTE delay-slot manual conformance + suite hardening
+
+Same-day hardening pass on top of the stale-T fix (§5 addendum of
+`docs/hs3_interrupt_tbit_fix.md`): the mirror resync moved from the retire
+pulse to the RTE's EX exit, so the delay slot itself already reads the
+restored T/S/M/Q.
+
+- Manual law implemented (sw manual 8.2.53 p.241: "the slot uses the SR
+  restored", + section-8 Delay_Slot illegal-slot list). Five RTL deltas:
+  (1) mirrors deposit i_SSR flags at the RTE's EX EXIT (replaces the
+  session-1 WB-pulse arm; the slot now reads restored T/S/M/Q);
+  (2) ctrl_reg RTE-restore arm MERGES same-edge retiring-slot commits
+  (ctrl regs + T/S/MQ bits land on top of the restore instead of being
+  dropped); (3) sr_id_view: STC-SR decoded as the RTE slot reads
+  SSR&MASK; (4) ex_md_view: slot privilege check against restored MD;
+  (5) bank1_nx rte_pre_wb arm: the slot's GPR read/write bank = restored
+  RB (shallow decode-field select, id_issue kept OFF the address cone);
+  plus NEW illegal-slot detection at the issue-time slot marking (any
+  PC-changer in a delay slot -> EXPEVT 0x1A0, was previously absent).
+- Suite hardening: passive flag-mirror coherence oracle (286,506
+  consume-point checks/run, property-checker group), hostile handlers in
+  the random INT/NMI capstone (flag-clobber + handler branches, MAC
+  save/clobber/restore, SSR/SPC rewrite context-switch shape; 12 trials,
+  MACH/MACL + S/M/Q added to the end-state compare), anti-vacuity
+  coverage asserts on every torture sweep, and GOLDEN X8 rte-slot laws
+  (6 phases). Old test_rte updated to the manual law (slot writes the
+  RESTORED bank).
+- tb lesson: MAC.W @R14+,@R14+ in the random mix drifts the window base
+  off longword alignment -> address error -> vector slide fetches the
+  program's own cached data at VBR+0x100 -> reset-like loop. MAC-state
+  coverage moved to MUL.L/DMULS.L; MAC.W x S stays in the X5 sweep.
+- Verification: cpu_core_tb 118/118, HS3_tb 86/86, IPC 0.401/0.974/0.554
+  bit-identical.
+- OOC: re-measured 2026-08-02 (entry below) — NEUTRAL, cleared to land.
+  Watch items going in were: bank1_nx gained a 3-term registered-field OR
+  on its select (feeds the GPR read-address cone - the sensitive family),
+  sr_id_view/ex_md_view are shallow control legs, illegal-slot is one
+  product in the ID illegal cone.
+
+## 2026-08-02 — OOC verdict for the RTE/interrupt conformance package + gap tests
+
+- 3-seed re-measure (s1/s5/s7, sta.rpt mtimes fresh): s1 −3.282/75.29,
+  s5 −2.366/80.87, s7 −2.425/80.48. Mean −2.69 vs the −2.920 frozen
+  baseline = NEUTRAL (slightly positive, within the ±0.4 noise band;
+  s1 is a plateau-tax placement draw of the known headline class).
+- Cone scan: every top-20 head is a PRE-EXISTING wall class — s1 all
+  fwd_shadow_a→address_error→ex_complete→fetch/pair (the round-5 weld),
+  s5 r_bank1-OUTPUT→operand-select (the historic fit4 o_SR[29] class,
+  same −2.36 magnitude) + bram_addr walls, s7 AGU→cache-state. ZERO
+  paths through rte_pre_wb / sr_id_view / ex_md_view / illegal-slot /
+  ctrl_reg merge / mirror deposits; no endpoint lands ON r_bank1 (the
+  widened bank1_nx select is invisible). PACKAGE CLEARED TO LAND.
+- Coverage-gap audit follow-ups built while fitting (X9/X10/X11, all
+  green = laws locked, no new bugs): RTE-target fetch fault (restored-SR
+  →SSR re-capture round trip, SPC/TEA on target), killed in-flight
+  LDC→GBR/SSR ctrl-write sweep (the ctrl-file twin of the GPR-leak law),
+  nested hostile handlers (BL-cleared outer + clobbering inner, 2-level
+  SSR/SPC save/restore chain via R0/R15 + entry-count discrimination).
+- Final: cpu_core_tb 121/121, HS3_tb 86/86, IPC 0.401/0.974/0.554.
+- Remaining audit items DEFERRED with rationale: SoC twin of the
+  hostile-handler suite (INTC-protocol product; core level proven, SoC
+  twins historically zero-bug), SLEEP×interrupt (SLEEP does not halt -
+  o_SLEEP_VALID unconnected, standby feature deferred with STBCR),
+  RTE-slot-fault behavior (manual p.241 disclaims: programmer must
+  avoid; current recovery is exercised but the exact SPC choice is a
+  documented-choice candidate), exc-MMIO write vs same-edge event
+  (documented priority, low value).
+
+## 2026-08-01 — X12 depth-3 mixed-kind nest + interrupt-logic optimization audit
+
+- GOLDEN X12 `test_int_nested_trapa` (torture group, green FIRST run,
+  20-offset sweep): interrupt → nested interrupt → TRAPA raised INSIDE
+  the inner handler. SH-3 has one physical SSR/SPC pair, so the 3-level
+  ladder is software save/restore (R14/R15 outer, R4/R5 inner); every
+  level clobbers the running T before its RTE. Locks: depth-3 capture
+  (STC SSR/SPC = inner live SR / TRAPA+2), FIRST-post-RTE MOVT reads the
+  restored T through the depth-3 poison, final SSR/SPC == outer-saved
+  images, main tst/bf loop transparent, entry/ack/EXPEVT/TRA bookkeeping
+  exact. tb trap avoided: load_tbit_torture's &remaining=0x100 aliases
+  the VBR+0x100 vector through the UNIFIED cache — X12 moves it to 0x180.
+- Final: cpu_core_tb 122/122 (torture 18/18), HS3_tb 86/86 (RTL
+  untouched), IPC 0.401/0.974/0.554 bit-identical.
+- RTL-SKILLS audit of the interrupt conformance logic (static cost-model
+  pass + the 3-seed OOC evidence): mirror deposits / ex_md_view /
+  illegal-slot override ≈ 1 ALM each on registered inputs; ctrl_reg
+  restore-merge = duplication-over-priority (correct trade); sr_id_view
+  adds ≤1 level on the rare STC immediate leg (foldable into the
+  control_read_value selector if it ever surfaces). ONE real lever
+  identified, NOT applied: predecode event_rte into pd_route_t to
+  replace the live 16-bit ==16'h002B equality in rte_pre_wb's ifid arm
+  (the front of the bank1_nx select → GPR M10K address path, Wall A
+  class). Withheld per the skill's own protocol: zero top-20 membership
+  across 3 seeds, campaign closed at the plateau (R7/R8 lesson: -0.3..
+  -0.7 tax on speculative shape changes). Apply only if bank1_nx /
+  bram-addr panels ever show rte_pre_wb membership.

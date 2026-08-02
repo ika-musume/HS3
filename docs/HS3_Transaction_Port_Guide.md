@@ -64,11 +64,18 @@ BUS_PCEN-grid signal.
 
 ## 2. Signal reference
 
-Transaction rails (all registered, dedicated FFs):
+Transaction rails — three request tiers (the EREQ trio is live, everything
+else registered dedicated FFs):
 
 | Signal | Width | Phase | Meaning |
 |---|---|---|---|
+| `o_MEM_EREQ` | 1 | combinational, 1 enabled edge before REQ | the accept-edge view ahead of the REQ register — pairs with the next REQ pulse by construction (§3.1) |
+| `o_MEM_EADDR` | 29 | live under EREQ | the address the paired REQ will carry |
+| `o_MEM_EWR` | 1 | live under EREQ | its direction |
 | `o_MEM_REQ` | 1 | 1 `i_CLK` pulse at the accept edge | one pulse per committed external transaction UNIT |
+| `o_MEM_PEND` | 1 | registered level | a unit-class request sitting valid-but-not-ready, pre-accept (§3.2) |
+| `o_MEM_PADDR` | 29 | held while PEND | the pend head's address — may be replaced mid-pend (§3.2) |
+| `o_MEM_PWR` | 1 | held while PEND | pend head direction |
 | `o_MEM_WR` | 1 | field, valid under REQ | 1 = write — the **early direction bit** |
 | `o_MEM_ADDR` | 29 | field, valid under REQ | physical address, `[28:26]` = CS area |
 | `o_MEM_SIZE` | 2 | field, valid under REQ | I_BUS size encoding |
@@ -118,10 +125,13 @@ consumer flushes both FIFOs and its match queue on any reset assertion.
 The accept is an **edge** event: it becomes
 fact only at the clock edge where `req_valid && req_ready` are sampled high.
 The REQ flop loads at that same edge, so the pulse rises AT the accept edge —
-the earliest committed, glitch-free instant that exists. Anything earlier
-would export the (wide, late-settling) accept cone combinationally: a glitchy
-pin carrying a prediction that a reset can retract, and external routing load
-on the accept cone that the dedicated-FF design deliberately avoids.
+the earliest committed, glitch-free instant that exists. A consumer can still
+act ahead of it, through the two pre-accept tiers, each with its hazard
+stated instead of hidden: `EREQ` (§3.1) is the same accept-edge event
+exported live one enabled edge early — glitchy until settle, sampled on the
+shared edge, pairing with REQ by construction; `PEND` (§3.2) is revocable
+pre-accept state under an explicit replacement/drop contract. REQ remains
+the commitment tier: glitch-free, never retracted.
 
 ```
 i_CLK        _/‾\_/‾\_/‾\_/‾\_
@@ -156,9 +166,10 @@ full cell before T1 do so for canvas room; the structural gap is 0..1
 `i_CLK` plus programmed AnIW idles. A read gains nothing from beating T1
 anyway — T1 carries no read data; the deadline is the SAMPLE FALL, and the
 guaranteed budget knobs are WCR2 first-access waits (fixed) and `i_WAIT_n`
-(dynamic, §5.3). Nothing earlier than the accept can be exported: that
-would be uncommitted pend state — retractable by reset, and its cone is the
-accept cone (§10).
+(dynamic, §5.3). Anything earlier than the accept is uncommitted pend
+state — exported only on the PEND tier (§3.2), whose contract names its two
+revocations (reset drop, arb head replacement) so the consumer can
+speculate on it soundly; the EREQ/REQ tiers never retract.
 
 **Spacing guarantee — pulses never merge.** The fabric is one-outstanding
 (`ibus_arb.sv`: `busy` from accept to `rsp_done`; owner moves only at idle
@@ -169,6 +180,76 @@ posted (`rsp_valid = gen_ext_done | ord_done` for non-envelope GEN,
 REQ-firing accepts are always separated by at least a full response-bounded
 transaction — no skid buffer exists, and a testbench assertion enforces the
 invariant (§10).
+
+### 3.1 `o_MEM_EREQ` — the accept edge, one enabled edge early
+
+`EREQ` re-computes the REQ register's D-input — the accept-edge view of
+the live handshake — in its own cone, shaped for the consumer's entry
+register (its whole budget is this launch). The cone is REGISTER-LAUNCHED:
+each bus master maintains a preserved request PACKAGE `{vld, class, wr,
+bst}` that rides the very same FSM arm writes that raise and retire its
+request (the cache's controller writes it alongside every REQ-state
+transition; the DMAC's is one LUT off its registered sequencer), the
+arbiter owner-muxes the packages once, and the BSC ANDs the result with
+its one-LUT ready rails over registered trackers. No live address enters
+the cone anywhere: the class kernel (`{gen, sdr}`, computed into the
+package flops from registered addresses × DRAMTP) encodes P4/area-1/
+area-7 as 00, which also makes the splitter's bridge windows structurally
+invisible. Measured launch: 4–6 fitted levels. `EADDR`/`EWR` launch from
+a dedicated copy of the on-chip arbiter's request mux — one mux level
+from the address registers, on their own nets (4 fitted levels). Pairing
+is exact BY CONSTRUCTION — at every enabled edge, `EREQ` high means the
+very next edge loads the REQ pulse:
+
+```
+i_CLK        _/‾\_/‾\_/‾\_/‾\_
+o_MEM_EREQ   ___/‾‾‾\_________    live accept view (glitchy until settle)
+o_MEM_REQ    _______/‾‾‾\_____    the registered pulse, one edge later
+EADDR/EWR    ===X live X======    settle with EREQ; == ADDR/WR under REQ
+```
+
+Contract:
+- `EREQ(T) <=> REQ(T+1)` — both directions: no cancels, no unannounced
+  units; pended accepts and resumed-drain re-strobes included.
+- `EADDR`/`EWR` at the sampling edge equal the paired unit's `ADDR`/`WR`
+  bit-exactly.
+- The trio is combinational: it glitches while the cycle's logic settles
+  and is meaningful only AT the shared sampling edge. Register it on entry.
+- Every unit therefore carries one guaranteed cycle of lead beyond the REQ
+  pulse — including fresh idle-bus accepts, the class PEND cannot cover
+  (§3.2).
+
+### 3.2 `o_MEM_PEND` — pre-accept pend visibility
+
+`PEND` is a registered level: a unit-class request is sitting
+valid-but-not-ready at the BSC front-end (bus handback, refresh, engine
+busy, posted-write ack pending). `PADDR`/`PWR` re-capture the live pend
+head every enabled edge, one edge behind the wire truth. Only pends whose
+eventual accept fires REQ are shown: P-bus / on-chip register / dummy
+destinations and burst-continuation calls are masked out (a yielded write
+drain's RESUME beat re-strobes REQ, so it shows).
+
+```
+i_CLK        _/‾\_/‾\_/‾\_/‾\_/‾\_
+valid&!rdy   /‾‾‾‾‾‾‾\____________    head waits (refresh / handback / ...)
+o_MEM_PEND   ____/‾‾‾‾‾‾‾\________    registered level, one edge behind
+o_MEM_REQ    ____________/‾‾‾\____    the pend's own accept pulse
+```
+
+Contract:
+- While PEND is high, an accept at that edge pairs the next REQ with the
+  `PADDR`/`PWR` then shown. PEND falls on the accept cycle itself, so REQ
+  and PEND are never high together.
+- The head is REVOCABLE, in exactly two ways, both observable:
+  1. **Replacement** — the on-chip arbiter moves ownership at an idle
+     boundary while a request waits un-accepted (DMAC outranks CPU);
+     `PADDR`/`PWR` show the new head one edge later. A consumer that
+     speculated on the old head re-evaluates; the EREQ/REQ pair still
+     carries the truth.
+  2. **Drop** — a reset kills the pending op with no REQ (the R10 flush).
+- PEND gives arbitrarily long lead (a head can wait tens of cycles), but
+  covers only already-waiting ops. Fresh idle-bus accepts never pend —
+  their guaranteed lead is the EREQ cycle (§3.1).
 
 ---
 
@@ -767,8 +848,10 @@ the controller's leisure.
 
 ## 9. Consumer contract
 
-1. Sample all `o_MEM_*` on every `i_CLK` edge. All outputs are registered —
-   no phase alignment needed, no pulse can be missed.
+1. Sample all `o_MEM_*` on every `i_CLK` edge. All outputs except the EREQ
+   trio are registered — no phase alignment needed, no pulse can be missed.
+   The EREQ trio is combinational: meaningful only at the sampling edge;
+   register it on entry, never combinate on it mid-cycle.
 2. On REQ=1: enqueue `{WR, ADDR, SIZE, BURST, LEN, WSTRB, SADDR}`. One pulse
    = one unit; pulses never merge. **Service units strictly in REQ order** —
    this is also the RAW/WAW guard: never serve a read past an older
@@ -788,14 +871,27 @@ the controller's leisure.
 6. On any reset assertion: flush both FIFOs and the match queue (spec R10).
 7. Refresh/MRS pin activity is port-silent — pin-decode it if needed
    (spec R2).
+8. `EREQ` pre-execution: work started on EREQ may be treated as committed —
+   the next edge's REQ confirms it unconditionally (§3.1).
+9. `PEND` speculation: pre-work keyed on PADDR (row activation etc.) must
+   be re-evaluated whenever PADDR changes while PEND holds, and abandoned
+   on reset (the two revocations, §3.2). Verification stays at the
+   EREQ/REQ pair.
 
 ---
 
 ## 10. Implementation notes
 
-- All transaction rails are dedicated FFs in the BSC — the port never loads
-  the accept cone or engine cones with external routing (the CV1k campaign
-  measured accept-cone-shape changes as Fmax-negative).
+- All transaction rails are dedicated FFs in the BSC except the EREQ trio,
+  which launches from the masters' preserved request packages (arm-riding
+  registers in the cache, sequencer decode in the DMAC) muxed at the arb,
+  ANDed with the BSC's one-LUT ready rails; EADDR/EWR from a dedicated
+  arb-level mux copy — either way the port never loads the accept cone or
+  engine cones with external routing (the CV1k campaign measured
+  accept-cone-shape changes as Fmax-negative). MAINTENANCE: any cache FSM
+  edit that adds or moves a REQ-state transition must write the `mon_pk_*`
+  package in the same arm — the whole-run EREQ<->REQ oracle (test 86)
+  fails on the first divergent run.
 - REQ + fields: implemented as dedicated registers in the BSC's
   transaction-port section — LEN from the SIZE × area-port-width decode the
   BSC already owns (`ord_w8_c`/`ord_w16_c`, `sd16_a2`/`sd16_a3`), SADDR,
@@ -807,9 +903,10 @@ the controller's leisure.
   twin) for pushes. No prediction, no cone loading.
 - WDATA (+ held WSTRB): one 32-bit register loaded under the same accept
   enables; ~45 new FF bits total including LEN/SADDR.
-- The port deliberately provides NO level-held request view (a consumer
-  needing one regenerates it as REQ-sets / LEN'th-DE-clears) and NO
-  pre-accept pend visibility (REQ = commitment).
+- The port provides NO level-held view of an ACCEPTED unit (a consumer
+  needing one regenerates it as REQ-sets / LEN'th-DE-clears); pre-accept
+  state is visible only on the PEND tier, under its named revocations
+  (§3.2) — the EREQ/REQ tiers stay commitment-only.
 - The HS3_tb harness keeps its raw-memory models and hsk controller on a
   WHITEBOX copy of the internal live request view (hierarchical taps,
   expression-identical to the deleted live mux) so every model trigger and
@@ -826,8 +923,11 @@ the controller's leisure.
   from silent engine bursts, judged at cause time (the registered pulse
   trails its consume edge by one cycle); hsk completions and write pushes
   are off-pin events that may land under a concurrent refresh. The port
-  must be dead across reset. A full FIFO reference-adapter model is a
-  possible future addition.
+  must be dead across reset. The early/pend oracle checks EREQ<->REQ
+  pairing in both directions with field equality, that REQ never overlaps
+  PEND, and that a PEND-covered REQ carries the announced PADDR/PWR (arb
+  owner flips exempted as documented head replacements). A full FIFO
+  reference-adapter model is a possible future addition.
 - First principle (hard gate, not an expectation): existing bus cycles and
   pipeline IPC are unchanged under all circumstances — no internal
   handshake, launch, or capture-path edits; new registers only on

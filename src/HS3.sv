@@ -79,10 +79,13 @@ module HS3 #(
     output  wire            o_D_PU,         //PULD: D31-D0 pull-up state (figs 10.42-43)
     output  wire            o_IRQOUT_n,     //bus retrieval request (p.321)
 
-    /* TRANSACTION PORT (spec: docs/Early_Monitor_Guide.md) - the complete
-       transaction view of the external bus, in parallel with the pins:
-       REQ = 1-cycle pulse per committed external unit at its accept edge
-       (fields held until the next unit, LEN = physical beat count);
+    /* TRANSACTION PORT (spec: docs/HS3_Transaction_Port_Guide.md) - the
+       complete transaction view of the external bus, in parallel with the
+       pins: EREQ = combinational notice exactly one enabled edge before
+       REQ (sample on the shared edge); REQ = 1-cycle pulse per committed
+       external unit at its accept edge (fields held until the next unit,
+       LEN = physical beat count); PEND = pre-accept level with the pend
+       head on PADDR/PWR (the head may be replaced by an arb owner flip);
        DE = 1-cycle pulse per beat - read units pop-confirm at the consume
        edge, write units push WDATA at each accepted beat. Generic-class
        accesses may be completed early by i_MEM_RSP_VALID / i_MEM_READY
@@ -93,6 +96,12 @@ module HS3 #(
     output  wire            o_MEM_BURST,
     output  wire    [1:0]   o_MEM_SIZE,
     output  wire    [28:0]  o_MEM_ADDR,
+    output  wire            o_MEM_EREQ,
+    output  wire    [28:0]  o_MEM_EADDR,
+    output  wire            o_MEM_EWR,
+    output  wire            o_MEM_PEND,
+    output  wire    [28:0]  o_MEM_PADDR,
+    output  wire            o_MEM_PWR,
     output  wire    [4:0]   o_MEM_LEN,
     output  wire            o_MEM_SADDR,
     output  wire    [6:0]   o_MEM_CS_n,
@@ -200,6 +209,12 @@ IBus_2          PBUS2_PORT();       //Peripheral bus 2: BSC -> ioport   (0x04000
 IBus_2          PBUS2_DMAC();       //Peripheral bus 2: BSC -> dmac     (0x04000020-77)
 
 wire            dmac_hold;          //DMAC transfer-unit / burst bus hold
+//transaction-port EREQ launch package: cache tracker -> arb mux -> BSC cone
+wire            mon_cpu_vld,  mon_cpu_cgen, mon_cpu_csdr;
+wire            mon_cpu_wr,   mon_cpu_bst;
+wire            mon_pkg_vld,  mon_pkg_cgen, mon_pkg_csdr;
+wire            mon_pkg_wr,   mon_pkg_bst;
+wire            mon_a2sdr,    mon_a3sdr;    //BSC DRAMTP decodes (quasi-static)
 
 ibus_arb u_arb (
     .i_RST_n                (rst_all_n                  ),
@@ -210,7 +225,22 @@ ibus_arb u_arb (
     .DMA_BUS                (IBUS1_DMA                  ),
     .CORE_BUS               (IBUS1_ARB                  ),
 
-    .i_DMA_HOLD             (dmac_hold                  )
+    .i_DMA_HOLD             (dmac_hold                  ),
+
+    .i_MON_CPU_VLD          (mon_cpu_vld                ),
+    .i_MON_CPU_CGEN         (mon_cpu_cgen               ),
+    .i_MON_CPU_CSDR         (mon_cpu_csdr               ),
+    .i_MON_CPU_WR           (mon_cpu_wr                 ),
+    .i_MON_CPU_BST          (mon_cpu_bst                ),
+    .i_MON_A2SDR            (mon_a2sdr                  ),
+    .i_MON_A3SDR            (mon_a3sdr                  ),
+    .o_MON_ADDR             (o_MEM_EADDR                ),
+    .o_MON_WR               (o_MEM_EWR                  ),
+    .o_MON_VLD              (mon_pkg_vld                ),
+    .o_MON_CGEN             (mon_pkg_cgen               ),
+    .o_MON_CSDR             (mon_pkg_csdr               ),
+    .o_MON_WRC              (mon_pkg_wr                 ),
+    .o_MON_BSTC             (mon_pkg_bst                )
 );
 
 ibus_splitter u_split (
@@ -268,6 +298,17 @@ bsc #(
     .o_MEM_BURST            (o_MEM_BURST                ),
     .o_MEM_SIZE             (o_MEM_SIZE                 ),
     .o_MEM_ADDR             (o_MEM_ADDR                 ),
+    .o_MEM_EREQ             (o_MEM_EREQ                 ),
+    .i_MON_VLD              (mon_pkg_vld                ),
+    .i_MON_CGEN             (mon_pkg_cgen               ),
+    .i_MON_CSDR             (mon_pkg_csdr               ),
+    .i_MON_WRC              (mon_pkg_wr                 ),
+    .i_MON_BSTC             (mon_pkg_bst                ),
+    .o_MON_A2SDR            (mon_a2sdr                  ),
+    .o_MON_A3SDR            (mon_a3sdr                  ),
+    .o_MEM_PEND             (o_MEM_PEND                 ),
+    .o_MEM_PADDR            (o_MEM_PADDR                ),
+    .o_MEM_PWR              (o_MEM_PWR                  ),
     .o_MEM_LEN              (o_MEM_LEN                  ),
     .o_MEM_SADDR            (o_MEM_SADDR                ),
     .o_MEM_CS_n             (o_MEM_CS_n                 ),
@@ -350,6 +391,13 @@ cpu_core #(
     .i_CEN                  (cen                        ),
 
     .I_BUS                  (IBUS1_CORE                 ),
+    .o_MON_VLD              (mon_cpu_vld                ),
+    .o_MON_CGEN             (mon_cpu_cgen               ),
+    .o_MON_CSDR             (mon_cpu_csdr               ),
+    .o_MON_WR               (mon_cpu_wr                 ),
+    .o_MON_BST              (mon_cpu_bst                ),
+    .i_MON_A2SDR            (mon_a2sdr                  ),
+    .i_MON_A3SDR            (mon_a3sdr                  ),
 
     .i_NMI_VALID            (nmi_valid                  ),
     .i_NMI_BLMSK            (nmi_blmsk                  ),

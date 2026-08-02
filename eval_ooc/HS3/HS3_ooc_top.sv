@@ -19,12 +19,18 @@ module HS3_ooc_top (
     output  wire            o_CKIO,
     input   wire            i_EXTAL2,   //RTC 32.768 kHz clock - own async domain (SDC cuts it)
 
-    /* TRANSACTION PORT (docs/Early_Monitor_Guide.md) */
+    /* TRANSACTION PORT (docs/HS3_Transaction_Port_Guide.md) */
     output  wire            o_MEM_REQ,
     output  wire            o_MEM_WR,
     output  wire            o_MEM_BURST,
     output  wire    [1:0]   o_MEM_SIZE,
     output  wire    [28:0]  o_MEM_ADDR,
+    output  wire            o_MEM_EREQ,
+    output  wire    [28:0]  o_MEM_EADDR,
+    output  wire            o_MEM_EWR,
+    output  wire            o_MEM_PEND,
+    output  wire    [28:0]  o_MEM_PADDR,
+    output  wire            o_MEM_PWR,
     output  wire    [4:0]   o_MEM_LEN,
     output  wire            o_MEM_SADDR,
     output  wire    [6:0]   o_MEM_CS_n,
@@ -130,6 +136,12 @@ module HS3_ooc_top (
         .o_MEM_BURST            (o_MEM_BURST                ),
         .o_MEM_SIZE             (o_MEM_SIZE                 ),
         .o_MEM_ADDR             (o_MEM_ADDR                 ),
+        .o_MEM_EREQ             (o_MEM_EREQ                 ),
+        .o_MEM_EADDR            (o_MEM_EADDR                ),
+        .o_MEM_EWR              (o_MEM_EWR                  ),
+        .o_MEM_PEND             (o_MEM_PEND                 ),
+        .o_MEM_PADDR            (o_MEM_PADDR                ),
+        .o_MEM_PWR              (o_MEM_PWR                  ),
         .o_MEM_LEN              (o_MEM_LEN                  ),
         .o_MEM_SADDR            (o_MEM_SADDR                ),
         .o_MEM_CS_n             (o_MEM_CS_n                 ),

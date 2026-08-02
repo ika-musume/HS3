@@ -100,6 +100,13 @@ cpu_core u_dut (
     .i_CEN                     (1'b1),
 
     .I_BUS                     (MEM_BUS),
+    .o_MON_VLD                 (),
+    .o_MON_CGEN                (),
+    .o_MON_CSDR                (),
+    .o_MON_WR                  (),
+    .o_MON_BST                 (),
+    .i_MON_A2SDR               (1'b0),
+    .i_MON_A3SDR               (1'b0),
 
     .i_NMI_VALID               (nmi_valid_q),
     .i_NMI_BLMSK               (nmi_blmsk_q),
@@ -288,6 +295,7 @@ logic   [31:0]  exception_entry_pc_l;
 integer         entry_count;         //exception/interrupt entries since reset
 logic           entry_z;             //one-cycle-delayed entry pulse (SPC settle)
 logic   [31:0]  entry_spc_l;         //SPC captured the cycle after each entry
+logic   [31:0]  entry_ssr_l;         //SSR captured with it (torture capture-law oracle)
 integer         int_ack_count;       //o_INT_ACK pulses since reset (INTC drop key)
 integer         nmi_ack_count;       //o_NMI_ACK pulses since reset (edge-pending clear key)
 logic           gpr_phase_write_seen;
@@ -332,6 +340,7 @@ always_ff @(posedge clk or negedge rst_n) begin
         entry_count          <= 0;
         entry_z              <= 1'b0;
         entry_spc_l          <= 32'd0;
+        entry_ssr_l          <= 32'd0;
         int_ack_count        <= 0;
         nmi_ack_count        <= 0;
         gpr_phase_write_seen   <= 1'b0;
@@ -382,6 +391,7 @@ always_ff @(posedge clk or negedge rst_n) begin
             end
             entry_z <= exception_entry_valid;
             if(entry_z) entry_spc_l <= spc_o;   //SPC is committed by the cycle after entry
+            if(entry_z) entry_ssr_l <= ssr_o;   //SSR twin: capture-law checks in the torture sweeps
             //Clocked ack sampling: the SoC INTC drops its request on this pulse, so an
             //ack WITHOUT a matching interrupt entry is a lost interrupt (collision law).
             if(int_ack_w) int_ack_count <= int_ack_count + 1;
@@ -886,6 +896,44 @@ always @(posedge clk) begin
         mb_lock_z  = MEM_BUS.req_lock;
         mb_wdata_z = MEM_BUS.req_wdata;
         mb_wstrb_z = MEM_BUS.req_wstrb;
+    end
+end
+
+/*
+    (8) Running-flag mirror coherence law (the ibara stale-T family, suite-wide):
+    whenever EX holds a live packet and no OLDER in-flight producer can still
+    change T/S/M/Q (no flag writer / RTE / LDC-SR in EX/MA or MA/WB, no byte-RMW
+    in EX/MA, no redirect and no restore-commit pulse this cycle), the running
+    mirrors r_t/r_s/r_m/r_q MUST equal the committed SR bits - checked at the
+    consume point, under every test in the suite. Any future resync hole in the
+    mirror protocol (RTE restore, LDC-SR, exception entry, drain) trips here
+    without needing a hand-built window test.
+*/
+integer mirror_checks = 0;
+integer mirror_viol   = 0;
+wire mirror_clean =
+    !(u_dut.u_int_pipe.exma.valid &&
+      (u_dut.u_int_pipe.exma.t_we || u_dut.u_int_pipe.exma.s_we ||
+       (|u_dut.u_int_pipe.exma.mq_we) || u_dut.u_int_pipe.exma.event_rte ||
+       u_dut.u_int_pipe.exma.ctrl_dst == int_pipe_pkg::CTRL_SR ||
+       u_dut.u_int_pipe.exma.mem_op   == int_pipe_pkg::MEM_RMW)) &&
+    !(u_dut.u_int_pipe.mawb.valid &&
+      (u_dut.u_int_pipe.mawb.t_we || u_dut.u_int_pipe.mawb.s_we ||
+       (|u_dut.u_int_pipe.mawb.mq_we) || u_dut.u_int_pipe.mawb.event_rte ||
+       u_dut.u_int_pipe.mawb.ctrl_dst == int_pipe_pkg::CTRL_SR)) &&
+    !u_dut.redirect_valid && !u_dut.u_int_pipe.o_RTE_VALID;
+
+always @(posedge clk) begin
+    if(rst_n && u_dut.u_int_pipe.idex.valid && mirror_clean) begin
+        mirror_checks = mirror_checks + 1;
+        if(u_dut.u_int_pipe.r_t !== sr[0] || u_dut.u_int_pipe.r_s !== sr[1] ||
+           u_dut.u_int_pipe.r_m !== sr[9] || u_dut.u_int_pipe.r_q !== sr[8]) begin
+            mirror_viol = mirror_viol + 1;
+            $display("      [MIRROR] r_t/s/m/q=%b%b%b%b vs SR=%b%b%b%b at EX pc=%08h @%0t",
+                     u_dut.u_int_pipe.r_t, u_dut.u_int_pipe.r_s,
+                     u_dut.u_int_pipe.r_m, u_dut.u_int_pipe.r_q,
+                     sr[0], sr[1], sr[9], sr[8], u_dut.u_int_pipe.idex.pc, $time);
+        end
     end
 end
 
@@ -3716,11 +3764,15 @@ task automatic test_mm_array_laws;
 endtask
 
 //GOLDEN Z3 - the capstone: constrained-random programs (ALU / R14-window memory /
-//TAS / PREF / plain+delayed forward branches over live T) run once with NO
-//interrupts as the reference, then again with random INT/NMI waves injected at
-//random offsets (dropped on ack, the INTC protocol). The architectural end state
-//must be IDENTICAL, the handler counter must equal the wave count, and no wave
-//may be lost. Generalizes every hand-built offset sweep in the suite.
+//TAS / PREF / plain+delayed forward branches over live T / MOVT / ADDC / DIV /
+//MAC.W) run once with NO interrupts as the reference, then again with random
+//INT/NMI waves injected at random offsets (dropped on ack, the INTC protocol).
+//The architectural end state - GPRs, memory, T, S/M/Q, MACH/MACL - must be
+//IDENTICAL, the handler counter must equal the wave count, and no wave may be
+//lost. HOSTILE HANDLERS (trial%4): the ibara lesson is that a minimal ADD/RTE
+//handler audits nothing - so the handlers clobber flags, branch with a delayed
+//pair, save/clobber/restore MACH/MACL, and save/rewrite/restore SSR+SPC (the
+//context-switch shape), using only R0/R15 (untouched by the programs).
 localparam integer TRACE_TRIAL = 5;   //+traceoracle: dump program + retire streams of this trial
 task automatic test_random_int_oracle;
     integer trial, i, k, cls, dst, srcr, disp, ilat, dlat;
@@ -3728,9 +3780,10 @@ task automatic test_random_int_oracle;
     logic [31:0] ref_r [0:14];
     logic [31:0] ref_m [0:15];
     logic        ref_t;
+    logic [31:0] ref_mach, ref_macl, ref_flags;
     begin
-        begin_test("Random-program oracle vs random INT/NMI waves: end state identical, none lost");
-        for(trial = 0; trial < 8; trial = trial + 1) begin
+        begin_test("Random-program oracle vs random INT/NMI waves + hostile handlers: end state identical");
+        for(trial = 0; trial < 12; trial = trial + 1) begin
             cacheable_bootstrap((trial & 1) ? 8'h0B : 8'h09);   //alternate WT / WB
             //R13/R14 init BEFORE the BL-clearing LDC: a wave accepted at the init's
             //own boundary would otherwise resume INTO the init and erase the handler
@@ -3751,7 +3804,7 @@ task automatic test_random_int_oracle;
             for(i = 1; i <= 12; i = i + 1) imem['h26 + i] = 16'hE000 | (i << 8);
             for(i = 0; i < 64; i = i + 1) begin
                 if(imem['h33 + i] != 16'h0009 && i != 0) continue;  //slot already forced
-                cls  = $urandom_range(0, 12);
+                cls  = $urandom_range(0, 16);
                 dst  = $urandom_range(1, 12);
                 srcr = $urandom_range(1, 12);
                 disp = $urandom_range(0, 15);
@@ -3774,15 +3827,75 @@ task automatic test_random_int_oracle;
                         imem['h34 + i]     = 16'h7001 | (dst << 8);               //   slot: ADD #1,Rn
                     end
                     11: imem['h33 + i] = 16'h4E1B;                                // TAS.B @R14 (locked RMW)
-                    default: imem['h33 + i] = 16'h0E83;                           // PREF @R14
+                    12: imem['h33 + i] = 16'h0E83;                                // PREF @R14
+                    13: imem['h33 + i] = 16'h0029 | (dst << 8);                   // MOVT Rn (T consumer)
+                    14: imem['h33 + i] = 16'h300E | (dst << 8) | (srcr << 4);     // ADDC Rm,Rn (T read+write)
+                    15: imem['h33 + i] = ($urandom_range(0, 1))
+                                         ? (16'h2007 | (dst << 8) | (srcr << 4))  // DIV0S (M/Q/T write)
+                                         : (16'h3004 | (dst << 8) | (srcr << 4)); // DIV1 (M/Q/T read+write)
+                    //MAC-state producers WITHOUT memory pointers (a MAC.W here would
+                    //drift R14 off longword alignment and address-error the window;
+                    //the MAC.W x S interplay lives in the dedicated X5 sweep).
+                    default: imem['h33 + i] = ($urandom_range(0, 1))
+                                         ? (16'h0007 | (dst << 8) | (srcr << 4))  // MUL.L (MACL pending)
+                                         : (16'h300D | (dst << 8) | (srcr << 4)); // DMULS.L (MACH:MACL)
                 endcase
             end
             imem['h73] = 16'h0009;  // sentinel
             imem['h74] = 16'hAFFE;  // guard
             imem['h75] = 16'h0009;
-            imem['h300] = 16'h7D01; // ADD   #1,R13   ; VBR+0x600 handler (INT and NMI)
-            imem['h301] = 16'h002B; // RTE
-            imem['h302] = 16'h0009; //   delay slot
+            //VBR+0x600 handler, one HOSTILE personality per trial%4. All variants
+            //count first (the wave-drop key) and stay architecturally transparent;
+            //R0/R15 are the only scratch registers (unused by the programs).
+            case(trial % 4)
+                0: begin
+                    //v0 - legacy minimal handler (keeps the historical shape covered).
+                    imem['h300] = 16'h7D01; // ADD   #1,R13
+                    imem['h301] = 16'h002B; // RTE
+                    imem['h302] = 16'h0009; //   slot
+                end
+                1: begin
+                    //v1 - flag clobber + a taken delayed pair INSIDE the handler
+                    //(poisons r_t and the rdir_target/pair machinery); the skipped
+                    //word is CLRMAC so a wrong-path leak breaks the MACL compare.
+                    imem['h300] = 16'h7D01; // ADD   #1,R13
+                    imem['h301] = 16'hA001; // BRA   +1 (taken handler branch)
+                    imem['h302] = 16'h0018; //   slot: SETT (T poison)
+                    imem['h303] = 16'h0028; // CLRMAC        ; must be SKIPPED
+                    imem['h304] = 16'h0019; // DIV0U         ; M/Q/T poison
+                    imem['h305] = 16'hEF80; // MOV   #-128,R15
+                    imem['h306] = 16'h2FF7; // DIV0S R15,R15 ; M=1,Q=1 poison
+                    imem['h307] = 16'h0058; // SETS          ; S poison
+                    imem['h308] = 16'h002B; // RTE
+                    imem['h309] = 16'h0009; //   slot
+                end
+                2: begin
+                    //v2 - MACH/MACL save + clobber + restore across the boundary
+                    //(audits MAC pending state and the LDS/STS commit lanes).
+                    imem['h300] = 16'h7D01; // ADD   #1,R13
+                    imem['h301] = 16'h001A; // STS   MACL,R0
+                    imem['h302] = 16'h0F0A; // STS   MACH,R15
+                    imem['h303] = 16'h0028; // CLRMAC        ; clobber
+                    imem['h304] = 16'h4F0A; // LDS   R15,MACH
+                    imem['h305] = 16'h401A; // LDS   R0,MACL
+                    imem['h306] = 16'h0018; // SETT          ; flag poison too
+                    imem['h307] = 16'h002B; // RTE
+                    imem['h308] = 16'h0009; //   slot
+                end
+                default: begin
+                    //v3 - the context-switch shape: save SSR/SPC, REWRITE SSR with
+                    //junk, restore both before RTE (the old 'residual exotic').
+                    imem['h300] = 16'h7D01; // ADD   #1,R13
+                    imem['h301] = 16'h0032; // STC   SSR,R0
+                    imem['h302] = 16'h0F42; // STC   SPC,R15
+                    imem['h303] = 16'h4F3E; // LDC   R15,SSR ; SSR = junk (SPC image)
+                    imem['h304] = 16'h403E; // LDC   R0,SSR  ; SSR restored
+                    imem['h305] = 16'h4F4E; // LDC   R15,SPC ; SPC rewritten (same value)
+                    imem['h306] = 16'h0008; // CLRT          ; flag poison
+                    imem['h307] = 16'h002B; // RTE
+                    imem['h308] = 16'h0009; //   slot
+                end
+            endcase
             ilat = $urandom_range(0, 4);
             dlat = $urandom_range(0, 4);
             i_latency = ilat; d_latency = dlat;
@@ -3800,7 +3913,10 @@ task automatic test_random_int_oracle;
                 ref_r[k] = ((trial % 3 != 0) && k >= 1 && k <= 7)
                            ? u_dut.u_int_pipe.u_gpr_bram.ram[k] : gpr(k);
             for(k = 0; k <  16; k = k + 1) ref_m[k] = dmem['h40 + k];
-            ref_t = sr[0];
+            ref_t     = sr[0];
+            ref_flags = sr & 32'h0000_0302;     //S (bit1), Q (bit8), M (bit9)
+            ref_mach  = mach_o;
+            ref_macl  = macl_o;
             //Trial: same program/latencies with random INT/NMI waves (drop on ack).
             do_reset;
             e0 = test_errors;
@@ -3846,6 +3962,9 @@ task automatic test_random_int_oracle;
                     ref_r[k]);
             chk($sformatf("trial %0d R14 transparent", trial), gpr(14), ref_r[14]);
             chk($sformatf("trial %0d T bit transparent", trial), {31'd0, sr[0]}, {31'd0, ref_t});
+            chk($sformatf("trial %0d S/M/Q flags transparent", trial), sr & 32'h0000_0302, ref_flags);
+            chk($sformatf("trial %0d MACH transparent", trial), mach_o, ref_mach);
+            chk($sformatf("trial %0d MACL transparent", trial), macl_o, ref_macl);
             for(k = 0; k < 16; k = k + 1)
                 chk($sformatf("trial %0d dmem[%02h] transparent", trial, 'h40 + k), dmem['h40 + k], ref_m[k]);
             if(test_errors != e0)
@@ -3882,6 +4001,9 @@ task automatic test_property_summary;
         chk("locked-pair violations",               lock_pair_viol[31:0], 32'd0);
         chk_true("interrupt-ack law exercised",     ack_checks > 100);
         chk("ack-without-entry / INTEVT violations", ack_viol[31:0], 32'd0);
+        $display("      flag-mirror coherence: %0d consume-point checks", mirror_checks);
+        chk_true("flag-mirror law exercised",       mirror_checks > 10000);
+        chk("flag-mirror coherence violations",     mirror_viol[31:0], 32'd0);
         //Acceptance coverage: which cache FSM states and restart-PC mux arms the
         //interrupt sweeps actually reached (histograms printed for the record).
         $write("      entry-vs-cache-state histogram:");
@@ -5340,7 +5462,10 @@ task automatic test_rte;
         run_cycles(120);
         chk_true("RTE pulsed", rte_seen);
         chk_true("delay slot retired", retired_seen[2]);
-        chk("R2 (delay slot)", gpr(2), 32'h0000_0022);
+        //The slot executes with the RESTORED SR (sw manual 8.2.53 p.241): reset
+        //SSR=0 restores MD=0/RB=0, so the slot's R2 write lands in BANK0 (ram[2]),
+        //not the reset bank1 word the gpr() helper reads.
+        chk("R2 (delay slot, restored-bank write)", u_dut.u_int_pipe.u_gpr_bram.ram[2], 32'h0000_0022);
         chk_true("past-slot word never retired", !retired_seen[3]);
         end_test;
     end
@@ -5955,6 +6080,883 @@ endtask
 
 
 ///////////////////////////////////////////////////////////
+//////  Interrupt Torture: Boundary Capture And Recovery
+////
+
+/*
+    Torture goldens for the ibara stale-T family (hs3_interrupt_tbit_bug.md,
+    2026-08-01). The prior interrupt sweeps all used ADD/RTE handlers that never
+    touch T/S/M/Q, so a broken RESTORE of the running EX flag mirrors (r_t/r_s/
+    r_m/r_q) was invisible: RTE rewrites SR from SSR inside ctrl_reg, and the
+    first target instruction consumes the mirror one cycle before the drain
+    resync lands. These tests clobber the flags INSIDE the handler (or fold the
+    restore into straight-line LDC/RTE) and consume them as the FIRST post-RTE
+    instruction, at every acceptance offset. Capture side is audited directly:
+    SSR.T latched at each entry must match the architectural T at that SPC.
+*/
+
+//GOLDEN X1 - deterministic RTE flag-mirror restore, no interrupt machinery. The
+//running T is poisoned to !pol_t right before RTE while SSR.T = pol_t; the RTE
+//target's FIRST instruction consumes T. Two passes so pass 2 streams from warm
+//I-lines (the tight timing that beats the drain resync). branch_first selects
+//whether the branch or MOVT is the first (bug-window) consumer.
+task automatic test_rte_flag_mirror(input logic pol_t, input logic branch_first,
+                                    input string label);
+    begin
+        begin_test(label);
+        cacheable_bootstrap(8'h09);
+        imem['h20] = 16'hEA00;  // MOV   #0,R10   ; wrong-path marker
+        imem['h21] = 16'hEB00;  // MOV   #0,R11   ; good-path marker
+        imem['h22] = 16'hEC00;  // MOV   #0,R12   ; MOVT probe
+        imem['h23] = 16'hED02;  // MOV   #2,R13   ; two passes: cold warm-up, then warm hit
+        //pass loop
+        imem['h24] = 16'hE860;  // MOV   #0x60,R8 ; RTE target byte address (widx 0x30)
+        imem['h25] = 16'h484E;  // LDC   R8,SPC
+        imem['h26] = 16'hE970;  // MOV   #0x70,R9
+        imem['h27] = 16'h4918;  // SHLL8 R9
+        imem['h28] = 16'h4928;  // SHLL16 R9      ; R9 = 0x70000000 (MD=RB=1, T=0 image)
+        imem['h29] = pol_t ? 16'h7901 : 16'h0009; // ADD #1,R9: SSR image T=1 | keep T=0
+        imem['h2A] = 16'h493E;  // LDC   R9,SSR
+        imem['h2B] = pol_t ? 16'h0008 : 16'h0018; // CLRT|SETT: poison mirror to !pol_t
+        imem['h2C] = 16'h002B;  // RTE            ; restores SR.T = pol_t
+        imem['h2D] = 16'h0009;  //   slot
+        //target: first instruction is the bug-window consumer (reads T one cycle
+        //before the drained-pipe resync can land)
+        if(branch_first) begin
+            imem['h30] = pol_t ? 16'h8B08 : 16'h8908; // BF|BT wrong ; taken only on stale T
+            imem['h31] = 16'h0C29;                    // MOVT R12    ; probe = restored T
+        end
+        else begin
+            imem['h30] = 16'h0C29;                    // MOVT R12    ; probe = restored T
+            imem['h31] = pol_t ? 16'h8B07 : 16'h8907; // BF|BT wrong ; taken only on stale T
+        end
+        imem['h32] = 16'hEB5A;  // MOV   #0x5A,R11 ; good path reached
+        imem['h33] = 16'h4D10;  // DT    R13
+        imem['h34] = 16'h8BEE;  // BF    pass loop ; next pass while R13 != 0
+        imem['h35] = 16'h0009;
+        imem['h36] = 16'h0009;  // sentinel
+        imem['h37] = 16'hAFFE;  // guard
+        imem['h38] = 16'h0009;
+        imem['h3A] = 16'hEA55;  // MOV   #0x55,R10 ; wrong path executed
+        imem['h3B] = 16'hAFF5;  // BRA   rejoin (widx 0x32)
+        imem['h3C] = 16'h0009;  //   slot
+        do_reset;
+        run_until_retire('h36, 20000);
+        chk("wrong path never taken (R10)", gpr(10), 32'd0);
+        chk("good path reached (R11)",      gpr(11), 32'h0000_005A);
+        chk("MOVT probe = restored SSR.T",  gpr(12), {31'd0, pol_t});
+        chk("both passes ran (R13)",        gpr(13), 32'd0);
+        chk_true("no spurious exception", !exc_seen);
+        do_reset;
+        end_test;
+    end
+endtask
+
+//GOLDEN X2 - LDC Rm,SR twin of X1: the SR-write serialization must hold younger
+//issue until the commit AND the mirror resync, for a consumer directly behind.
+task automatic test_ldcsr_flag_mirror(input logic pol_t, input string label);
+    begin
+        begin_test(label);
+        cacheable_bootstrap(8'h09);
+        imem['h20] = 16'hEA00;  // MOV   #0,R10   ; wrong-path marker
+        imem['h21] = 16'hEB00;  // MOV   #0,R11   ; good-path marker
+        imem['h22] = 16'hEC00;  // MOV   #0,R12   ; MOVT probe
+        imem['h23] = 16'hED02;  // MOV   #2,R13   ; two passes (warm, then hit)
+        //pass loop
+        imem['h24] = 16'hE970;  // MOV   #0x70,R9
+        imem['h25] = 16'h4918;  // SHLL8 R9
+        imem['h26] = 16'h4928;  // SHLL16 R9      ; 0x70000000 (MD=RB=1, T=0 image)
+        imem['h27] = pol_t ? 16'h7901 : 16'h0009; // ADD #1,R9: image T=1 | keep T=0
+        imem['h28] = pol_t ? 16'h0008 : 16'h0018; // CLRT|SETT: poison mirror to !pol_t
+        imem['h29] = 16'h490E;  // LDC   R9,SR    ; architectural T = pol_t
+        imem['h2A] = pol_t ? 16'h8B0E : 16'h890E; // BF|BT wrong ; first consumer after LDC-SR
+        imem['h2B] = 16'h0C29;  // MOVT  R12      ; probe = written T
+        imem['h2C] = 16'hEB5A;  // MOV   #0x5A,R11
+        imem['h2D] = 16'h4D10;  // DT    R13
+        imem['h2E] = 16'h8BF4;  // BF    pass loop
+        imem['h2F] = 16'h0009;
+        imem['h30] = 16'h0009;  // sentinel
+        imem['h31] = 16'hAFFE;  // guard
+        imem['h3A] = 16'hEA55;  // MOV   #0x55,R10 ; wrong path executed
+        imem['h3B] = 16'hAFEF;  // BRA   rejoin (widx 0x2C)
+        imem['h3C] = 16'h0009;  //   slot
+        do_reset;
+        run_until_retire('h30, 20000);
+        chk("wrong path never taken (R10)", gpr(10), 32'd0);
+        chk("good path reached (R11)",      gpr(11), 32'h0000_005A);
+        chk("MOVT probe = written SR.T",    gpr(12), {31'd0, pol_t});
+        chk("both passes ran (R13)",        gpr(13), 32'd0);
+        chk_true("no spurious exception", !exc_seen);
+        do_reset;
+        end_test;
+    end
+endtask
+
+//Shared loader for the T-bit torture loop (the ibara NAND-pump geometry): memory
+//counter loaded at top, TST and its consuming BF in the SAME fetch pair, CMP/PZ
+//re-arming T=1 every continuing iteration, exit via BRA on T=1. poison_op is the
+//handler's flag clobber (the coverage the old ADD/RTE-only handlers never had).
+task automatic load_tbit_torture(input logic [15:0] poison_op);
+    begin
+        cacheable_bootstrap(8'h09);
+        imem['h20] = 16'hE860;  // MOV    #0x60,R8 ; BL-clear prologue (IMASK=0)
+        imem['h21] = 16'h4818;  // SHLL8  R8
+        imem['h22] = 16'h4828;  // SHLL16 R8
+        imem['h23] = 16'h480E;  // LDC    R8,SR
+        imem['h24] = 16'hED00;  // MOV   #0,R13   ; handler entry counter
+        imem['h25] = 16'hE600;  // MOV   #0,R6    ; iteration counter
+        imem['h26] = 16'hE208;  // MOV   #8,R2    ; remaining = 8
+        imem['h27] = 16'hE101;  // MOV   #1,R1
+        imem['h28] = 16'h4118;  // SHLL8 R1       ; R1 = 0x100 (&remaining, off the code lines)
+        imem['h29] = 16'h2122;  // MOV.L R2,@R1
+        imem['h2A] = 16'h4215;  // CMP/PL R2      ; prime the loop invariant T=1
+        //top: byte 0x56
+        imem['h2B] = 16'h6312;  // MOV.L @R1,R3   ; load remaining (ibara 0c0b072e)
+        imem['h2C] = 16'h2338;  // TST   R3,R3    ; T := remaining==0 (pair {2C,2D} = writer+consumer)
+        imem['h2D] = 16'h8B01;  // BF    body     ; T=0 -> continue (ibara 0c0b0732)
+        imem['h2E] = 16'hA006;  // BRA   exit     ; T=1 -> exit
+        imem['h2F] = 16'h0009;  //   slot
+        //body: byte 0x60
+        imem['h30] = 16'h73FF;  // ADD   #-1,R3
+        imem['h31] = 16'h2132;  // MOV.L R3,@R1
+        imem['h32] = 16'h4311;  // CMP/PZ R3      ; T=1 (continuing-iteration invariant)
+        imem['h33] = 16'h7601;  // ADD   #1,R6
+        imem['h34] = 16'hAFF5;  // BRA   top
+        imem['h35] = 16'h0009;  //   slot
+        imem['h36] = 16'h0009;  // exit: sentinel (byte 0x6C)
+        imem['h37] = 16'hAFFE;  // guard
+        imem['h38] = 16'h0009;
+        //handler at VBR+0x600: count, CLOBBER the flag, return
+        imem['h300] = 16'h7D01;    // ADD  #1,R13
+        imem['h301] = poison_op;   // SETT/CLRT   ; the running-mirror poison
+        imem['h302] = 16'h002B;    // RTE
+        imem['h303] = 16'h0009;    //   slot
+    end
+endtask
+
+//The architectural T at every legal acceptance boundary of the torture loop is a
+//pure function of SPC (except the TST->BF boundary, where it depends on the loop
+//iteration - end-state checks cover that one). Returns {known, expected_T}.
+function automatic logic [1:0] tbit_map(input logic [11:0] spc);
+    case(spc)
+        12'h04A, 12'h04C, 12'h04E,
+        12'h050, 12'h052, 12'h054: tbit_map = 2'b10;  //prologue: reset T=0
+        12'h056, 12'h058:          tbit_map = 2'b11;  //post CMP/PL / CMP/PZ
+        12'h05C:                   tbit_map = 2'b11;  //BRA-exit path only on T=1
+        12'h060, 12'h062, 12'h064: tbit_map = 2'b10;  //body before CMP/PZ: T=0
+        12'h066, 12'h068:          tbit_map = 2'b11;  //post CMP/PZ
+        12'h06C, 12'h06E:          tbit_map = 2'b11;  //sentinel/guard: exit T=1
+        default:                   tbit_map = 2'b00;  //0x5A (iteration-dependent) etc.
+    endcase
+endfunction
+
+//GOLDEN X3 - the ibara replica sweep. One interrupt fired at every cycle offset
+//across the loop, handler CLOBBERS T before RTE. Laws: loop result transparent
+//(no early exit through a stale-T BF), exactly one entry, SPC never a slot, and
+//the SSR.T captured at entry matches the architectural T map above.
+task automatic test_int_torture_tbit_sweep(input logic [15:0] poison_op, input string label);
+    integer off, w, spc5a_hits;
+    logic [1:0] m;
+    begin
+        begin_test($sformatf("Interrupt torture: T-clobbering handler (%s) x acceptance sweep", label));
+        spc5a_hits = 0;
+        for(off = 0; off < 40; off = off + 1) begin
+            load_tbit_torture(poison_op);
+            do_reset;
+            run_until_retire('h24, 20000);        //R13 initialized: loop is starting
+            repeat(off) @(posedge clk);
+            int_level_q = 4'd8;
+            int_code_q  = 12'h600;
+            int_valid_q = 1'b1;
+            //Sticky-counter keyed level drop (see the GOLDEN T sweep rationale).
+            w = 0;
+            while(entry_count == 0 && w < 20000) begin @(posedge clk); w = w + 1; end
+            @(posedge clk);
+            int_valid_q = 1'b0;
+            run_until_retire('h302, 20000);       //handler RTE retired
+            run_until_retire('h36, 80000);        //loop completed (stale-T exit would fail)
+            chk($sformatf("off=%0d: exactly one entry", off), entry_count, 32'd1);
+            chk($sformatf("off=%0d: handler ran once", off), gpr(13), 32'd1);
+            chk($sformatf("off=%0d: iterations transparent", off), gpr(6), 32'd8);
+            chk($sformatf("off=%0d: remaining consumed", off), gpr(3), 32'd0);
+            chk_true($sformatf("off=%0d: no spurious exception", off), !exc_seen);
+            chk_true($sformatf("off=%0d: SPC never a delay slot (spc=%08h)", off, entry_spc_l),
+                     entry_spc_l[11:0] != 12'h05E && entry_spc_l[11:0] != 12'h06A);
+            //Direct capture law: SSR.T at entry = architectural T at that boundary.
+            m = tbit_map(entry_spc_l[11:0]);
+            if(m[1])
+                chk($sformatf("off=%0d: SSR.T capture law at spc=%03h", off, entry_spc_l[11:0]),
+                    {31'd0, entry_ssr_l[0]}, {31'd0, m[0]});
+            if(entry_spc_l[11:0] == 12'h05A) spc5a_hits = spc5a_hits + 1;
+        end
+        //Coverage verdict: the sweep must land on the TST->BF boundary (the ibara window).
+        $display("      TST->BF boundary (spc=0x5A) entries across the sweep: %0d", spc5a_hits);
+        chk_true("sweep reached the writer->consumer boundary", spc5a_hits > 0);
+        do_reset;
+        end_test;
+    end
+endtask
+
+//GOLDEN X4 - M/Q/T mirror torture: a 16-step DIV1 chain swept by an interrupt
+//whose handler poisons M/Q (DIV0S of negatives) and T (SETT). The post-RTE DIV1
+//consumes all three mirrors as its FIRST instruction. Oracle: partial remainder
+//and STC-read SR (M/Q/T) must equal the no-interrupt baseline at every offset.
+task automatic test_int_torture_div_sweep;
+    integer off, w, k, chain_hits;
+    logic [31:0] base_r4, base_r7;
+    begin
+        begin_test("Interrupt torture: DIV1 chain vs M/Q/T-clobbering handler (baseline sweep)");
+        chain_hits = 0;
+        for(off = -1; off < 24; off = off + 1) begin
+            cacheable_bootstrap(8'h09);
+            imem['h20] = 16'hE860;  // MOV    #0x60,R8 ; BL-clear prologue (IMASK=0)
+            imem['h21] = 16'h4818;  // SHLL8  R8
+            imem['h22] = 16'h4828;  // SHLL16 R8
+            imem['h23] = 16'h480E;  // LDC    R8,SR
+            imem['h24] = 16'hED00;  // MOV   #0,R13   ; handler entry counter
+            imem['h25] = 16'hE412;  // MOV   #0x12,R4
+            imem['h26] = 16'h4418;  // SHLL8 R4
+            imem['h27] = 16'h7434;  // ADD   #0x34,R4
+            imem['h28] = 16'h4418;  // SHLL8 R4
+            imem['h29] = 16'h7456;  // ADD   #0x56,R4 ; dividend 0x00123456
+            imem['h2A] = 16'hE501;  // MOV   #1,R5
+            imem['h2B] = 16'h4528;  // SHLL16 R5      ; divisor 0x00010000
+            imem['h2C] = 16'h0019;  // DIV0U          ; M=Q=T=0
+            for(k = 0; k < 16; k = k + 1)
+                imem['h2D + k] = 16'h3454; // DIV1 R5,R4 ; each step reads/writes M,Q,T
+            imem['h3D] = 16'h0702;  // STC   SR,R7    ; committed M/Q/T snapshot
+            imem['h3E] = 16'h0009;  // sentinel
+            imem['h3F] = 16'hAFFE;  // guard
+            //handler: count, poison M=Q=1 (DIV0S of negatives) then T=1, return
+            imem['h300] = 16'h7D01; // ADD   #1,R13
+            imem['h301] = 16'hEEFF; // MOV   #-1,R14
+            imem['h302] = 16'h2EE7; // DIV0S R14,R14  ; M=1,Q=1,T=0 poison
+            imem['h303] = 16'h0018; // SETT           ; T=1 poison
+            imem['h304] = 16'h002B; // RTE
+            imem['h305] = 16'h0009; //   slot
+            do_reset;
+            if(off < 0) begin
+                //Baseline pass: no interrupt; record the golden results.
+                run_until_retire('h3E, 20000);
+                base_r4 = gpr(4);
+                base_r7 = gpr(7);
+            end
+            else begin
+                run_until_retire('h24, 20000);
+                repeat(off) @(posedge clk);
+                int_level_q = 4'd8;
+                int_code_q  = 12'h600;
+                int_valid_q = 1'b1;
+                w = 0;
+                while(entry_count == 0 && w < 20000) begin @(posedge clk); w = w + 1; end
+                @(posedge clk);
+                int_valid_q = 1'b0;
+                run_until_retire('h304, 20000);
+                run_until_retire('h3E, 20000);
+                chk($sformatf("off=%0d: exactly one entry", off), entry_count, 32'd1);
+                chk($sformatf("off=%0d: handler ran once", off), gpr(13), 32'd1);
+                chk($sformatf("off=%0d: DIV1 remainder transparent", off), gpr(4), base_r4);
+                chk($sformatf("off=%0d: final M/Q/T transparent", off), gpr(7), base_r7);
+                chk_true($sformatf("off=%0d: no spurious exception", off), !exc_seen);
+                if(entry_spc_l[11:0] >= 12'h05A && entry_spc_l[11:0] <= 12'h078)
+                    chain_hits = chain_hits + 1;
+            end
+        end
+        //Anti-vacuity verdict: the sweep must land entries INSIDE the DIV1 chain,
+        //where the post-RTE first instruction consumes M/Q/T.
+        $display("      entries inside the DIV1 chain: %0d", chain_hits);
+        chk_true("sweep reached the DIV1-chain boundaries", chain_hits > 0);
+        do_reset;
+        end_test;
+    end
+endtask
+
+//GOLDEN X5 - S mirror torture: a MAC.W accumulation chain (S=0, 64-bit mode)
+//swept by an interrupt whose handler poisons S=1 (32-bit saturation mode). A
+//stale r_s at the first post-RTE MAC.W clamps the accumulator and diverges
+//MACH/MACL from the no-interrupt baseline.
+task automatic test_int_torture_macs_sweep;
+    integer off, w, k, chain_hits;
+    logic [31:0] base_r6, base_r7;
+    begin
+        begin_test("Interrupt torture: MAC.W chain vs SETS-clobbering handler (baseline sweep)");
+        chain_hits = 0;
+        for(off = -1; off < 20; off = off + 1) begin
+            cacheable_bootstrap(8'h09);
+            imem['h20] = 16'hE860;  // MOV    #0x60,R8 ; BL-clear prologue (IMASK=0)
+            imem['h21] = 16'h4818;  // SHLL8  R8
+            imem['h22] = 16'h4828;  // SHLL16 R8
+            imem['h23] = 16'h480E;  // LDC    R8,SR
+            imem['h24] = 16'hED00;  // MOV   #0,R13   ; handler entry counter
+            imem['h25] = 16'hE401;  // MOV   #1,R4
+            imem['h26] = 16'h4418;  // SHLL8 R4       ; src1 = 0x100 (off the code lines)
+            imem['h27] = 16'h6543;  // MOV   R4,R5
+            imem['h28] = 16'h7520;  // ADD   #0x20,R5 ; src2 = 0x120
+            imem['h29] = 16'h0028;  // CLRMAC
+            imem['h2A] = 16'h0048;  // CLRS           ; 64-bit accumulate mode
+            for(k = 0; k < 8; k = k + 1)
+                imem['h2B + k] = 16'h454F; // MAC.W @R5+,@R4+ ; 0x7FFF*0x7FFF each step
+            imem['h33] = 16'h061A;  // STS   MACL,R6
+            imem['h34] = 16'h070A;  // STS   MACH,R7
+            imem['h35] = 16'h0009;  // sentinel
+            imem['h36] = 16'hAFFE;  // guard
+            //handler: count, poison S=1, return
+            imem['h300] = 16'h7D01; // ADD   #1,R13
+            imem['h301] = 16'h0058; // SETS           ; saturation-mode poison
+            imem['h302] = 16'h002B; // RTE
+            imem['h303] = 16'h0009; //   slot
+            do_reset;
+            for(k = 'h40; k < 'h44; k = k + 1) dmem[k] = 32'h7FFF_7FFF; //src1 words
+            for(k = 'h48; k < 'h4C; k = k + 1) dmem[k] = 32'h7FFF_7FFF; //src2 words
+            if(off < 0) begin
+                run_until_retire('h35, 20000);
+                base_r6 = gpr(6);
+                base_r7 = gpr(7);
+            end
+            else begin
+                run_until_retire('h24, 20000);
+                repeat(off) @(posedge clk);
+                int_level_q = 4'd8;
+                int_code_q  = 12'h600;
+                int_valid_q = 1'b1;
+                w = 0;
+                while(entry_count == 0 && w < 20000) begin @(posedge clk); w = w + 1; end
+                @(posedge clk);
+                int_valid_q = 1'b0;
+                run_until_retire('h302, 20000);
+                run_until_retire('h35, 20000);
+                chk($sformatf("off=%0d: exactly one entry", off), entry_count, 32'd1);
+                chk($sformatf("off=%0d: handler ran once", off), gpr(13), 32'd1);
+                chk($sformatf("off=%0d: MACL transparent", off), gpr(6), base_r6);
+                chk($sformatf("off=%0d: MACH transparent", off), gpr(7), base_r7);
+                chk($sformatf("off=%0d: src1 pointer walked", off), gpr(4), 32'h0000_0110);
+                chk($sformatf("off=%0d: src2 pointer walked", off), gpr(5), 32'h0000_0130);
+                chk_true($sformatf("off=%0d: no spurious exception", off), !exc_seen);
+                if(entry_spc_l[11:0] >= 12'h056 && entry_spc_l[11:0] <= 12'h064)
+                    chain_hits = chain_hits + 1;
+            end
+        end
+        //Anti-vacuity verdict: entries must land INSIDE the MAC.W chain, where the
+        //post-RTE first instruction captures SR.S into its saturation control.
+        $display("      entries inside the MAC.W chain: %0d", chain_hits);
+        chk_true("sweep reached the MAC.W-chain boundaries", chain_hits > 0);
+        do_reset;
+        end_test;
+    end
+endtask
+
+//GOLDEN X6 - wrong-path commit leak (the silicon MACL anomaly law, report sec 5).
+//A branch that is ALWAYS taken hides a fall-through poison block: MUL.L and
+//CLRMAC (MAC state), and a GPR marker. The block is speculatively fetched every
+//iteration and must NEVER commit - swept with interrupts to stress kill windows.
+task automatic test_int_wrongpath_leak_sweep;
+    integer off, w, bt_hits;
+    begin
+        begin_test("Interrupt torture: wrong-path MUL/CLRMAC/GPR poison never commits (sweep)");
+        bt_hits = 0;
+        for(off = 0; off < 30; off = off + 1) begin
+            cacheable_bootstrap(8'h09);
+            imem['h20] = 16'hE860;  // MOV    #0x60,R8 ; BL-clear prologue (IMASK=0)
+            imem['h21] = 16'h4818;  // SHLL8  R8
+            imem['h22] = 16'h4828;  // SHLL16 R8
+            imem['h23] = 16'h480E;  // LDC    R8,SR
+            imem['h24] = 16'hED00;  // MOV   #0,R13   ; handler entry counter
+            imem['h25] = 16'hE7AB;  // MOV   #-0x55,R7 ; 0xFFFFFFAB pattern
+            imem['h26] = 16'h471A;  // LDS   R7,MACL  ; preset MAC state
+            imem['h27] = 16'h470A;  // LDS   R7,MACH
+            imem['h28] = 16'hEC00;  // MOV   #0,R12   ; wrong-path marker
+            imem['h29] = 16'hE308;  // MOV   #8,R3    ; loop count
+            imem['h2A] = 16'hE600;  // MOV   #0,R6
+            //loop: byte 0x56
+            imem['h2B] = 16'h7601;  // ADD   #1,R6
+            imem['h2C] = 16'h4315;  // CMP/PL R3      ; T=1 on every iteration (R3 = 8..1)
+            imem['h2D] = 16'h8903;  // BT    cont     ; ALWAYS taken
+            //fall-through poison: fetched speculatively, must never commit
+            imem['h2E] = 16'h0777;  // MUL.L R7,R7    ; MACL poison
+            imem['h2F] = 16'hEC55;  // MOV   #0x55,R12 ; GPR poison
+            imem['h30] = 16'h0028;  // CLRMAC          ; MACH/MACL poison
+            imem['h31] = 16'h0009;
+            //cont: byte 0x64
+            imem['h32] = 16'h4310;  // DT    R3
+            imem['h33] = 16'h8BF6;  // BF    loop
+            imem['h34] = 16'h0009;  // sentinel
+            imem['h35] = 16'hAFFE;  // guard
+            //handler: count and return (kill-window law isolated from flag clobber)
+            imem['h300] = 16'h7D01; // ADD   #1,R13
+            imem['h301] = 16'h002B; // RTE
+            imem['h302] = 16'h0009; //   slot
+            do_reset;
+            run_until_retire('h24, 20000);
+            repeat(off) @(posedge clk);
+            int_level_q = 4'd8;
+            int_code_q  = 12'h600;
+            int_valid_q = 1'b1;
+            w = 0;
+            while(entry_count == 0 && w < 20000) begin @(posedge clk); w = w + 1; end
+            @(posedge clk);
+            int_valid_q = 1'b0;
+            run_until_retire('h301, 20000);
+            run_until_retire('h34, 40000);
+            chk($sformatf("off=%0d: exactly one entry", off), entry_count, 32'd1);
+            chk($sformatf("off=%0d: handler ran once", off), gpr(13), 32'd1);
+            chk($sformatf("off=%0d: MACL preserved", off), macl_o, 32'hFFFF_FFAB);
+            chk($sformatf("off=%0d: MACH preserved", off), mach_o, 32'hFFFF_FFAB);
+            chk($sformatf("off=%0d: wrong-path GPR never committed", off), gpr(12), 32'd0);
+            chk($sformatf("off=%0d: iterations intact", off), gpr(6), 32'd8);
+            chk_true($sformatf("off=%0d: no spurious exception", off), !exc_seen);
+            if(entry_spc_l[11:0] == 12'h05A) bt_hits = bt_hits + 1;
+        end
+        //Anti-vacuity verdict: entries must land at the CMP/PL->BT boundary, where
+        //the post-RTE first instruction is the branch guarding the poison block.
+        $display("      entries at the CMP/PL->BT boundary: %0d", bt_hits);
+        chk_true("sweep reached the branch boundary", bt_hits > 0);
+        do_reset;
+        end_test;
+    end
+endtask
+
+//GOLDEN X7 - RTE re-entry storm: the level is HELD across many RTEs (real SH
+//level semantics re-enter immediately), so acceptance repeatedly lands on the
+//first post-RTE boundary - the exact restore-vs-mirror collision cycle - with a
+//T-clobbering handler. Laws: loop transparent, every ack entered, counts agree.
+task automatic test_int_rte_storm;
+    integer w;
+    begin
+        begin_test("Interrupt torture: held-level RTE re-entry storm with T-clobbering handler");
+        load_tbit_torture(16'h0018);              //SETT poison
+        do_reset;
+        run_until_retire('h24, 20000);
+        int_level_q = 4'd8;
+        int_code_q  = 12'h600;
+        int_valid_q = 1'b1;
+        w = 0;
+        while(entry_count < 12 && w < 40000) begin @(posedge clk); w = w + 1; end
+        int_valid_q = 1'b0;
+        run_until_retire('h36, 80000);            //loop must still complete
+        chk_true("storm reached 12 entries", entry_count >= 12);
+        chk("handler count = entry count", gpr(13), entry_count[31:0]);
+        chk("acks = entries", int_ack_count, entry_count[31:0]);
+        chk("iterations transparent", gpr(6), 32'd8);
+        chk("remaining consumed", gpr(3), 32'd0);
+        chk_true("no spurious exception", !exc_seen);
+        do_reset;
+        end_test;
+    end
+endtask
+
+//GOLDEN X8 - the RTE delay-slot laws, sw manual 8.2.53 p.241: "an instruction
+//executed in a delayed slot immediately following this instruction uses the SR
+//restored by this instruction", plus the section-8 Delay_Slot rule that every
+//PC-changing instruction in a delay slot is an illegal slot instruction. Six
+//phases: slot MOVT reads restored T (both polarities, two fetch latencies), a
+//slot SETT lands ON TOP of the restore, a slot LDC->GBR is not dropped at the
+//restore edge, a slot STC-SR reads the restored image, a slot GPR read uses the
+//RESTORED bank on an RB flip, and branches in RTE/BRA slots fault as 0x1A0.
+task automatic test_rte_slot_laws;
+    integer pol, lat;
+    begin
+        begin_test("RTE slot laws: restored SR view, slot-commit merge, bank flip, illegal-slot branch");
+
+        //Phase A - slot MOVT must read the RESTORED T, not the pre-RTE live T.
+        for(pol = 0; pol <= 1; pol = pol + 1) begin
+        for(lat = 0; lat <= 2; lat = lat + 2) begin
+            cacheable_bootstrap(8'h09);
+            i_latency = lat;
+            imem['h20] = 16'hEC00;                        // MOV   #0,R12
+            imem['h21] = 16'hE860;                        // MOV   #0x60,R8 ; RTE target
+            imem['h22] = 16'h484E;                        // LDC   R8,SPC
+            imem['h23] = 16'hE970;                        // MOV   #0x70,R9
+            imem['h24] = 16'h4918;                        // SHLL8 R9
+            imem['h25] = 16'h4928;                        // SHLL16 R9      ; image T=0
+            imem['h26] = pol[0] ? 16'h7901 : 16'h0009;    // ADD #1,R9: image T=pol
+            imem['h27] = 16'h493E;                        // LDC   R9,SSR
+            imem['h28] = pol[0] ? 16'h0008 : 16'h0018;    // CLRT|SETT: live T = !pol
+            imem['h29] = 16'h002B;                        // RTE
+            imem['h2A] = 16'h0C29;                        // MOVT R12  ;   SLOT: restored T
+            imem['h2B] = 16'h0009;
+            imem['h30] = 16'h0009;                        // target: sentinel
+            imem['h31] = 16'hAFFE;                        // guard
+            do_reset;
+            run_until_retire('h30, 10000);
+            chk($sformatf("A: slot MOVT = restored T (pol=%0d lat=%0d)", pol, lat),
+                gpr(12), {31'd0, pol[0]});
+            chk_true("A: no spurious exception", !exc_seen);
+        end
+        end
+
+        //Phase B - a slot flag write lands ON TOP of the restore (RTE then slot).
+        cacheable_bootstrap(8'h09);
+        imem['h20] = 16'hEC00;  // MOV   #0,R12
+        imem['h21] = 16'hE860;  // MOV   #0x60,R8
+        imem['h22] = 16'h484E;  // LDC   R8,SPC
+        imem['h23] = 16'hE970;  // MOV   #0x70,R9
+        imem['h24] = 16'h4918;  // SHLL8 R9
+        imem['h25] = 16'h4928;  // SHLL16 R9      ; image T=0
+        imem['h26] = 16'h493E;  // LDC   R9,SSR
+        imem['h27] = 16'h0008;  // CLRT           ; live T=0 - only the slot can set it
+        imem['h28] = 16'h002B;  // RTE
+        imem['h29] = 16'h0018;  // SETT           ;   SLOT: T write on the restore edge
+        imem['h2A] = 16'h0009;
+        imem['h30] = 16'h0C29;  // MOVT  R12      ; target first instr: T must be 1
+        imem['h31] = 16'h0702;  // STC   SR,R7    ; committed SR: restored + slot T
+        imem['h32] = 16'h0009;  // sentinel
+        do_reset;
+        run_until_retire('h32, 10000);
+        chk("B: target MOVT sees the slot's T",   gpr(12), 32'd1);
+        chk("B: committed SR = restore + slot T", gpr(7),  32'h7000_0001);
+        chk_true("B: no spurious exception", !exc_seen);
+
+        //Phase C - a slot control write (LDC->GBR) must not be dropped by the
+        //restore commit sharing its edge.
+        cacheable_bootstrap(8'h09);
+        imem['h20] = 16'hE677;  // MOV   #0x77,R6
+        imem['h21] = 16'hE860;  // MOV   #0x60,R8
+        imem['h22] = 16'h484E;  // LDC   R8,SPC
+        imem['h23] = 16'hE970;  // MOV   #0x70,R9
+        imem['h24] = 16'h4918;  // SHLL8 R9
+        imem['h25] = 16'h4928;  // SHLL16 R9
+        imem['h26] = 16'h493E;  // LDC   R9,SSR
+        imem['h27] = 16'h002B;  // RTE
+        imem['h28] = 16'h461E;  // LDC   R6,GBR   ;   SLOT: ctrl write on the restore edge
+        imem['h29] = 16'h0009;
+        imem['h30] = 16'h0712;  // STC   GBR,R7   ; target: read it back
+        imem['h31] = 16'h0009;  // sentinel
+        do_reset;
+        run_until_retire('h31, 10000);
+        chk("C: slot GBR write committed (STC)", gpr(7), 32'h0000_0077);
+        chk("C: slot GBR write committed (dbg)", gbr_o,  32'h0000_0077);
+        chk_true("C: no spurious exception", !exc_seen);
+
+        //Phase D - a slot STC-SR reads the RESTORED image, not the pre-RTE SR.
+        cacheable_bootstrap(8'h09);
+        imem['h20] = 16'h0018;  // SETT           ; live SR = 0x700000F1 (distinct)
+        imem['h21] = 16'hE860;  // MOV   #0x60,R8
+        imem['h22] = 16'h484E;  // LDC   R8,SPC
+        imem['h23] = 16'hE970;  // MOV   #0x70,R9
+        imem['h24] = 16'h4918;  // SHLL8 R9
+        imem['h25] = 16'h4928;  // SHLL16 R9      ; image 0x70000000
+        imem['h26] = 16'h493E;  // LDC   R9,SSR
+        imem['h27] = 16'h002B;  // RTE
+        imem['h28] = 16'h0702;  // STC   SR,R7    ;   SLOT: must read 0x70000000
+        imem['h29] = 16'h0009;
+        imem['h30] = 16'h0009;  // sentinel
+        do_reset;
+        run_until_retire('h30, 10000);
+        chk("D: slot STC-SR = restored image", gpr(7), 32'h7000_0000);
+        chk_true("D: no spurious exception", !exc_seen);
+
+        //Phase E - the slot's GPR read uses the RESTORED bank when RTE flips RB
+        //(p.241 covers the whole SR, RB/MD included). Both banks' R3 preloaded.
+        for(lat = 0; lat <= 2; lat = lat + 2) begin
+            cacheable_bootstrap(8'h09);
+            i_latency = lat;
+            imem['h20] = 16'hE522;  // MOV   #0x22,R5
+            imem['h21] = 16'h45BE;  // LDC   R5,R3_BANK ; INACTIVE bank0 R3 := 0x22
+            imem['h22] = 16'hE311;  // MOV   #0x11,R3   ; active bank1 R3 := 0x11
+            imem['h23] = 16'hE860;  // MOV   #0x60,R8
+            imem['h24] = 16'h484E;  // LDC   R8,SPC
+            imem['h25] = 16'hE940;  // MOV   #0x40,R9
+            imem['h26] = 16'h4918;  // SHLL8 R9
+            imem['h27] = 16'h4928;  // SHLL16 R9        ; image 0x40000000: MD=1 RB=0
+            imem['h28] = 16'h493E;  // LDC   R9,SSR
+            imem['h29] = 16'h002B;  // RTE              ; restores RB=0
+            imem['h2A] = 16'h6933;  // MOV   R3,R9      ;   SLOT: restored bank0 R3
+            imem['h2B] = 16'h0009;
+            imem['h30] = 16'h0009;  // sentinel
+            do_reset;
+            run_until_retire('h30, 10000);
+            chk($sformatf("E: slot reads RESTORED bank R3 (lat=%0d)", lat), gpr(9), 32'h0000_0022);
+            chk_true("E: no spurious exception", !exc_seen);
+        end
+
+        //Phase F - PC-changing instructions in a delay slot fault BEFORE execution
+        //as illegal-slot (section 8 Delay_Slot list); EXPEVT = 0x1A0.
+        cacheable_bootstrap(8'h09);
+        imem['h20] = 16'hE860;  // MOV    #0x60,R8 ; BL-clear so the fault is not reset-like
+        imem['h21] = 16'h4818;  // SHLL8  R8
+        imem['h22] = 16'h4828;  // SHLL16 R8
+        imem['h23] = 16'h480E;  // LDC    R8,SR
+        imem['h24] = 16'hE860;  // MOV   #0x60,R8
+        imem['h25] = 16'h484E;  // LDC   R8,SPC
+        imem['h26] = 16'hE960;  // MOV   #0x60,R9
+        imem['h27] = 16'h4918;  // SHLL8 R9
+        imem['h28] = 16'h4928;  // SHLL16 R9      ; image 0x60000000 (BL=0)
+        imem['h29] = 16'h493E;  // LDC   R9,SSR
+        imem['h2A] = 16'h002B;  // RTE
+        imem['h2B] = 16'hA002;  // BRA            ;   SLOT: branch -> illegal slot
+        imem['h2C] = 16'h0009;
+        do_reset;
+        run_until_exc(10000);
+        chk_true("F1: RTE-slot branch faulted", exc_seen);
+        chk("F1: cause = illegal",   {29'd0, exc_cause_l}, {29'd0, EXC_ILLEGAL});
+        chk_true("F1: flagged as delay-slot", exc_delay_l);
+        chk("F1: EXPEVT = illegal slot 0x1A0", expevt_o, 32'h0000_01A0);
+        chk("F1: exc pc = the slot", exc_pc_l, 32'h0000_0056);
+
+        cacheable_bootstrap(8'h09);
+        imem['h20] = 16'hE860;  // MOV    #0x60,R8 ; BL-clear prologue
+        imem['h21] = 16'h4818;  // SHLL8  R8
+        imem['h22] = 16'h4828;  // SHLL16 R8
+        imem['h23] = 16'h480E;  // LDC    R8,SR
+        imem['h24] = 16'hA001;  // BRA   +1
+        imem['h25] = 16'h8902;  // BT             ;   SLOT: branch -> illegal slot
+        imem['h26] = 16'h0009;
+        do_reset;
+        run_until_exc(10000);
+        chk_true("F2: BRA-slot branch faulted", exc_seen);
+        chk("F2: cause = illegal",   {29'd0, exc_cause_l}, {29'd0, EXC_ILLEGAL});
+        chk_true("F2: flagged as delay-slot", exc_delay_l);
+        chk("F2: EXPEVT = illegal slot 0x1A0", expevt_o, 32'h0000_01A0);
+        chk("F2: exc pc = the slot", exc_pc_l, 32'h0000_004A);
+
+        do_reset;
+        end_test;
+    end
+endtask
+
+//GOLDEN X9 - RTE-target fetch fault: the restore commits, then the TARGET's own
+//fetch faults immediately. The new exception entry must re-capture the RESTORED
+//SR into SSR (restore->capture round trip) with SPC/TEA on the faulting target.
+task automatic test_rte_target_fault;
+    begin
+        begin_test("RTE-target fetch fault: entry re-captures the restored SR, SPC/TEA = target");
+        imem[0]  = 16'hE860;  // MOV    #0x60,R8 ; BL-clear (a BL=1 fault would be reset-like)
+        imem[1]  = 16'h4818;  // SHLL8  R8
+        imem[2]  = 16'h4828;  // SHLL16 R8
+        imem[3]  = 16'h480E;  // LDC    R8,SR
+        imem[4]  = 16'hE8A0;  // MOV   #0xA0,R8
+        imem[5]  = 16'h4818;  // SHLL8 R8
+        imem[6]  = 16'h4828;  // SHLL16 R8      ; 0xA0000000
+        imem[7]  = 16'hE902;  // MOV   #2,R9
+        imem[8]  = 16'h4918;  // SHLL8 R9       ; 0x200
+        imem[9]  = 16'h389C;  // ADD   R9,R8    ; target = 0xA0000200 (faulting widx 0x100)
+        imem[10] = 16'h484E;  // LDC   R8,SPC
+        imem[11] = 16'hE960;  // MOV   #0x60,R9
+        imem[12] = 16'h4918;  // SHLL8 R9
+        imem[13] = 16'h4928;  // SHLL16 R9
+        imem[14] = 16'h7901;  // ADD   #1,R9    ; image 0x60000001 (T=1, distinct from live)
+        imem[15] = 16'h493E;  // LDC   R9,SSR
+        imem[16] = 16'h0008;  // CLRT           ; live T=0
+        imem[17] = 16'h002B;  // RTE
+        imem[18] = 16'h0009;  //   slot
+        if_fault_en   = 1'b1;
+        if_fault_widx = 11'h100;               //pc[11:1] of the RTE target
+        do_reset;
+        if_fault_en   = 1'b1;                  //re-arm (do_reset is knob-neutral, be explicit)
+        if_fault_widx = 11'h100;
+        run_until_exc(2000);
+        chk_true("target fetch faulted", exc_seen);
+        chk("cause = EXC_IFETCH", {29'd0, exc_cause_l}, {29'd0, EXC_IFETCH});
+        chk("exc pc = the RTE target", exc_pc_l, 32'hA000_0200);
+        chk("EXPEVT = address-error read", expevt_o, 32'h0000_00E0);
+        chk("SPC = the target (restart PC)", spc_o, 32'hA000_0200);
+        chk("SSR = the RESTORED SR (round trip)", ssr_o, 32'h6000_0001);
+        do_reset;
+        end_test;
+    end
+endtask
+
+//GOLDEN X10 - killed in-flight control-register writes: an acceptance edge that
+//kills a retiring LDC->GBR/SSR must suppress its commit (the o_CTRL_WE redirect
+//gate - the ctrl-file twin of the historic GPR-write-leak law), and the post-RTE
+//re-execution must land it exactly once. GBR survives entries untouched; SSR is
+//clobbered by every entry and must still end at the loop's final value.
+task automatic test_int_ctrlwrite_kill_sweep;
+    integer ph, off, w;
+    logic [15:0] ldc_op, stc_op;
+    begin
+        begin_test("Interrupt vs in-flight LDC->GBR/SSR: killed commit re-executes exactly once (sweep)");
+        for(ph = 0; ph < 2; ph = ph + 1) begin
+            ldc_op = (ph == 0) ? 16'h421E : 16'h423E;   //LDC R2,GBR | LDC R2,SSR
+            stc_op = (ph == 0) ? 16'h0712 : 16'h0732;   //STC GBR,R7 | STC SSR,R7
+            for(off = 0; off < 20; off = off + 1) begin
+                cacheable_bootstrap(8'h09);
+                imem['h20] = 16'hE860;  // MOV    #0x60,R8 ; BL-clear prologue (IMASK=0)
+                imem['h21] = 16'h4818;  // SHLL8  R8
+                imem['h22] = 16'h4828;  // SHLL16 R8
+                imem['h23] = 16'h480E;  // LDC    R8,SR
+                imem['h24] = 16'hED00;  // MOV   #0,R13   ; handler entry counter
+                imem['h25] = 16'hE208;  // MOV   #8,R2    ; ctrl value seed
+                imem['h26] = 16'hE308;  // MOV   #8,R3    ; loop count
+                imem['h27] = 16'h7201;  // ADD   #1,R2
+                imem['h28] = ldc_op;    // LDC   R2,GBR/SSR ; the killable ctrl write
+                imem['h29] = 16'h4310;  // DT    R3
+                imem['h2A] = 16'h8BFB;  // BF    loop
+                imem['h2B] = stc_op;    // STC   GBR/SSR,R7 ; read back the final value
+                imem['h2C] = 16'h0009;  // sentinel
+                imem['h2D] = 16'hAFFE;  // guard
+                imem['h300] = 16'h7D01; // ADD   #1,R13
+                imem['h301] = 16'h002B; // RTE
+                imem['h302] = 16'h0009; //   slot
+                do_reset;
+                run_until_retire('h24, 20000);
+                repeat(off) @(posedge clk);
+                int_level_q = 4'd8;
+                int_code_q  = 12'h600;
+                int_valid_q = 1'b1;
+                w = 0;
+                while(entry_count == 0 && w < 20000) begin @(posedge clk); w = w + 1; end
+                @(posedge clk);
+                int_valid_q = 1'b0;
+                run_until_retire('h301, 20000);
+                run_until_retire('h2C, 40000);
+                chk($sformatf("ph=%0d off=%0d: exactly one entry", ph, off), entry_count, 32'd1);
+                chk($sformatf("ph=%0d off=%0d: handler ran once", ph, off), gpr(13), 32'd1);
+                chk($sformatf("ph=%0d off=%0d: final ctrl value exact", ph, off), gpr(7), 32'h0000_0010);
+                chk($sformatf("ph=%0d off=%0d: loop count consumed", ph, off), gpr(3), 32'd0);
+                chk_true($sformatf("ph=%0d off=%0d: no spurious exception", ph, off), !exc_seen);
+            end
+        end
+        do_reset;
+        end_test;
+    end
+endtask
+
+//GOLDEN X11 - nested interrupts with a HOSTILE inner handler: the outer handler
+//saves SSR/SPC to R0/R15, clears BL, and spins; a second held wave enters NESTED
+//(clobbering SSR/SPC and, via SETT, the running T); the inner RTE returns into
+//the outer spin, the outer restores the saved context, poisons T again, and RTEs
+//back into the tst/bf main loop. Two-level restore chain, main loop transparent.
+task automatic test_int_nested_hostile;
+    integer off, w;
+    begin
+        begin_test("Nested hostile handlers: 2-level SSR/SPC stack + inner/outer T clobber (sweep)");
+        for(off = 0; off < 20; off = off + 1) begin
+            load_tbit_torture(16'h0009);          //main loop; handler rebuilt below
+            imem['h300] = 16'h7D01; // ADD   #1,R13   ; entry counter (1=outer, 2=inner)
+            imem['h301] = 16'hEB02; // MOV   #2,R11
+            imem['h302] = 16'h3DB0; // CMP/EQ R11,R13 ; T=1 on the INNER entry
+            imem['h303] = 16'h8909; // BT    inner
+            imem['h304] = 16'h0032; // STC   SSR,R0   ; outer: save the main context
+            imem['h305] = 16'h0F42; // STC   SPC,R15
+            imem['h306] = 16'hEA60; // MOV   #0x60,R10
+            imem['h307] = 16'h4A18; // SHLL8 R10
+            imem['h308] = 16'h4A28; // SHLL16 R10     ; 0x60000000 (BL=0, IMASK=0)
+            imem['h309] = 16'h4A0E; // LDC   R10,SR   ; nested acceptance OPEN
+            imem['h30A] = 16'h3DB0; // CMP/EQ R11,R13 ; spin until the inner wave ran
+            imem['h30B] = 16'h8BFD; // BF    spin
+            imem['h30C] = 16'h403E; // LDC   R0,SSR   ; restore the saved main context
+            imem['h30D] = 16'h4F4E; // LDC   R15,SPC
+            imem['h30E] = 16'h0018; // SETT           ; common T poison (inner AND outer)
+            imem['h30F] = 16'h002B; // RTE
+            imem['h310] = 16'h0009; //   slot
+            do_reset;
+            run_until_retire('h24, 20000);
+            repeat(off) @(posedge clk);
+            int_level_q = 4'd8;
+            int_code_q  = 12'h600;
+            int_valid_q = 1'b1;
+            //Hold the level across the outer entry so the BL-clear inside the
+            //handler admits the nested wave; drop at the SECOND entry.
+            w = 0;
+            while(entry_count < 2 && w < 20000) begin @(posedge clk); w = w + 1; end
+            @(posedge clk);
+            int_valid_q = 1'b0;
+            run_until_retire('h36, 80000);        //main loop completed
+            chk($sformatf("off=%0d: exactly two entries", off), entry_count, 32'd2);
+            chk($sformatf("off=%0d: handler ran twice", off), gpr(13), 32'd2);
+            chk($sformatf("off=%0d: iterations transparent", off), gpr(6), 32'd8);
+            chk($sformatf("off=%0d: remaining consumed", off), gpr(3), 32'd0);
+            chk($sformatf("off=%0d: acks = entries", off), int_ack_count, 32'd2);
+            chk_true($sformatf("off=%0d: no spurious exception", off), !exc_seen);
+        end
+        do_reset;
+        end_test;
+    end
+endtask
+
+//GOLDEN X12 - depth-3 MIXED-KIND nest: interrupt -> nested interrupt -> TRAPA
+//exception raised INSIDE the inner handler. SH-3 has ONE physical SSR/SPC pair,
+//so every level saves/restores it in software; every level clobbers the running
+//T before its RTE. The deepest entry's capture (STC SSR/SPC) plus the FIRST
+//post-RTE MOVT lock the restore->re-capture ladder three levels deep, and the
+//main tst/bf loop must complete transparently at every acceptance offset.
+task automatic test_int_nested_trapa;
+    integer off, w;
+    begin
+        begin_test("Depth-3 mixed nest: int -> nested int -> TRAPA, 3-level restore ladder (sweep)");
+        for(off = 0; off < 20; off = off + 1) begin
+            load_tbit_torture(16'h0009);          //main loop; handlers rebuilt below
+            //&remaining moved 0x100 -> 0x180: the UNIFIED cache would otherwise
+            //serve the loop's cached DATA line to the VBR+0x100 vector fetch.
+            imem['h27] = 16'hE160;  // MOV   #0x60,R1
+            imem['h28] = 16'h4108;  // SHLL2 R1       ; R1 = 0x180 (&remaining)
+            //general-exception handler (VBR+0x100): depth-3 capture + T poison
+            imem['h80] = 16'h0832;  // STC   SSR,R8   ; must be the inner LIVE SR
+            imem['h81] = 16'h0942;  // STC   SPC,R9   ; must be TRAPA+2
+            imem['h82] = 16'h7C01;  // ADD   #1,R12   ; exception entry counter
+            imem['h83] = 16'h0008;  // CLRT           ; depth-3 mirror poison
+            imem['h84] = 16'h002B;  // RTE
+            imem['h85] = 16'h0009;  //   slot
+            //interrupt handler (VBR+0x600): level-1 (outer) and level-2 (inner)
+            imem['h300] = 16'h7D01; // ADD   #1,R13   ; entry counter (1=outer, 2=inner)
+            imem['h301] = 16'hEB02; // MOV   #2,R11
+            imem['h302] = 16'h3DB0; // CMP/EQ R11,R13 ; T=1 on the INNER entry
+            imem['h303] = 16'h890D; // BT    inner
+            imem['h304] = 16'hEC00; // MOV   #0,R12   ; outer: init exc counter (GPRs persist)
+            imem['h305] = 16'h0E32; // STC   SSR,R14  ; save the main context (unbanked regs)
+            imem['h306] = 16'h0F42; // STC   SPC,R15
+            imem['h307] = 16'hEA60; // MOV   #0x60,R10
+            imem['h308] = 16'h4A18; // SHLL8 R10
+            imem['h309] = 16'h4A28; // SHLL16 R10     ; 0x60000000 (BL=0, IMASK=0)
+            imem['h30A] = 16'h4A0E; // LDC   R10,SR   ; nested acceptance OPEN (level held)
+            imem['h30B] = 16'h3DB0; // CMP/EQ R11,R13 ; spin until the inner chain ran
+            imem['h30C] = 16'h8BFD; // BF    spin
+            imem['h30D] = 16'h4E3E; // LDC   R14,SSR  ; restore the saved main context
+            imem['h30E] = 16'h4F4E; // LDC   R15,SPC
+            imem['h30F] = 16'h0018; // SETT           ; level-1 T poison before RTE
+            imem['h310] = 16'h002B; // RTE
+            imem['h311] = 16'h0009; //   slot
+            imem['h312] = 16'h0432; // inner: STC SSR,R4 ; save the level-1 context
+            imem['h313] = 16'h0542; // STC   SPC,R5
+            imem['h314] = 16'hEA60; // MOV   #0x60,R10
+            imem['h315] = 16'h4A18; // SHLL8 R10
+            imem['h316] = 16'h4A28; // SHLL16 R10
+            imem['h317] = 16'h4A0E; // LDC   R10,SR   ; BL=0: TRAPA must NOT be reset-like
+            imem['h318] = 16'h0018; // SETT           ; live T=1 = the depth-3 capture probe
+            imem['h319] = 16'hC320; // TRAPA #0x20    ; -> VBR+0x100, entry #3
+            imem['h31A] = 16'h0729; // MOVT  R7       ; FIRST post-RTE consumer: restored T=1
+            imem['h31B] = 16'h443E; // LDC   R4,SSR   ; restore the level-1 context
+            imem['h31C] = 16'h454E; // LDC   R5,SPC
+            imem['h31D] = 16'h0008; // CLRT           ; level-2 T poison before RTE
+            imem['h31E] = 16'h002B; // RTE
+            imem['h31F] = 16'h0009; //   slot
+            do_reset;
+            run_until_retire('h24, 20000);
+            repeat(off) @(posedge clk);
+            int_level_q = 4'd8;
+            int_code_q  = 12'h600;
+            int_valid_q = 1'b1;
+            //Hold across the outer entry so its BL-clear admits the nested wave;
+            //drop at the SECOND entry (before the inner handler re-clears BL).
+            w = 0;
+            while(entry_count < 2 && w < 20000) begin @(posedge clk); w = w + 1; end
+            @(posedge clk);
+            int_valid_q = 1'b0;
+            run_until_retire('h36, 80000);        //main loop completed
+            chk($sformatf("off=%0d: three entries (2 int + TRAPA)", off), entry_count, 32'd3);
+            chk($sformatf("off=%0d: acks = interrupt entries", off), int_ack_count, 32'd2);
+            chk($sformatf("off=%0d: int handler ran twice", off), gpr(13), 32'd2);
+            chk($sformatf("off=%0d: exc handler ran once", off), gpr(12), 32'd1);
+            chk_true($sformatf("off=%0d: TRAPA pulsed", off), trapa_seen);
+            chk($sformatf("off=%0d: TRAPA imm", off), {24'd0, trapa_imm_l}, 32'h0000_0020);
+            chk($sformatf("off=%0d: EXPEVT = TRAPA", off), expevt_o, 32'h0000_0160);
+            chk($sformatf("off=%0d: depth-3 SSR = inner live SR", off), gpr(8), 32'h6000_0001);
+            chk($sformatf("off=%0d: depth-3 SPC = TRAPA+2", off), gpr(9), 32'h0000_0634);
+            chk($sformatf("off=%0d: post-TRAPA MOVT reads restored T", off), gpr(7), 32'd1);
+            chk($sformatf("off=%0d: final SSR = outer-saved image", off), ssr_o, gpr(14));
+            chk($sformatf("off=%0d: final SPC = outer-saved return", off), spc_o, gpr(15));
+            chk($sformatf("off=%0d: iterations transparent", off), gpr(6), 32'd8);
+            chk($sformatf("off=%0d: remaining consumed", off), gpr(3), 32'd0);
+            chk_true($sformatf("off=%0d: no fault-class exception", off), !exc_seen);
+        end
+        do_reset;
+        end_test;
+    end
+endtask
+
+
+///////////////////////////////////////////////////////////
 //////  Test Sequencer
 ////
 
@@ -5989,6 +6991,33 @@ initial begin
         $display("");
         if(errors == 0) $display("cpu_core_tb: PASS (fnew subset, %0d tests)", test_count);
         else            $display("cpu_core_tb: FAIL (fnew subset, %0d errors over %0d tests)", errors, test_count);
+        $finish;
+    end
+
+    //+torture: run only the interrupt-torture goldens (stale-flag family) while iterating.
+    if($test$plusargs("torture")) begin
+        group("torture: interrupt boundary capture/recovery subset");
+        test_rte_flag_mirror(1'b0, 1'b0, "RTE flag mirror: SETT poison, SSR.T=0, MOVT first");
+        test_rte_flag_mirror(1'b0, 1'b1, "RTE flag mirror: SETT poison, SSR.T=0, branch first");
+        test_rte_flag_mirror(1'b1, 1'b0, "RTE flag mirror: CLRT poison, SSR.T=1, MOVT first");
+        test_rte_flag_mirror(1'b1, 1'b1, "RTE flag mirror: CLRT poison, SSR.T=1, branch first");
+        test_ldcsr_flag_mirror(1'b0, "LDC-SR flag mirror: SETT poison, written T=0");
+        test_ldcsr_flag_mirror(1'b1, "LDC-SR flag mirror: CLRT poison, written T=1");
+        test_int_torture_tbit_sweep(16'h0018, "SETT");
+        test_int_torture_tbit_sweep(16'h0008, "CLRT");
+        test_int_torture_div_sweep;
+        test_int_torture_macs_sweep;
+        test_int_wrongpath_leak_sweep;
+        test_int_rte_storm;
+        test_rte_slot_laws;
+        test_rte_target_fault;
+        test_int_ctrlwrite_kill_sweep;
+        test_int_nested_hostile;
+        test_int_nested_trapa;
+        test_random_int_oracle;
+        $display("");
+        if(errors == 0) $display("cpu_core_tb: PASS (torture subset, %0d tests)", test_count);
+        else            $display("cpu_core_tb: FAIL (torture subset, %0d errors over %0d tests)", errors, test_count);
         $finish;
     end
 
@@ -6154,6 +7183,27 @@ initial begin
     test_nmi_int_order;
     test_nmi_tas_atomic;
     test_random_int_oracle;
+
+    //Interrupt torture: post-RTE/LDC-SR flag-mirror recovery, clobbering-handler
+    //sweeps, wrong-path commit leaks (the ibara stale-T family, 2026-08-01).
+    group("12c. Interrupt torture: boundary capture and recovery");
+    test_rte_flag_mirror(1'b0, 1'b0, "RTE flag mirror: SETT poison, SSR.T=0, MOVT first");
+    test_rte_flag_mirror(1'b0, 1'b1, "RTE flag mirror: SETT poison, SSR.T=0, branch first");
+    test_rte_flag_mirror(1'b1, 1'b0, "RTE flag mirror: CLRT poison, SSR.T=1, MOVT first");
+    test_rte_flag_mirror(1'b1, 1'b1, "RTE flag mirror: CLRT poison, SSR.T=1, branch first");
+    test_ldcsr_flag_mirror(1'b0, "LDC-SR flag mirror: SETT poison, written T=0");
+    test_ldcsr_flag_mirror(1'b1, "LDC-SR flag mirror: CLRT poison, written T=1");
+    test_int_torture_tbit_sweep(16'h0018, "SETT");
+    test_int_torture_tbit_sweep(16'h0008, "CLRT");
+    test_int_torture_div_sweep;
+    test_int_torture_macs_sweep;
+    test_int_wrongpath_leak_sweep;
+    test_int_rte_storm;
+    test_rte_slot_laws;
+    test_rte_target_fault;
+    test_int_ctrlwrite_kill_sweep;
+    test_int_nested_hostile;
+    test_int_nested_trapa;
 
     //Verdicts of the always-on passive checkers, judged over the WHOLE suite.
     group("13. Suite-wide property checkers");
