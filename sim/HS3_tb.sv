@@ -101,6 +101,7 @@ wire            rd_wr, rasl_n, rasu_n, casl_n, casu_n, rd_n, cke, back_n, bus_oe
 wire            rascas_oe, a_pu, d_pu, irqout_n;    //release pads + IRQOUT (Group C)
 wire    [7:0]   ptc_o, ptc_oe;                      //PTC pad ring view (MCS merge)
 logic           breq_n = 1'b1;
+logic           mem_hold = 1'b0;    //i_MEM_HOLD consumer accept-hold knob (group 20 tests)
 logic           md4_pin = 1'b1;  //area-0 width straps (knobs; 11=32-bit boot,
 logic           md3_pin = 1'b1;  //10=16-bit for the NOR flash tests)
 wire    [3:0]   we_n;
@@ -146,6 +147,7 @@ HS3 #(
     .i_MEM_RSP_VALID           (raw_mode ? 1'b0 : MEM_BUS.rsp_valid),
     .i_MEM_FAULT               (MEM_BUS.rsp_fault),
     .o_MEM_RSP_READY           (mem_rsp_ready),
+    .i_MEM_HOLD                (mem_hold),
 
     .o_A                       (a_pin),
     .o_D_O                     (d_o),
@@ -269,6 +271,43 @@ always @(posedge clk) begin
     if(tas_mon_clr) tas_viol <= 1'b0;
     else if((u_dut.u_bsc.e_lock_hold || u_dut.u_bsc.fe_lock_hold) && !back_n)
         tas_viol <= 1'b1;
+end
+
+//i_MEM_HOLD truth (guide 3.2 third wait source; group 20): sticky "REQ rose
+//on the edge after a held edge" violation, REQ counter, and the anti-vacuity
+//defer counter - a head (or drain resume) that ONLY the hold keeps from
+//accepting this edge, recomputed flat from the front-end trackers (whitebox)
+logic           holdmon_clr   = 1'b0;
+logic           hold_req_viol = 1'b0;
+logic           mem_hold_z    = 1'b0;
+integer         hold_req_cnt   = 0;
+integer         hold_defer_cnt = 0;
+wire            tb_hgen_ok = !(u_dut.u_bsc.ord_busy || u_dut.u_bsc.ordb_act ||
+                               u_dut.u_bsc.ordw_act || u_dut.u_bsc.eng_busy ||
+                               u_dut.u_bsc.eng_go   || u_dut.u_bsc.bus_blk);
+wire            tb_hsdh_ok = !(u_dut.u_bsc.eng_go      || u_dut.u_bsc.eng_busy ||
+                               u_dut.u_bsc.self_active || u_dut.u_bsc.bus_blk  ||
+                               u_dut.u_bsc.sd_rd_wait  || u_dut.u_bsc.sd_wr_ack);
+wire            tb_hsdc_ok = !(u_dut.u_bsc.sd_rd_wait  || u_dut.u_bsc.sd_wr_ack ||
+                               u_dut.u_bsc.eng_wr_pend);
+wire            tb_hold_defer = mem_hold && u_dut.IBUS1_BSC.req_valid &&
+                                (u_dut.u_bsc.fe_gen ? (!u_dut.u_bsc.ord_bcont && tb_hgen_ok) :
+                                 (u_dut.u_bsc.fe_eng && !u_dut.u_bsc.fe_sdmr) ?
+                                     (u_dut.u_bsc.fe_b_cont ?
+                                      (u_dut.IBUS1_BSC.req_write && tb_hsdc_ok) : tb_hsdh_ok) :
+                                 1'b0);
+always @(posedge clk) begin
+    mem_hold_z <= mem_hold;                 //bsc runs CEN=1 here: 1-edge delay is exact
+    if(holdmon_clr) begin
+        hold_req_viol  <= 1'b0;
+        hold_req_cnt   <= 0;
+        hold_defer_cnt <= 0;
+    end
+    else begin
+        if(mem_hold_z && mon_req) hold_req_viol  <= 1'b1;
+        if(mon_req)               hold_req_cnt   <= hold_req_cnt   + 1;
+        if(tb_hold_defer)         hold_defer_cnt <= hold_defer_cnt + 1;
+    end
 end
 
 //Micron MT48LC2M32B2 on the SDRAM pins (area 3 in the tests -> CS3). The
@@ -1416,6 +1455,7 @@ task automatic init_knobs;
         sgdev_clr      = 1'b0;
         dackmon_en     = 1'b0;
         dmaw_clr       = 1'b0;
+        mem_hold       = 1'b0;      //accept-hold released (default = today's behavior)
     end
 endtask
 
@@ -6129,6 +6169,209 @@ endtask
 
 
 ///////////////////////////////////////////////////////////
+//////  i_MEM_HOLD Consumer Accept-Hold (guide 3.2 third wait source)
+////
+
+/*
+    The CV1k-side feature request (docs/hs3_mem_hold_request.md): while
+    i_MEM_HOLD is high no unit-class head (or yielded-drain resume) is
+    accepted - heads wait valid-but-not-ready like the refresh/handback
+    class. hold=0 must be bit-identical to the pre-port machine (the whole
+    rest of this suite runs with the knob low and its exact cycle laws are
+    that proof). The tests below check the deferral itself, random-burst
+    torture over mixed traffic, the TAS locked-pair stretch, and a DMAC
+    burst walked by hold pulses - all under the whole-run port oracles.
+*/
+
+task automatic test_hold_defer_boot;
+    integer sent, c;
+    begin
+        begin_test("i_MEM_HOLD directed: hold through reset defers the boot fetch; PEND shows; REQ silent");
+        eidx = 0;
+        emit_ldrn(3, 32'h1234_5678);
+        emit_sentinel_loop(eidx, sent);
+        mem_hold = 1'b1;                    //up BEFORE reset: hold-through-reset shape
+        do_reset;
+        holdmon_clr = 1'b1; @(posedge clk); holdmon_clr = 1'b0;
+        c = 0;                              //boot fetch head must reach the front end and sit
+        while(!mon_pend && c < 200) begin @(posedge clk); c = c + 1; end
+        chk_true("PEND rises under hold (fetch head waits)", mon_pend === 1'b1);
+        run_cycles(40);
+        chk_true("REQ silent across the held window",  hold_req_cnt == 0);
+        chk_true("defers counted (anti-vacuity)",      hold_defer_cnt > 0);
+        mem_hold = 1'b0;
+        run_until_retire(sent, 30000);
+        chk("program completes after release", gpr(3), 32'h1234_5678);
+        chk_true("REQs resumed after release", hold_req_cnt > 0);
+        chk_true("no REQ ever rose off a held edge", hold_req_viol === 1'b0);
+        end_test;
+    end
+endtask
+
+//random pulse train walked across a running program: burst 1-20 cycles
+//(the request's stated envelope), gap 1-30, until the sentinel retires
+task automatic hold_pulse_train(input integer sent, input integer max_bursts);
+    integer r, c, len, gap;
+    begin
+        r = 0;
+        while(!retired_seen[sent] && r < max_bursts) begin
+            len = 1 + ($urandom % 20);
+            gap = 1 + ($urandom % 30);
+            mem_hold = 1'b1;
+            for(c = 0; c < len && !retired_seen[sent]; c = c + 1) @(posedge clk);
+            mem_hold = 1'b0;
+            for(c = 0; c < gap && !retired_seen[sent]; c = c + 1) @(posedge clk);
+            r = r + 1;
+        end
+        mem_hold = 1'b0;
+    end
+endtask
+
+task automatic test_hold_torture;
+    integer sent, i;
+    logic   [31:0]  pool [0:15];
+    logic   [31:0]  acc;
+    begin
+        begin_test("i_MEM_HOLD torture: random bursts over ordinary+SDRAM rw + TAS, results exact");
+        //phase 1 (uncached P2): 16 ordinary loads -> SDRAM stores, TAS.B,
+        //16 SDRAM readbacks accumulated, sum stored to an ordinary mailbox
+        acc = 32'd0;
+        for(i = 0; i < 16; i = i + 1) begin
+            pool[i] = $urandom;
+            dmem[16'h20 + 16'(i)] = pool[i];
+            acc = acc + pool[i];
+        end
+        sdram_poke(32'h0C00_02F0, 32'h00FF_00FF);    //TAS byte = 0x00 -> T=1
+        eidx = 0;
+        emit_sdram_init(16'h5038, 16'hFFDF, 32'hFFFF_E880);
+        emit_ldrn(1, 32'hA000_0080);                 //ordinary source pool
+        emit_ldrn(2, 32'hAC00_0200);                 //SDRAM dst window
+        emit_ldrn(6, 32'hAC00_02F0);                 //TAS semaphore
+        imem[eidx] = 16'hE500; eidx = eidx + 1;      // MOV   #0,R5
+        for(i = 0; i < 16; i = i + 1) begin
+            imem[eidx] = 16'h6316; eidx = eidx + 1;  // MOV.L @R1+,R3
+            imem[eidx] = 16'h2232; eidx = eidx + 1;  // MOV.L R3,@R2
+            imem[eidx] = 16'h7204; eidx = eidx + 1;  // ADD   #4,R2
+        end
+        imem[eidx] = 16'h461B; eidx = eidx + 1;      // TAS.B @R6 (locked RMW pair)
+        imem[eidx] = 16'h0729; eidx = eidx + 1;      // MOVT  R7
+        emit_ldrn(2, 32'hAC00_0200);                 //readback base
+        for(i = 0; i < 16; i = i + 1) begin
+            imem[eidx] = 16'h6426; eidx = eidx + 1;  // MOV.L @R2+,R4
+            imem[eidx] = 16'h354C; eidx = eidx + 1;  // ADD   R4,R5
+        end
+        imem[eidx] = 16'h2152; eidx = eidx + 1;      // MOV.L R5,@R1 (mailbox A000_00C0)
+        emit_sentinel_loop(eidx, sent);
+        do_reset;
+        holdmon_clr = 1'b1; @(posedge clk); holdmon_clr = 1'b0;
+        hold_pulse_train(sent, 400);
+        run_until_retire(sent, 200000);
+        for(i = 0; i < 16; i = i + 1)
+            chk("SDRAM image long", sdram_peek(32'h0C00_0200 + 32'(i*4)), pool[i]);
+        chk("accumulator mailbox", dmem[16'h30], acc);
+        chk("TAS T-bit (was clear)", gpr(7), 32'd1);
+        chk("TAS byte set", sdram_peek(32'h0C00_02F0), 32'h80FF_00FF);
+        chk_true("accept defers occurred (anti-vacuity)", hold_defer_cnt > 0);
+        chk_true("no REQ ever rose off a held edge",      hold_req_viol === 1'b0);
+        $display("      (info) phase 1: %0d defer cycles, %0d REQ units", hold_defer_cnt, hold_req_cnt);
+
+        //phase 2 (cached P0): line fills from SDRAM (engine 4-beat heads) +
+        //cached ifetch under the same train; sum of the phase-1 image again
+        init_knobs;
+        cacheable_bootstrap;                         //imem[0..7]: CCR on, jump to P0 0x40
+        eidx = 'h20;
+        emit_sdram_init(16'h5038, 16'hFFDF, 32'hFFFF_E880);
+        emit_ldrn(1, 32'hA000_00C4);                 //mailbox 2 (ordinary)
+        emit_ldrn(2, 32'h8C00_0200);                 //CACHED SDRAM source
+        imem[eidx] = 16'hE500; eidx = eidx + 1;      // MOV   #0,R5
+        for(i = 0; i < 16; i = i + 1) begin
+            imem[eidx] = 16'h6426; eidx = eidx + 1;  // MOV.L @R2+,R4 (fill bursts)
+            imem[eidx] = 16'h354C; eidx = eidx + 1;  // ADD   R4,R5
+        end
+        imem[eidx] = 16'h2152; eidx = eidx + 1;      // MOV.L R5,@R1
+        emit_sentinel_loop(eidx, sent);
+        do_reset;
+        holdmon_clr = 1'b1; @(posedge clk); holdmon_clr = 1'b0;
+        hold_pulse_train(sent, 400);
+        run_until_retire(sent, 200000);
+        chk("cached readback sum", dmem[16'h31], acc);
+        chk_true("cached-phase defers occurred", hold_defer_cnt > 0);
+        chk_true("no REQ ever rose off a held edge (cached)", hold_req_viol === 1'b0);
+        $display("      (info) phase 2: %0d defer cycles, %0d REQ units", hold_defer_cnt, hold_req_cnt);
+        end_test;
+    end
+endtask
+
+task automatic test_hold_tas_dmac;
+    integer sent, c, idx;
+    begin
+        begin_test("i_MEM_HOLD vs locked pair + DMAC burst: pair stretches (never splits), images exact");
+        //phase A: hold lands inside the SDRAM engine's locked pair - the
+        //write head defers at the front end; the pair completes on release
+        sdram_poke(32'h0C00_0070, 32'h00FF_00FF);    //byte = 0x00 -> T=1
+        eidx = 0;
+        emit_sdram_init(16'h5038, 16'hFFDF, 32'hFFFF_E880);
+        emit_ldrn(1, 32'hAC00_0070);
+        imem[eidx] = 16'h401B; eidx = eidx + 1;      // TAS.B @R1 (locked RMW pair)
+        imem[eidx] = 16'h0329; eidx = eidx + 1;      // MOVT  R3
+        imem[eidx] = 16'h6412; eidx = eidx + 1;      // MOV.L @R1,R4 (readback)
+        emit_sentinel_loop(eidx, sent);
+        do_reset;
+        c = 0;                                       //hold rises inside the pair:
+        while(u_dut.u_bsc.e_lock_hold !== 1'b1 && c < 60000) begin @(posedge clk); c = c + 1; end
+        chk_true("locked read dispatched (probe)", u_dut.u_bsc.e_lock_hold === 1'b1);
+        mem_hold = 1'b1;
+        run_cycles(2);                               //a pre-hold accept's REQ may still land
+        holdmon_clr = 1'b1; @(posedge clk); holdmon_clr = 1'b0;
+        run_cycles(24);                              //pair write (and fetches) sit deferred
+        chk_true("REQ silent across the held pair window", hold_req_cnt == 0);
+        mem_hold = 1'b0;
+        run_until_retire(sent, 120000);
+        run_cycles(200);
+        chk("T set (semaphore was clear)", gpr(3), 32'd1);
+        chk("TAS readback has bit7",       gpr(4), 32'h80FF_00FF);
+        chk("device byte set", sdram_peek(32'h0C00_0070), 32'h80FF_00FF);
+        chk_true("no REQ ever rose off a held edge (pair)", hold_req_viol === 1'b0);
+
+        //phase B: DMAC burst-mode auto transfer walked by 6 hold pulses
+        //(the test_dmac_breq_cut shape with hold instead of BREQ)
+        init_knobs;
+        clear_imem;
+        clear_dmem;
+        eidx = 0;
+        for(idx = 0; idx < 8; idx = idx + 1)
+            emit_poke_l(32'hA000_0100 + 32'(idx*4), 32'hB4B4_0001 + 32'(idx));
+        emit_poke_l(32'hA400_0020, 32'h0000_0100);   // SAR0
+        emit_poke_l(32'hA400_0024, 32'h0000_0200);   // DAR0
+        emit_poke_l(32'hA400_0028, 32'h0000_0008);   // DMATCR0 = 8
+        emit_poke_l(32'hA400_002C, 32'h0000_5431);   // CHCR0: inc/inc auto long BURST DE
+        emit_wreg_w(32'hA400_0060, 16'h0001);        // DMAOR: DME
+        emit_poll_te(32'hA400_002C);
+        emit_sentinel_loop(eidx, sent);
+        do_reset;
+        c = 0;                                       //burst begins...
+        while(u_dut.u_dmac.u_ch0.tcr != 24'd8 && c < 30000) begin @(posedge clk); c = c + 1; end
+        c = 0;
+        while(u_dut.u_dmac.u_ch0.tcr > 24'd6 && c < 30000) begin @(posedge clk); c = c + 1; end
+        for(idx = 0; idx < 6; idx = idx + 1) begin   //...six hold pulses walk across it
+            mem_hold = 1'b1;
+            run_cycles(1 + ($urandom % 20));
+            mem_hold = 1'b0;
+            run_cycles(9);                           //odd spacing: pulses walk the R/W pair
+        end
+        run_until_retire(sent, 120000);
+        for(idx = 0; idx < 8; idx = idx + 1)
+            chk("image long", dmem[16'h80 + 16'(idx)], 32'hB4B4_0001 + 32'(idx));
+        chk("SAR0 end", u_dut.u_dmac.u_ch0.sar, 32'h0000_0120);
+        chk("DAR0 end", u_dut.u_dmac.u_ch0.dar, 32'h0000_0220);
+        chk("DMATCR0 end", {8'd0, u_dut.u_dmac.u_ch0.tcr}, 32'd0);
+        chk_true("no REQ ever rose off a held edge (DMAC)", hold_req_viol === 1'b0);
+        end_test;
+    end
+endtask
+
+
+///////////////////////////////////////////////////////////
 //////  Main Sequence
 ////
 
@@ -6275,7 +6518,12 @@ initial begin
     test_dmac_random_diff;
     test_dmac_breq_cut;
 
-    group("20. Board-bus shape monitors (whole run)");
+    group("20. i_MEM_HOLD consumer accept-hold (docs/hs3_mem_hold_request.md)");
+    test_hold_defer_boot;
+    test_hold_torture;
+    test_hold_tas_dmac;
+
+    group("21. Board-bus shape monitors (whole run)");
     test_bus_monitors;
 
     $display("");

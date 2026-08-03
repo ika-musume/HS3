@@ -1039,3 +1039,26 @@ restored T/S/M/Q.
   across 3 seeds, campaign closed at the plateau (R7/R8 lesson: -0.3..
   -0.7 tax on speculative shape changes). Apply only if bank1_nx /
   bram-addr panels ever show rte_pre_wb membership.
+
+## 2026-08-02 — OOC verdict for i_MEM_HOLD (consumer accept-hold, CV1k request)
+
+- Change shape: one registered top-level input ANDed into the two head-ready
+  legs + the SDRAM continuation resume qualifier (bsc.sv), mirrored into the
+  flat EREQ arms mon_gen_ok/mon_sdh_ok/mon_sdc_ok (6→7, 6→7, 4→5 inputs).
+  New HS3/HS3_ooc_top port routed through the generated wrapper (preserve
+  _drv reg = real launch arc into the ready cones).
+- 3-seed re-measure (s1/s5/s7, sta.rpt mtimes fresh 2026-08-02 21:06):
+  s1 −2.975 / 77.07, s5 −2.973 / 77.26, s7 −3.414 / 75.55. Mean −3.12 vs
+  the −2.920 frozen baseline (−0.20) and inside the documented
+  identical-RTL family band (−2.2..−3.9; the two prior baseline trios
+  themselves differ by up to ±0.9 per seed). s7's −3.414 is the catalogued
+  placement-coupled swing of the mon_pk headline class.
+- Cone scan: i_MEM_HOLD in ZERO of 60 top-20 paths; no u_bsc cone in any
+  top-20; every worst endpoint is the PRE-EXISTING mon_pk_cls/mon_pk_vld
+  EREQ-package wall (cache FSM-arm select class, unchanged by this edit).
+  NEUTRAL — CLEARED TO LAND.
+- Sim gates: HS3_tb 89/89 (new group 20: hold-through-reset defer, random
+  1-20-cycle burst torture, TAS-pair stretch, DMAC-burst walk; anti-vacuity
+  defer counters 333/64 cycles); tests 1-82 output diff-identical to the
+  86/86 baseline at hold=0 (first-principle proof); EREQ<->REQ oracle green
+  over 341,962 strobes including injected traffic.

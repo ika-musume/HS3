@@ -41,6 +41,7 @@ module HS3_ooc_top (
     input   wire            i_MEM_RSP_VALID,
     input   wire            i_MEM_FAULT,
     output  wire            o_MEM_RSP_READY,
+    input   wire            i_MEM_HOLD,     //consumer accept-hold (tie low when unused)
 
     /* BSC PHYSICAL PINS (shared external bus, table 10.1) */
     output  wire    [25:0]  o_A,
@@ -152,6 +153,7 @@ module HS3_ooc_top (
         .i_MEM_RSP_VALID        (i_MEM_RSP_VALID            ),
         .i_MEM_FAULT            (i_MEM_FAULT                ),
         .o_MEM_RSP_READY        (o_MEM_RSP_READY            ),
+        .i_MEM_HOLD             (i_MEM_HOLD                 ),
 
         .o_A                    (o_A                        ),
         .o_D_O                  (o_D_O                      ),

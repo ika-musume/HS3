@@ -13,7 +13,10 @@ pin edge) or the pipeline's IPC change: every rail is a dedicated FF
 mirroring an already-existing internal enable; no handshake, launch, or
 capture path is touched; no new backpressure enters the core. Full-suite
 cycle laws bit-exact and identical IPC are the acceptance gate for every
-implementation change.
+implementation change. One deliberate, opt-in exception exists:
+`i_MEM_HOLD` (§3.3) is consumer-driven backpressure at the accept tier —
+tied low (the default) it is bit-identical to the pre-hold machine, and
+the acceptance gate above is proven at hold = 0.
 
 The intended consumer structure is a pair of FIFOs in the controller:
 
@@ -101,6 +104,7 @@ Companion rails (they complete the port):
 | `i_MEM_RSP_VALID` / `i_MEM_READY` | in | optional early completion of an ordinary access (handshake fast path, IPC-parity); tie low to use the timed path only |
 | `o_MEM_RSP_READY` | out | accept pacing for the handshake completions |
 | `i_MEM_FAULT` | in | fault injection on a handshake completion |
+| `i_MEM_HOLD` | in | consumer accept-hold: defers every REQ-firing accept while high (§3.3); tie low when unused |
 
 **Unit mapping** (one REQ each):
 - SDRAM head/single op (excluding SDMR/MRS). A line fill strobes once; a
@@ -223,7 +227,7 @@ Contract:
 
 `PEND` is a registered level: a unit-class request is sitting
 valid-but-not-ready at the BSC front-end (bus handback, refresh, engine
-busy, posted-write ack pending). `PADDR`/`PWR` re-capture the live pend
+busy, posted-write ack pending, consumer `i_MEM_HOLD` — §3.3). `PADDR`/`PWR` re-capture the live pend
 head every enabled edge, one edge behind the wire truth. Only pends whose
 eventual accept fires REQ are shown: P-bus / on-chip register / dummy
 destinations and burst-continuation calls are masked out (a yielded write
@@ -251,9 +255,38 @@ Contract:
   covers only already-waiting ops. Fresh idle-bus accepts never pend —
   their guaranteed lead is the EREQ cycle (§3.1).
 
----
+### 3.3 `i_MEM_HOLD` — consumer accept-hold
 
-## 4. `o_MEM_DE` — 1 `i_CLK` pulse per data beat
+`i_MEM_HOLD` is a registered level in the `i_CLK` domain, driven by the
+consumer; low (the default tie) is bit-identical to the pre-hold machine.
+While high, **no REQ-firing accept occurs**: unit-class heads — CPU and
+DMAC alike — and the one REQ-firing continuation shape (a yielded write
+drain's RESUME re-strobe) wait valid-but-not-ready at the front end,
+exactly like the refresh/handback class. This is a third *source* for a
+wait state the PEND contract already exports: the waiting head shows on
+PEND per §3.2 — a wait reason, NOT a new revocation class. Every
+architecturally fixed instant stays anchored to the (now later) accept.
+
+Not deferred — these proceed under hold untouched:
+
+- burst continuation calls of an already-accepted unit (fill beats, drain
+  top-ups, ordinary envelope calls; their write beats still push DE);
+- P-bus / on-chip register / dummy destinations (port-silent classes);
+- refresh / self-refresh / MRS pin machinery (port-silent, spec R2).
+
+When hold falls, acceptance resumes on the normal launch grid; no
+spacing or one-outstanding rule changes. A locked RMW pair (TAS.B) whose
+write head is caught by hold **stretches in time but never splits**: bus
+ownership and the lock stay held (BREQ stays masked through the pair,
+p.320), and the write completes on release — external atomicity is the
+consumer's to keep, as the sole service agent. The RTL does not police
+the consumer's bounded-burst usage guarantee (≤ ~16 `i_CLK` per
+assertion, few-percent duty): a stuck-high hold stalls the CPU exactly
+like an unreleased BREQ or a stuck `i_WAIT_n` — the same trust class.
+
+`EREQ` pairing is preserved under hold by construction (the hold term is
+mirrored into the flat EREQ arms), and `EREQ(T) <=> REQ(T+1)` continues
+to bind: a REQ pulse never rises off a held edge.
 
 DE asserts a **single-`i_CLK` pulse per beat**, so it can drive a
 synchronous FIFO enable directly (a multi-cycle window would double-pop).
@@ -907,6 +940,14 @@ the controller's leisure.
   needing one regenerates it as REQ-sets / LEN'th-DE-clears); pre-accept
   state is visible only on the PEND tier, under its named revocations
   (§3.2) — the EREQ/REQ tiers stay commitment-only.
+- `i_MEM_HOLD` enters as one term in each head-ready leg (GEN and SDRAM)
+  plus a resume qualifier on the SDRAM continuation leg, mirrored
+  identically into the flat EREQ arms (`mon_gen_ok`/`mon_sdh_ok`/
+  `mon_sdc_ok`). MAINTENANCE: any edit to a ready leg must edit its flat
+  twin in the same commit — the whole-run EREQ<->REQ oracle fails on the
+  first divergent accept. PEND needs no hold logic: it derives from
+  `req_valid && !req_ready`. The hold=0 tie is the first-principle proof
+  (full-suite diff bit-exact); the hold tests live in HS3_tb group 20.
 - The HS3_tb harness keeps its raw-memory models and hsk controller on a
   WHITEBOX copy of the internal live request view (hierarchical taps,
   expression-identical to the deleted live mux) so every model trigger and

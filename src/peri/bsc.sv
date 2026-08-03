@@ -165,7 +165,8 @@ module bsc #(
          REQ  = one registered 1-cycle pulse per committed external UNIT
                 at its accept edge; fields load with it, hold to the next;
          PEND = registered pre-accept level: a unit-class request sitting
-                valid-but-not-ready (handback / refresh / engine busy).
+                valid-but-not-ready (handback / refresh / engine busy /
+                consumer i_MEM_HOLD - a wait reason, not a revocation).
                 PADDR/PWR re-capture the pend head every enabled edge; an
                 idle-boundary arb owner flip REPLACES the head (consumer
                 re-evaluates on change). An accept while PEND shows pairs
@@ -211,6 +212,11 @@ module bsc #(
     input   wire            i_MEM_RSP_VALID,
     input   wire            i_MEM_FAULT,
     output  wire            o_MEM_RSP_READY,
+    input   wire            i_MEM_HOLD,     //consumer accept-hold (registered level, default 0):
+                                            //while high no unit-class head (or drain resume) is
+                                            //accepted - a third valid-but-not-ready wait source
+                                            //next to handback/refresh/engine-busy (guide 3.2);
+                                            //continuations/P-bus/refresh/MRS pins run untouched
 
     /* DMAC SIDEBAND CONSUMER (section 11.3.4-11.3.5): active-high DACK
        window strobes framed on the tagged ordinary cycle's CSn assertion
@@ -355,10 +361,14 @@ logic           fe_lock_hold;
 wire            bus_blk      = bus_held && !(fe_lock_hold || e_lock_hold);
 
 //ready per class. A head/single engine op needs the whole engine idle; burst
-//continuations only need the previous beat's response consumed.
-wire            sd_ready  = fe_b_cont ? (!sd_rd_wait && !sd_wr_ack) :
+//continuations only need the previous beat's response consumed. i_MEM_HOLD
+//defers every REQ-firing accept: heads, and the one REQ-firing continuation
+//shape - a yielded drain's RESUME (write cont with no engine write pending);
+//buffer top-ups and read continuations ride their committed unit untouched
+wire            sd_ready  = fe_b_cont ? (!sd_rd_wait && !sd_wr_ack &&
+                                         !(i_MEM_HOLD && I_BUS.req_write && !eng_wr_pend)) :
                             (!eng_go && !eng_busy && !self_active && !bus_blk &&
-                             !sd_rd_wait && !sd_wr_ack);
+                             !sd_rd_wait && !sd_wr_ack && !i_MEM_HOLD);
 wire            loc_ready = !loc_rsp_v;
 wire            pbs_ready;          //P-bus bridge idle (defined in its section)
 
@@ -369,7 +379,7 @@ wire            pbs_ready;          //P-bus bridge idle (defined in its section)
 //previous call's response consumed (the sd_ready continuation twin)
 assign  I_BUS.req_ready = fe_gen  ? (ord_bcont ? !(ob_wait || ord_wr_ack) :
                                      !(ord_busy || ordb_act || ordw_act ||
-                                       eng_busy || eng_go || bus_blk)) :
+                                       eng_busy || eng_go || bus_blk || i_MEM_HOLD)) :
                           fe_eng  ? sd_ready  :
                           fe_pbus ? pbs_ready : loc_ready;
 
@@ -1214,11 +1224,12 @@ end end
                                            est == E_ACTV    || est == E_RCD ||
                                            est == E_WR);
 (* keep *) wire mon_gen_ok   = !(ord_busy || ordb_act || ordw_act ||
-                                 mon_ebusy || eng_go || mon_blk);
+                                 mon_ebusy || eng_go || mon_blk || i_MEM_HOLD);
 (* keep *) wire mon_sdh_ok   = !(eng_go || mon_ebusy || self_active || mon_blk ||
-                                 sd_rd_wait || sd_wr_ack);  //head/single op
+                                 sd_rd_wait || sd_wr_ack || i_MEM_HOLD);  //head/single op
 (* keep *) wire mon_sdc_ok   = !(sd_rd_wait || sd_wr_ack ||
-                                 (eng_go && eng_op_write) || mon_wrp_est);  //drain resume
+                                 (eng_go && eng_op_write) || mon_wrp_est ||
+                                 i_MEM_HOLD);  //drain resume
 //per-class arms: ordinary continuation calls never strobe; an SDRAM read
 //continuation never strobes; a write continuation strobes only as a
 //yielded-drain resume (fresh op from its own beat, mon comment above)

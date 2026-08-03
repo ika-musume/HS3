@@ -112,6 +112,8 @@ module HS3 #(
     input   wire            i_MEM_RSP_VALID,
     input   wire            i_MEM_FAULT,
     output  wire            o_MEM_RSP_READY,
+    input   wire            i_MEM_HOLD,     //consumer accept-hold: defers unit-class
+                                            //accepts while high (tie low when unused)
 
     /* INTERRUPT PINS - IRQ/IRL, IRLS and PINT arrive through the port pads
        below (table 18.1 pin shares); only NMI is dedicated */
@@ -319,6 +321,7 @@ bsc #(
     .i_MEM_RSP_VALID        (i_MEM_RSP_VALID            ),
     .i_MEM_FAULT            (i_MEM_FAULT                ),
     .o_MEM_RSP_READY        (o_MEM_RSP_READY            ),
+    .i_MEM_HOLD             (i_MEM_HOLD                 ),
 
     .o_A                    (o_A                        ),
     .o_D_O                  (o_D_O                      ),
