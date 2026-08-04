@@ -43,10 +43,18 @@
 
     Replacement: 6-bit pseudo-LRU, Table 5.2 (cache_pkg). Write policy
     (pp.105,110-111): per-region mode (P1->CCR.CB, P0/U0/P3->~CCR.WT, wb_mode);
-    U (dirty) bit in the tag entry; write hit WB=cache+U / WT=cache+memory;
+    U (dirty) bit beside V in the VU RAM; write hit WB=cache+U / WT=cache+memory;
     write miss WB=write-allocate / WT=memory only; read/inst miss fills.
     Write-back buffer (1 line, p.111-112, Fig 5.5). Memory-mapped cache windows
     (p.112-114): tag 0xF0xx_xxxx, data 0xF1xx_xxxx.
+
+    CCR.CF flush = SHADOW-BANK SWAP (p.106 discard-only; real SH3 flushes in
+    1-2 cycles, not 256): V/U and LRU sit in double-depth RAMs, vu_bank picks
+    the active half. The flush toggles vu_bank to the pre-cleared shadow in one
+    S_IDLE cycle; the retired half is scrubbed to zero in the background on
+    write-port-free cycles. Only a second CCR.CF before scrub-done ever waits.
+    Tag/data arrays are untouched: V=0 makes their stale contents unreachable,
+    and a fill rewrites all four words before re-validating a way.
 */
 
 import cache_pkg::*;
@@ -102,7 +110,7 @@ logic           ccr_ce;     //cache enable bit; see p.106
 logic           ccr_wt;     //write-through bit for P0/U0/P3 (1=WT, 0=write-back)
 logic           ccr_cb;     //write-back/through switch for P1 (1=write-back)
 logic   [31:0]  ccr2;       //way-lock controls; stored only (DSP-gated, unused)
-logic           flush_req;  //CCR.CF requested a flush; serviced from S_IDLE
+logic           flush_req;  //CCR.CF requested a flush; bank-swapped from S_IDLE
 
 (* direct_enable *) wire cen = i_CEN; //architectural edge enable; binds to DFF CE
 
@@ -125,7 +133,6 @@ wire    [31:0]  lmmio_rdata   = bram_is_ccr  ? {29'd0, ccr_cb, ccr_wt, ccr_ce} :
 ////
 
 typedef enum logic [4:0] {
-    S_FLUSH,        //clear-walk over all 256 sets (reset + CCR.CF)
     S_IDLE,         //RUNNING: accept live, resolve bram_* one cycle later
     S_STORE_WR,     //store hit (write-through): write the merged word back to the data bank
     S_ALLOC_WR,     //write-allocate: merge the store into the filled line (U=1)
@@ -155,8 +162,6 @@ localparam logic [1:0] AW_IFILL = 2'd0;
 localparam logic [1:0] AW_DFILL = 2'd1;
 localparam logic [1:0] AW_MMTAG = 2'd2;
 logic   [1:0]   after_wb;
-
-logic   [8:0]   flush_idx;      //clear-walk index, counts 0..256
 
 //Access context for whichever request the MISS FSM is currently servicing.
 logic           cur_is_data;    //1 = data (MA) access, 0 = instruction (IF) access; cpu_core_tb I/D probe
@@ -288,14 +293,29 @@ assign  grant_word = PIPE_L_BUS.req_addr_idx[3:2];
 logic   [7:0]   tag_raddr;          //read-port index
 logic   [7:0]   tag_waddr;          //write-port index
 logic   [3:0]   tag_we;
-logic   [20:0]  tag_wdata;
-logic   [20:0]  tag_rdata [0:3];    //{valid, U, tag[18:0]} (write-through bypassed)
+logic   [18:0]  tag_wdata;
+logic   [18:0]  tag_rdata [0:3];    //tag[18:0] only (write-through bypassed)
 
-logic   [7:0]   lru_raddr;
-logic   [7:0]   lru_waddr;
+//VU = {V (valid), U (dirty)} per way, split out of the tag word into the
+//DOUBLE-depth shadow-swapped RAM (see the flush note in the header).
+logic   [8:0]   vu_raddr;           //{active bank, set}
+logic   [8:0]   vu_waddr;           //{bank, set}: active commit or shadow scrub
+logic   [3:0]   vu_we;
+logic   [1:0]   vu_wdata;           //{V, U}
+logic   [1:0]   vu_rdata [0:3];     //(write-through bypassed)
+
+logic   [8:0]   lru_raddr;          //{active bank, set}
+logic   [8:0]   lru_waddr;
 logic           lru_we;
 logic   [5:0]   lru_wdata;
 logic   [5:0]   lru_rdata;          //6-bit pseudo-LRU for the set; see p.104
+
+//Shadow-bank flush state. NO reset term on either: they must survive a manual
+//reset exactly like the RAM contents (p.104: reset keeps V/U/LRU; a mid-scrub
+//reset must not re-mark a half-dirty shadow as clean). Power-up: both banks
+//are zero, so the scrub starts DONE.
+logic           vu_bank   = 1'b0;   //active V/U/LRU bank half
+logic   [8:0]   scrub_idx = 9'h100; //shadow clear-walk position; [8] = done
 
 logic   [9:0]   data_raddr;         //read-port {index, word}
 logic   [9:0]   data_waddr;         //write-port {index, word}
@@ -343,16 +363,19 @@ end
 
 //EARLY store-commit qualifier: every run_d_store_wb factor EXCEPT the tag compare -
 //edge-latched classify bits plus the pair-freshness gate, one LUT plane.
-wire    store_wb_qual = resq_q && bram_is_data && bram_write && !bram_pref &&
-                        bram_cacheable_d && bram_wb_mode;
+//!flush_req: a flush-wait resolve reads the dying bank - its commit is dead
+//anyway (the swap invalidates the line), and suppressing it frees the VU/LRU
+//write ports so the scrub can run at full speed while accepts are blocked.
+wire    store_wb_qual = resq_q && !flush_req && bram_is_data && bram_write &&
+                        !bram_pref && bram_cacheable_d && bram_wb_mode;
 
 always_comb begin
-    //Hit resolve of the running access (bram_*). tag_rdata/data_rdata were read at
+    //Hit resolve of the running access (bram_*). tag/vu/data q were read at
     //bram's capture edge at its index, so they match bram_* this cycle.
-    hit_w[0] = tag_rdata[0][20] && (tag_rdata[0][18:0] == tag_of(bram_addr));
-    hit_w[1] = tag_rdata[1][20] && (tag_rdata[1][18:0] == tag_of(bram_addr));
-    hit_w[2] = tag_rdata[2][20] && (tag_rdata[2][18:0] == tag_of(bram_addr));
-    hit_w[3] = tag_rdata[3][20] && (tag_rdata[3][18:0] == tag_of(bram_addr));
+    hit_w[0] = vu_rdata[0][1] && (tag_rdata[0] == tag_of(bram_addr));
+    hit_w[1] = vu_rdata[1][1] && (tag_rdata[1] == tag_of(bram_addr));
+    hit_w[2] = vu_rdata[2][1] && (tag_rdata[2] == tag_of(bram_addr));
+    hit_w[3] = vu_rdata[3][1] && (tag_rdata[3] == tag_of(bram_addr));
     //Priority one-hot mirroring hit_way (= w0?0:w1?1:w2?2:3, so way 3 is the default row;
     //rows only matter when lru_we is set, i.e. on a real hit).
     hit_pri[0] =  hit_w[0];
@@ -374,23 +397,23 @@ always_comb begin
                ({32{hit_w[3]}} & data_rdata[3]);
     victim   = lru_victim(lru_rdata);
     victim_oh    = lru_victim_oh(lru_rdata);
-    dirty_w[0]   = tag_rdata[0][20] && tag_rdata[0][19];
-    dirty_w[1]   = tag_rdata[1][20] && tag_rdata[1][19];
-    dirty_w[2]   = tag_rdata[2][20] && tag_rdata[2][19];
-    dirty_w[3]   = tag_rdata[3][20] && tag_rdata[3][19];
+    dirty_w[0]   = vu_rdata[0][1] && vu_rdata[0][0];
+    dirty_w[1]   = vu_rdata[1][1] && vu_rdata[1][0];
+    dirty_w[2]   = vu_rdata[2][1] && vu_rdata[2][0];
+    dirty_w[3]   = vu_rdata[3][1] && vu_rdata[3][0];
     victim_dirty = |(dirty_w & victim_oh);
-    victim_tag_w = ({19{victim_oh[0]}} & tag_rdata[0][18:0]) |
-                   ({19{victim_oh[1]}} & tag_rdata[1][18:0]) |
-                   ({19{victim_oh[2]}} & tag_rdata[2][18:0]) |
-                   ({19{victim_oh[3]}} & tag_rdata[3][18:0]);
+    victim_tag_w = ({19{victim_oh[0]}} & tag_rdata[0]) |
+                   ({19{victim_oh[1]}} & tag_rdata[1]) |
+                   ({19{victim_oh[2]}} & tag_rdata[2]) |
+                   ({19{victim_oh[3]}} & tag_rdata[3]);
 
     //Memory-mapped: way from addr[13:12]; associative compares tag field to all ways.
     //Off cur_* - the mm access is owned by the MISS FSM (S_MMTAG) in cur_*.
     mm_way       = cur_addr[13:12];
-    mm_match_w[0] = tag_rdata[0][20] && (tag_rdata[0][18:0] == cur_wdata[28:10]);
-    mm_match_w[1] = tag_rdata[1][20] && (tag_rdata[1][18:0] == cur_wdata[28:10]);
-    mm_match_w[2] = tag_rdata[2][20] && (tag_rdata[2][18:0] == cur_wdata[28:10]);
-    mm_match_w[3] = tag_rdata[3][20] && (tag_rdata[3][18:0] == cur_wdata[28:10]);
+    mm_match_w[0] = vu_rdata[0][1] && (tag_rdata[0] == cur_wdata[28:10]);
+    mm_match_w[1] = vu_rdata[1][1] && (tag_rdata[1] == cur_wdata[28:10]);
+    mm_match_w[2] = vu_rdata[2][1] && (tag_rdata[2] == cur_wdata[28:10]);
+    mm_match_w[3] = vu_rdata[3][1] && (tag_rdata[3] == cur_wdata[28:10]);
     mm_match     = |mm_match_w;
     mm_match_way = mm_match_w[0] ? 2'd0 : mm_match_w[1] ? 2'd1 : mm_match_w[2] ? 2'd2 : 2'd3;
     mm_sel_way   = cur_addr[3] ? mm_match_way : mm_way;     //addr[3] = associative bit
@@ -407,8 +430,10 @@ wire    run_d_hit_pref  = bram_is_data && bram_pref &&
 wire    run_i_hit       = !bram_is_data && bram_cacheable_i && hit;
 //Every factor of the MRU-update terms above EXCEPT the compare, for the LRU write
 //enable: lru_we = lru_mru_qual && hit (one LUT after the compares).
+//!flush_req frees the port for the scrub, like store_wb_qual above.
 wire    lru_mru_qual =
-        resq_q && ((bram_is_data && bram_cacheable_d &&
+        resq_q && !flush_req &&
+                  ((bram_is_data && bram_cacheable_d &&
                     ((!bram_write && !bram_pref) || bram_pref ||
                      (bram_write && !bram_pref && bram_wb_mode))) ||
                    (!bram_is_data && bram_cacheable_i));
@@ -457,66 +482,124 @@ always_comb begin
     endcase
 end
 
-//Tag RAM controls. Entry = {valid, U, tag}.
+///////////////////////////////////////////////////////////
+//////  Shadow-Bank Flush (swap + background scrub)
+////
+
+wire    scrub_done = scrub_idx[8];
+//SWAP: serviced from S_IDLE like the old walk (same serialisation point), so
+//no in-flight resolve can straddle it. The pair captured AT the swap edge read
+//the dying bank - resq_q marks it stale below, exactly the FSM-excursion rule.
+wire    flush_swap = (state == S_IDLE) && flush_req && scrub_done;
+//Write-port-busy cycles, SHALLOW terms only (state decode + bus flags). Active
+//VU/LRU writes exist ONLY in: S_IDLE fresh resolves (both quals carry resq_q
+//and !flush_req), fill-WAIT response beats (any beat blocks - conservative),
+//and S_MMTAG_WR. Everything else is a free write slot for the scrub.
+wire    scrub_busy = ((state == S_IDLE) && resq_q && !flush_req) ||
+                     (state == S_MMTAG_WR) ||
+                     (((state == S_IFILL_WAIT) || (state == S_DFILL_WAIT)) &&
+                      I_BUS.rsp_valid && I_BUS.rsp_ready);
+wire    scrub_fire = !scrub_done && !scrub_busy;    //write one shadow set this edge
+
+//No reset (see the declaration note); flush_swap and scrub_fire are exclusive
+//by construction (scrub_done true in one, false in the other).
+always_ff @(posedge i_CLK) begin if(cen) begin
+    if(flush_swap) begin
+        vu_bank   <= ~vu_bank;
+        scrub_idx <= 9'd0;          //begin scrubbing the just-retired half
+    end
+    else if(scrub_fire) scrub_idx <= scrub_idx + 9'd1;
+end end
+
+// synthesis translate_off
+//Swap-edge oracle: the shadow half being swapped INTO must be fully scrubbed
+//(all V/U and LRU zero), and no active-bank write may share the swap edge.
+always @(posedge i_CLK) if(i_RST_n && cen && flush_swap) begin
+    for(int k = 0; k < 256; k++) begin
+        if(u_lru.ram[{~vu_bank, k[7:0]}] != 6'd0)
+            $fatal(1, "flush_swap: LRU shadow set %02h not scrubbed", k);
+        if(g_way[0].u_vu.ram[{~vu_bank, k[7:0]}] != 2'd0 ||
+           g_way[1].u_vu.ram[{~vu_bank, k[7:0]}] != 2'd0 ||
+           g_way[2].u_vu.ram[{~vu_bank, k[7:0]}] != 2'd0 ||
+           g_way[3].u_vu.ram[{~vu_bank, k[7:0]}] != 2'd0)
+            $fatal(1, "flush_swap: VU shadow set %02h not scrubbed", k);
+    end
+    if(lru_we || vu_we != 4'b0000)
+        $fatal(1, "flush_swap coincides with a VU/LRU write");
+end
+// synthesis translate_on
+
+//Tag RAM controls. Entry = tag[18:0]; V/U live in the VU RAM below. The tag is
+//written ONLY on a fill validate and a non-assoc mm write - a store-hit U set
+//and a fill-fault invalidate are VU-only (the stale tag is unreachable at V=0).
 always_comb begin
     tag_we    = 4'b0000;
-    tag_wdata = {1'b1, 1'b0, tag_of(cur_addr)};
-    if(state == S_FLUSH) begin
-        tag_raddr = flush_idx[7:0];
-        tag_waddr = flush_idx[7:0];
-        tag_wdata = 21'd0;                          //clear valid + U
-        tag_we    = 4'b1111;
+    tag_wdata = tag_of(cur_addr);
+    //Read port: live grant while RUNNING (mm dispatch redirects to the serviced
+    //index); the serviced index in miss states. Write port: cur index (all
+    //remaining tag writes are FSM-owned).
+    tag_raddr = (state == S_IDLE) ? grant_idx : cur_addr[11:4];
+    tag_waddr = cur_addr[11:4];
+    //Fill tag update: completion validates the line (fault handling is VU-only).
+    if((state == S_IFILL_WAIT || state == S_DFILL_WAIT) &&
+       I_BUS.rsp_valid && I_BUS.rsp_ready && !I_BUS.rsp_fault && fill_last)
+        tag_we[cur_way] = 1'b1;
+    if(state == S_MMTAG_WR) begin
+        //Memory-mapped tag write. Associative keeps the tag (VU-only write);
+        //non-associative writes the full tag field.
+        tag_wdata = cur_wdata[28:10];
+        if(!mm_assoc_wr) tag_we[cur_way] = 1'b1;
     end
-    else begin
-        //Read port: live grant while RUNNING (mm dispatch redirects to the serviced
-        //index); the serviced index in miss states. Write port: bram index for the
-        //running store-hit U write; cur index for fills/mm.
-        tag_raddr = (state == S_IDLE) ? grant_idx : cur_addr[11:4];
-        tag_waddr = (state == S_IDLE) ? bram_addr[11:4] : cur_addr[11:4];
-        //1-cycle write-back store hit: set the dirty bit on the hit way, but only when it is
-        //not already dirty - so a run of stores to a now-dirty line skips the tag write. V/tag
-        //unchanged, so a clean-line first store writes {V=1, U=1, tag}. (WT hits never set U.)
-        //DATAIN is set off state ONLY (the S_IDLE arm writes nothing else): the deep
-        //resolve gates just the 1-bit WE, keeping the tag-compare cone off the 21-bit
-        //M10K datain input registers.
-        if(state == S_IDLE) begin
-            tag_wdata = {1'b1, 1'b1, tag_of(bram_addr)};
-            tag_we[0] = store_wb_qual && hit_w[0] && !tag_rdata[0][19];
-            tag_we[1] = store_wb_qual && hit_w[1] && !tag_rdata[1][19];
-            tag_we[2] = store_wb_qual && hit_w[2] && !tag_rdata[2][19];
-            tag_we[3] = store_wb_qual && hit_w[3] && !tag_rdata[3][19];
+end
+
+//VU RAM controls - mirrors the old tag-block V/U arms. DATAIN is set off state
+//ONLY: the deep resolve gates just the 1-bit WEs, keeping the tag-compare cone
+//off the M10K datain input registers (same discipline as the tag block).
+always_comb begin
+    vu_we    = 4'b0000;
+    vu_wdata = 2'b11;                               //S_IDLE store U-set value {V,U}
+    vu_raddr = {vu_bank, tag_raddr};                //reads track the tag read, active bank
+    vu_waddr = {vu_bank, (state == S_IDLE) ? bram_addr[11:4] : cur_addr[11:4]};
+    if(scrub_fire) begin
+        vu_waddr = {~vu_bank, scrub_idx[7:0]};      //clear one shadow set, all ways
+        vu_wdata = 2'b00;
+        vu_we    = 4'b1111;
+    end
+    else if(state == S_IDLE) begin
+        //1-cycle write-back store hit: set the dirty bit on the hit way, but only
+        //when it is not already dirty - so a run of stores to a now-dirty line
+        //skips the write. (WT hits never set U.)
+        vu_we[0] = store_wb_qual && hit_w[0] && !vu_rdata[0][0];
+        vu_we[1] = store_wb_qual && hit_w[1] && !vu_rdata[1][0];
+        vu_we[2] = store_wb_qual && hit_w[2] && !vu_rdata[2][0];
+        vu_we[3] = store_wb_qual && hit_w[3] && !vu_rdata[3][0];
+    end
+    else if(state == S_IFILL_WAIT && I_BUS.rsp_valid && I_BUS.rsp_ready) begin
+        //A mid-line FAULT INVALIDATES the victim way: earlier beats already
+        //overwrote its data words, and the old tag would otherwise stay valid
+        //over the half-filled line (victim-integrity golden).
+        if(I_BUS.rsp_fault) begin
+            vu_wdata        = 2'b00;
+            vu_we[cur_way]  = 1'b1;
         end
-        //Fill tag update: completion validates the line. A mid-line FAULT instead
-        //INVALIDATES the victim way: earlier beats already overwrote its data words,
-        //and the old tag would otherwise stay valid over the half-filled line - a
-        //later access to the old address would hit CORRUPT data (victim-integrity golden).
-        if(state == S_IFILL_WAIT && I_BUS.rsp_valid && I_BUS.rsp_ready) begin
-            if(I_BUS.rsp_fault) begin
-                tag_wdata       = 21'd0;                    //kill V (and U) of the victim way
-                tag_we[cur_way] = 1'b1;
-            end
-            else if(fill_last) begin
-                tag_wdata       = {1'b1, 1'b0, tag_of(cur_addr)};
-                tag_we[cur_way] = 1'b1;
-            end
+        else if(fill_last) begin
+            vu_wdata        = 2'b10;                //validate clean
+            vu_we[cur_way]  = 1'b1;
         end
-        if(state == S_DFILL_WAIT && I_BUS.rsp_valid && I_BUS.rsp_ready) begin
-            if(I_BUS.rsp_fault) begin
-                tag_wdata       = 21'd0;
-                tag_we[cur_way] = 1'b1;
-            end
-            else if(fill_last) begin
-                tag_wdata       = {1'b1, cur_write, tag_of(cur_addr)};  //U=1 for write-allocate
-                tag_we[cur_way] = 1'b1;
-            end
+    end
+    else if(state == S_DFILL_WAIT && I_BUS.rsp_valid && I_BUS.rsp_ready) begin
+        if(I_BUS.rsp_fault) begin
+            vu_wdata        = 2'b00;
+            vu_we[cur_way]  = 1'b1;
         end
-        if(state == S_MMTAG_WR) begin
-            //Memory-mapped tag write. Associative keeps tag+LRU, sets V/U only;
-            //non-associative writes the full tag field.
-            tag_wdata       = mm_assoc_wr ? {cur_wdata[0], cur_wdata[1], tag_rdata[cur_way][18:0]}
-                                          : {cur_wdata[0], cur_wdata[1], cur_wdata[28:10]};
-            tag_we[cur_way] = 1'b1;
+        else if(fill_last) begin
+            vu_wdata        = {1'b1, cur_write};    //U=1 for write-allocate
+            vu_we[cur_way]  = 1'b1;
         end
+    end
+    else if(state == S_MMTAG_WR) begin
+        vu_wdata        = {cur_wdata[0], cur_wdata[1]};     //mm word: bit0=V, bit1=U (p.113)
+        vu_we[cur_way]  = 1'b1;
     end
 end
 
@@ -524,15 +607,14 @@ end
 always_comb begin
     lru_we    = 1'b0;
     lru_wdata = lru_wdata_hit;      //flat form (== lru_update(hit_way, lru_rdata))
-    if(state == S_FLUSH) begin
-        lru_raddr = flush_idx[7:0];
-        lru_waddr = flush_idx[7:0];
+    lru_raddr = {vu_bank, (state == S_IDLE) ? grant_idx : cur_addr[11:4]};
+    if(scrub_fire) begin
+        lru_waddr = {~vu_bank, scrub_idx[7:0]};
         lru_wdata = 6'd0;
         lru_we    = 1'b1;
     end
     else begin
-        lru_raddr = (state == S_IDLE) ? grant_idx : cur_addr[11:4];
-        lru_waddr = (state == S_IDLE) ? bram_addr[11:4] : cur_addr[11:4];
+        lru_waddr = {vu_bank, (state == S_IDLE) ? bram_addr[11:4] : cur_addr[11:4]};
         if(state == S_IDLE) begin
             //Mark the hit way MRU on any running hit (load / inst / write-back store).
             //FLAT WE: lru_mru_qual folds every run_* factor except the compare.
@@ -615,6 +697,15 @@ generate
             .i_WADDR  (tag_waddr      ),
             .i_DI     (tag_wdata      ),
             .o_DO     (tag_rdata[gw]  )
+        );
+        cache_vu_ram_wt u_vu (
+            .i_CLK    (i_CLK          ),
+            .i_EN     (cen            ),
+            .i_RADDR  (vu_raddr       ),
+            .i_WE     (vu_we[gw]      ),
+            .i_WADDR  (vu_waddr       ),
+            .i_DI     (vu_wdata       ),
+            .o_DO     (vu_rdata[gw]   )
         );
         cache_data_bank_wt u_data (
             .i_CLK    (i_CLK          ),
@@ -840,11 +931,11 @@ always_ff @(posedge i_CLK or negedge i_RST_n) begin
         ccr2                 <= 32'd0;
         flush_req            <= 1'b0;
 
-        //Block RAM powers up to 0 (valid=0), so no reset clear-walk is needed; per
-        //p.104 a manual reset must NOT clear V/U anyway. S_FLUSH is for CCR.CF only.
+        //Block RAM powers up to 0 (valid=0), so no reset clear is needed; per
+        //p.104 a manual reset must NOT clear V/U anyway (vu_bank/scrub_idx are
+        //reset-free for the same reason - see their declaration).
         state         <= S_IDLE;
         after_wb      <= AW_DFILL;
-        flush_idx     <= 9'd0;
         cur_is_data   <= 1'b0;
         cur_addr      <= 32'd0;
         cur_write     <= 1'b0;
@@ -933,15 +1024,6 @@ always_ff @(posedge i_CLK or negedge i_RST_n) begin
 
         ////////  Access pipeline
         unique case(state)
-            S_FLUSH: begin
-                if(flush_idx == 9'd255) begin
-                    flush_idx <= 9'd0;
-                    state     <= S_IDLE;
-                end
-                else
-                    flush_idx <= flush_idx + 9'd1;
-            end
-
             //RUNNING. TWO dispatch sites share this arm, never both writing state:
             //  (1) the RESOLVE site (acc_*_q): the access accepted LAST edge resolves
             //      now - cacheable hit/miss decisions, write-back store commit, fills.
@@ -952,9 +1034,11 @@ always_ff @(posedge i_CLK or negedge i_RST_n) begin
             //      each other. flush + background drain run when neither dispatches.
             S_IDLE: begin
                 if(flush_req) begin
-                    flush_req <= 1'b0;
-                    flush_idx <= 9'd0;
-                    state     <= S_FLUSH;
+                    //Shadow swap the moment the scrub is done (flush_swap flips
+                    //vu_bank + restarts the scrub in the side block above).
+                    //Accepts stay blocked while flush_req holds; only a
+                    //back-to-back CCR.CF ever waits here for the scrub.
+                    if(scrub_done) flush_req <= 1'b0;
                 end
                 else if(acc_d_q) begin
                     //D resolve site. Classify-only cases already dispatched at their
@@ -1369,8 +1453,8 @@ always_ff @(posedge i_CLK or negedge i_RST_n) begin
             S_MMTAG: begin
                 if(!cur_write) begin
                     //Read: tag, LRU, U, V of the addressed way (no associative op).
-                    rsp_rdata   <= {3'b000, tag_rdata[mm_way][18:0], lru_rdata,
-                                    2'b00, tag_rdata[mm_way][19], tag_rdata[mm_way][20]};
+                    rsp_rdata   <= {3'b000, tag_rdata[mm_way], lru_rdata,
+                                    2'b00, vu_rdata[mm_way][0], vu_rdata[mm_way][1]};
                     rsp_fault_d <= 1'b0;
                     rsp_valid_d <= 1'b1;
                     state       <= S_IDLE;
@@ -1385,9 +1469,9 @@ always_ff @(posedge i_CLK or negedge i_RST_n) begin
                     after_wb    <= AW_MMTAG;
                     //Write back first if displacing/invalidating a dirty line:
                     //non-assoc needs both U and V set; assoc needs U set on the hit way.
-                    if((!cur_addr[3] && tag_rdata[mm_sel_way][20] && tag_rdata[mm_sel_way][19]) ||
-                       ( cur_addr[3] && tag_rdata[mm_sel_way][19])) begin
-                        victim_tag <= tag_rdata[mm_sel_way][18:0];
+                    if((!cur_addr[3] && vu_rdata[mm_sel_way][1] && vu_rdata[mm_sel_way][0]) ||
+                       ( cur_addr[3] && vu_rdata[mm_sel_way][0])) begin
+                        victim_tag <= tag_rdata[mm_sel_way];
                         if(wb_valid) begin
                             drain_for_vic <= 1'b1;
                             drain_to_wbuf <= 1'b1;      //displaced entry is dirty: buffer it
@@ -1504,8 +1588,11 @@ always_ff @(posedge i_CLK or negedge i_RST_n) begin
         bram_is_ccr     <= PIPE_L_BUS.req_addr == ADDR_CCR;
         bram_is_ccr2    <= PIPE_L_BUS.req_addr == ADDR_CCR2_P4;
 
-        //Pair freshness + accept captures for the coming resolve edge.
-        resq_q  <= (state == S_IDLE);
+        //Pair freshness + accept captures for the coming resolve edge. A swap
+        //edge poisons the pair like an FSM excursion: its RAM read used the
+        //dying bank, so a live re-presented store/fetch must not resolve on it
+        //(a hit there would resurrect a flushed line into the fresh bank).
+        resq_q  <= (state == S_IDLE) && !flush_swap;
         acc_d_q <= acc_d_nx;
         acc_i_q <= acc_i_nx;
     end end

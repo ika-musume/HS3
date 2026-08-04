@@ -1062,3 +1062,22 @@ restored T/S/M/Q.
   defer counters 333/64 cycles); tests 1-82 output diff-identical to the
   86/86 baseline at hold=0 (first-principle proof); EREQ<->REQ oracle green
   over 341,962 strobes including injected traffic.
+
+## 2026-08-03 — OOC verdict for the CCR.CF shadow-swap flush (V/U split + scrub)
+
+- Change shape: V/U moved from tag-word bits [20:19] into per-way 512x2 VU RAMs
+  (bank-MSB shadow swap), LRU 512x6, tag RAM narrowed to 256x19, S_FLUSH state
+  deleted, background scrubber muxed into the VU/LRU write ports (shallow
+  scrub_busy state decode as the select), resq_q gains a !flush_swap term,
+  store/MRU quals gain !flush_req. Hit-resolve depth unchanged by construction
+  (V sourced from a parallel RAM q, same AND level).
+- 3-seed re-measure (cpu_core rig, sta.rpt mtimes fresh 2026-08-03 18:22-18:28):
+  s1 -2.783 / 78.23, s5 -2.347 / 80.99, s7 -3.045 / 76.66. Mean -2.73 vs the
+  -2.920 frozen baseline (+0.19, inside the documented identical-RTL family
+  band -2.2..-3.9).
+- Cone scan: u_vu / scrub / vu_bank in ZERO of 60 top-20 paths; every worst
+  endpoint is the pre-existing int_pipe forwarding-lane class (fwd_lane_a,
+  fwd_lane_b_agu, fwd_wbsel_a). NEUTRAL — CLEARED TO LAND.
+- Sim gates: cpu_core_tb 122/122, HS3_tb 89/89; IPC 0.401/0.974/0.554 with
+  identical retire/cycle counts; three HS3_tb whole-run laws relocked -248/-256
+  (the flush walk itself). Flush cost measured: ~258 -> 2 cycles.

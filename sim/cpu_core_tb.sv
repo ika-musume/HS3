@@ -313,6 +313,14 @@ integer         locked_write_count;
 logic           bench_arm = 1'b0;
 logic           bench_active, bench_started;
 integer         bench_arch_cycles, bench_retires;
+//Step-2 scoping probes (128-bit I-fetch line-buffer candidate): how much does IF
+//actually lose to MA on the shared AGU/L-bus slot inside the bench window?
+//supp      = fetch wanted (early_i_req_raw_valid) but the slot was data-typed;
+//supp_dreq = subset where a REAL D request occupied the cache that cycle;
+//supp_hit  = subset with the cache FSM in S_IDLE (hit-stream conflicts - the
+//            only cycles a cache-side I-line buffer could convert);
+//id_empty  = IF/ID held no instruction (realized decode starvation, any cause).
+integer         bench_if_supp, bench_if_supp_dreq, bench_if_supp_hit, bench_id_empty;
 
 always_ff @(posedge clk or negedge rst_n) begin
     if(!rst_n) begin
@@ -355,6 +363,10 @@ always_ff @(posedge clk or negedge rst_n) begin
         bench_started          <= 1'b0;
         bench_arch_cycles      <= 0;
         bench_retires          <= 0;
+        bench_if_supp          <= 0;
+        bench_if_supp_dreq     <= 0;
+        bench_if_supp_hit      <= 0;
+        bench_id_empty         <= 0;
     end
     else begin
         retire_valid_z <= retire_valid;
@@ -406,6 +418,10 @@ always_ff @(posedge clk or negedge rst_n) begin
                 bench_started     <= 1'b0;
                 bench_arch_cycles <= 0;
                 bench_retires     <= 0;
+                bench_if_supp      <= 0;
+                bench_if_supp_dreq <= 0;
+                bench_if_supp_hit  <= 0;
+                bench_id_empty     <= 0;
             end
             else if(!bench_arm) begin
                 bench_active <= 1'b0;
@@ -415,6 +431,16 @@ always_ff @(posedge clk or negedge rst_n) begin
                 if(bench_started) begin
                     bench_arch_cycles <= bench_arch_cycles + 1;
                     if(retire_valid) bench_retires <= bench_retires + 1;
+                    //IF-vs-MA conflict probes (see the declaration note).
+                    if(u_dut.u_int_pipe.early_i_req_raw_valid && u_dut.u_int_pipe.l_is_data) begin
+                        bench_if_supp <= bench_if_supp + 1;
+                        if(u_dut.LBUS_PIPE.req_valid) begin
+                            bench_if_supp_dreq <= bench_if_supp_dreq + 1;
+                            if(u_dut.u_cache.state == 5'd0)     //S_IDLE (CS_IDLE)
+                                bench_if_supp_hit <= bench_if_supp_hit + 1;
+                        end
+                    end
+                    if(!u_dut.u_int_pipe.ifid.valid) bench_id_empty <= bench_id_empty + 1;
                 end
             end
         end
@@ -471,7 +497,9 @@ end
     A divergence means a stale LRU read, a missed MRU update, or a broken
     same-edge RDW bypass in the LRU RAM. A software LRU load (non-assoc mm
     tag write) is not a total order in general: a zero value is the known
-    reset order, anything else UNTRACKS that set until the next flush walk.
+    reset order, anything else UNTRACKS that set until the next flush swap.
+    The CCR.CF shadow-bank swap re-baselines every set at once; background
+    scrub writes target the inactive half and are skipped here.
 
     The pair-bit semantic (bit = 1 means the pair's FIRST way is OLDER) and
     the state encodings mirror cache.sv; the "unknown lru_we site" guard
@@ -479,12 +507,11 @@ end
 */
 
 //cache.sv state_t encodings (declaration order). CS = "cache state".
-localparam logic [4:0] CS_FLUSH      = 5'd0;
-localparam logic [4:0] CS_IDLE       = 5'd1;
-localparam logic [4:0] CS_IFILL_REQ  = 5'd8;
-localparam logic [4:0] CS_IFILL_WAIT = 5'd9;
-localparam logic [4:0] CS_DFILL_WAIT = 5'd11;
-localparam logic [4:0] CS_MMTAG_WR   = 5'd19;
+localparam logic [4:0] CS_IDLE       = 5'd0;
+localparam logic [4:0] CS_IFILL_REQ  = 5'd7;
+localparam logic [4:0] CS_IFILL_WAIT = 5'd8;
+localparam logic [4:0] CS_DFILL_WAIT = 5'd10;
+localparam logic [4:0] CS_MMTAG_WR   = 5'd18;
 
 logic   [1:0]   lru_order [0:255][0:3];     //mirror recency queue per set
 logic           lru_untracked [0:255];      //set holds a software-written non-order
@@ -599,12 +626,17 @@ always @(posedge clk) begin
             end
         end
 
-        //(2) Every LRU RAM write: cross-check the written bits, then track it.
-        if(u_dut.u_cache.lru_we) begin
-            cset = u_dut.u_cache.lru_waddr;
-            if(cst == CS_FLUSH)
-                mirror_reset_set(cset);
-            else if(cst == CS_IDLE || cst == CS_IFILL_WAIT || cst == CS_DFILL_WAIT) begin
+        //(1b) Shadow-bank swap (CCR.CF): the new active half is all-zero, so the
+        //whole mirror re-baselines at once. Scrub writes never coincide (RTL oracle).
+        if(u_dut.u_cache.flush_swap) begin
+            for(cset = 0; cset < 256; cset = cset + 1) mirror_reset_set(cset);
+        end
+
+        //(2) Every ACTIVE-bank LRU RAM write: cross-check the written bits, then
+        //track it. Scrub writes target the inactive half - not this bank's view.
+        if(u_dut.u_cache.lru_we && !u_dut.u_cache.scrub_fire) begin
+            cset = u_dut.u_cache.lru_waddr[7:0];
+            if(cst == CS_IDLE || cst == CS_IFILL_WAIT || cst == CS_DFILL_WAIT) begin
                 cway = (cst == CS_IDLE) ? u_dut.u_cache.hit_way : u_dut.u_cache.cur_way;
                 mirror_mru(cset, cway);
                 if(!lru_untracked[cset]) begin
@@ -1136,6 +1168,9 @@ task automatic bench_ipc_straightline(input integer n);
             ms_ipc = (bench_retires * 1000) / bench_arch_cycles;
             $display("  [BENCH] straight-line NOP: %0d retires / %0d arch-cycles -> IPC = %0d.%03d (bypass path)",
                      bench_retires, bench_arch_cycles, ms_ipc/1000, ms_ipc%1000);
+            $display("  [PROBE] IF-vs-MA: supp=%0d (dreq=%0d, hit-stream=%0d), IF/ID empty=%0d of %0d",
+                     bench_if_supp, bench_if_supp_dreq, bench_if_supp_hit,
+                     bench_id_empty, bench_arch_cycles);
         end
         else
             $display("  [BENCH] straight-line NOP: no retirements measured");
@@ -1193,11 +1228,15 @@ task automatic bench_ipc_cached(input integer body, input integer iters);
         bench_arm = 1'b0;
         @(posedge clk);
 
-        if(bench_arch_cycles > 0)
+        if(bench_arch_cycles > 0) begin
             $display("  [BENCH] cached add loop (CCR.CE=%0d): %0d retires / %0d arch-cycles -> IPC = %0d.%03d (cache-hit path)",
                      u_dut.u_cache.ccr_ce, bench_retires, bench_arch_cycles,
                      ((bench_retires * 1000) / bench_arch_cycles) / 1000,
                      ((bench_retires * 1000) / bench_arch_cycles) % 1000);
+            $display("  [PROBE] IF-vs-MA: supp=%0d (dreq=%0d, hit-stream=%0d), IF/ID empty=%0d of %0d",
+                     bench_if_supp, bench_if_supp_dreq, bench_if_supp_hit,
+                     bench_id_empty, bench_arch_cycles);
+        end
         else
             $display("  [BENCH] cached add loop: no steady state measured (warm-up guard=%0d)", guard);
 
@@ -1246,11 +1285,15 @@ task automatic bench_ipc_store(input integer nstores, input integer iters);
         bench_arm = 1'b0;
         @(posedge clk);
 
-        if(bench_arch_cycles > 0)
+        if(bench_arch_cycles > 0) begin
             $display("  [BENCH] cached store loop (%0d stores/iter): %0d retires / %0d arch-cycles -> IPC = %0d.%03d",
                      nstores, bench_retires, bench_arch_cycles,
                      ((bench_retires * 1000) / bench_arch_cycles) / 1000,
                      ((bench_retires * 1000) / bench_arch_cycles) % 1000);
+            $display("  [PROBE] IF-vs-MA: supp=%0d (dreq=%0d, hit-stream=%0d), IF/ID empty=%0d of %0d",
+                     bench_if_supp, bench_if_supp_dreq, bench_if_supp_hit,
+                     bench_id_empty, bench_arch_cycles);
+        end
         chk("store loop verify load -> R2", gpr(2), 32'h0000_005A);
         chk("store loop R5 = 0 (DT;BF count)", gpr(5), 32'd0);
         do_reset;
@@ -3402,8 +3445,10 @@ task automatic test_exc_int_collision2;
     end
 endtask
 
-//GOLDEN Y7 - interrupt vs the CCR.CF flush walk (256-set S_FLUSH excursion, the
-//longest the cache has; the CCR write itself is a notify-at-accept MMIO store).
+//GOLDEN Y7 - interrupt vs the CCR.CF shadow-swap flush (the CCR write itself is a
+//notify-at-accept MMIO store). This second CF lands scrub-incomplete, so the sweep
+//still crosses a real multi-cycle flush-WAIT window (accepts blocked on the scrub);
+//late offsets fire after the program parks on the guard loop - also legal.
 //End state is offset-invariant: dirty data discarded, one entry, no deadlock.
 task automatic test_int_flush_collision;
     integer off, w;
@@ -3444,6 +3489,10 @@ task automatic test_int_flush_collision;
             while(entry_count == 0 && w < 20000) begin @(posedge clk); w = w + 1; end
             @(posedge clk);
             int_valid_q = 1'b0;
+            //Late offsets arm the interrupt AFTER the sentinel retired (sticky flag:
+            //run_until_retire would return at once) - wait for the handler itself.
+            w = 0;
+            while(gpr(13) == 32'd0 && w < 20000) begin @(posedge clk); w = w + 1; end
             run_until_retire('h31, 60000);
             chk($sformatf("off=%0d: exactly one entry", off), entry_count, 32'd1);
             chk($sformatf("off=%0d: handler ran once", off), gpr(13), 32'd1);

@@ -1337,7 +1337,7 @@ logic   [11:0]  ack_code2_z;                    //INTC b_code2_q at the ack edge
 integer         entry_cache_busy = 0;           //entries with the cache FSM mid-excursion
 integer         entry_sdram_busy = 0;           //entries with the SDRAM engine mid-cycle
 logic   [4:0]   cache_st, bsc_est;
-localparam logic [4:0] TB_CS_IDLE = 5'd1;       //cache state_t encoding (drift guard: cpu_core_tb)
+localparam logic [4:0] TB_CS_IDLE = 5'd0;       //cache state_t encoding (drift guard: cpu_core_tb)
 
 wire            core_lock_beat = u_dut.IBUS1_CORE.req_valid && u_dut.IBUS1_CORE.req_ready &&
                                  u_dut.IBUS1_CORE.req_lock;
@@ -3269,7 +3269,7 @@ task automatic bench_ipc_sdram;
                      ((bench_retires * 1000) / bench_arch_cycles) % 1000);
         chk("SDRAM cached loop R3", gpr(3), 32'd100);
         chk("SDRAM cached retires (incl. boot)",     bench_retires,     32'd1311); //relocked 2026-07-05 (fetch-leak fix)
-        chk("SDRAM cached arch-cycles (incl. boot)", bench_arch_cycles, 32'd1969);  //relocked 2026-07-07 (Group A + fill-forward)
+        chk("SDRAM cached arch-cycles (incl. boot)", bench_arch_cycles, 32'd1721);  //relocked 2026-08-03 (shadow-swap CCR.CF: walk gone)
         end_test;
     end
 endtask
@@ -3377,9 +3377,9 @@ task automatic test_burst_rom;
         end
         $display("      [ROM] no-burst: %0d (%0d CS falls)   burst pitch: %0d (%0d CS falls)",
                  c_nb, f_nb, c_bst, f_bst);
-        chk("no-burst fill cycles", c_nb,  32'd987);  //relocked 2026-07-09 (burst envelope:
-        chk("burst-ROM fill cycles", c_bst, 32'd951); //beats chain w/ no idle state, fig 10.30 -
-                                                      //9 beat transitions x 2 cycles saved)
+        chk("no-burst fill cycles", c_nb,  32'd731);  //relocked 2026-08-03 (shadow-swap CCR.CF:
+        chk("burst-ROM fill cycles", c_bst, 32'd695); //flush walk gone, -256 each; prev relock
+                                                      //2026-07-09, burst envelope fig 10.30)
         chk_true("burst pitch is faster", c_bst < c_nb);
         //envelope law (p.304/fig 23.19): a burst-ROM line fill asserts CS0 ONCE
         //("CS0 is not negated"); a plain-area fill re-frames all 4 beats
