@@ -4,11 +4,11 @@
     Cache memory primitives, kept in dedicated modules so synthesis maps them
     cleanly onto Cyclone V block RAM. All arrays carry an explicit ramstyle
     directive (M10K) and the synchronous registered-read pattern Quartus needs
-    to infer BRAM. The valid bit is folded into each tag entry (bit 22) so the
-    4-way lookup is a single registered read with no flop-array mux; CCR.CF
-    clears validity with a short index walk in the controller (p.106). The
-    round-robin replacement pointer lives in its own small block RAM, read in
-    step with the tag.
+    to infer BRAM. V (valid) and U (dirty) live in their own DOUBLE-depth VU
+    RAM (with the LRU) so CCR.CF flushes by swapping to a pre-cleared shadow
+    half in one cycle (p.106; the real SH3 flush is 1-2 cycles) - the tag
+    array itself is never cleared: V=0 makes a stale tag unreachable. The
+    controller scrubs the retired half in the background.
 
     The data array is split into one bank per way (cache_data_bank_wt x4) so all
     four ways are read in parallel and the hit way is selected after the tag
@@ -140,7 +140,7 @@ endmodule
 
 
 ///////////////////////////////////////////////////////////
-//////  Tag RAM - 1R1W + write-through bypass (256 x 21 = {valid, U, tag[18:0]})
+//////  Tag RAM - 1R1W + write-through bypass (256 x 19 = tag[18:0])
 ////
 
 /*
@@ -148,9 +148,8 @@ endmodule
     and fitted - the 256-deep composition needs 8-deep MLAB banking plus a wide
     output mux, and the depth-mux levels + inter-LAB routing cost MORE than the
     M10K's ~2.3 ns tCO. 32-deep arrays are the profitable MLAB shape; 256-deep is
-    not. The bypass here also guards the DIRTY (U) bit: a store-hit U write must be
-    visible to the very next lookup of the same set, else a stale-clean victim
-    would skip its write-back (lost store).
+    not. V/U moved to the shadowed VU RAM below; the bypass covers the fill-
+    validate tag write against a same-set lookup captured at the same edge.
 */
 
 module cache_tag_ram_wt (
@@ -159,15 +158,15 @@ module cache_tag_ram_wt (
     input   wire    [7:0]   i_RADDR,
     input   wire            i_WE,
     input   wire    [7:0]   i_WADDR,
-    input   wire    [20:0]  i_DI,
-    output  wire    [20:0]  o_DO
+    input   wire    [18:0]  i_DI,
+    output  wire    [18:0]  o_DO
 );
 
-(* ramstyle = "M10K, no_rw_check" *) logic [20:0] ram [0:255];
+(* ramstyle = "M10K, no_rw_check" *) logic [18:0] ram [0:255];
 
-logic   [20:0]  rd_q;
+logic   [18:0]  rd_q;
 logic           byp_q;
-logic   [20:0]  di_q;
+logic   [18:0]  di_q;
 
 always_ff @(posedge i_CLK) if(i_EN) begin
     if(i_WE) ram[i_WADDR] <= i_DI;
@@ -182,26 +181,68 @@ endmodule
 
 
 ///////////////////////////////////////////////////////////
-//////  LRU RAM - 1R1W + write-through bypass (256 x 6, 6-bit pseudo-LRU; p.104)
+//////  VU RAM - 1R1W + write-through bypass (512 x 2 = {V, U}, one per way)
+////
+
+/*
+    VU = {V (valid), U (dirty)} of one way, DOUBLE depth: addr MSB is the
+    active-bank select (shadow-swap CCR.CF flush, see cache.sv). The bypass
+    guards the store-hit U write: it must be visible to the very next lookup
+    of the same set, else a stale-clean victim would skip its write-back
+    (lost store). Scrub writes hit the other bank - the 9-bit address compare
+    keeps them out of the bypass automatically.
+*/
+
+module cache_vu_ram_wt (
+    input   wire            i_CLK,
+    input   wire            i_EN,
+    input   wire    [8:0]   i_RADDR,    //{bank, set}
+    input   wire            i_WE,
+    input   wire    [8:0]   i_WADDR,
+    input   wire    [1:0]   i_DI,       //{V, U}
+    output  wire    [1:0]   o_DO
+);
+
+(* ramstyle = "M10K, no_rw_check" *) logic [1:0] ram [0:511];
+
+logic   [1:0]   rd_q;
+logic           byp_q;
+logic   [1:0]   di_q;
+
+always_ff @(posedge i_CLK) if(i_EN) begin
+    if(i_WE) ram[i_WADDR] <= i_DI;
+    rd_q  <= ram[i_RADDR];
+    byp_q <= i_WE && (i_WADDR == i_RADDR);
+    di_q  <= i_DI;
+end
+
+assign  o_DO = byp_q ? di_q : rd_q;
+
+endmodule
+
+
+///////////////////////////////////////////////////////////
+//////  LRU RAM - 1R1W + write-through bypass (512 x 6, 6-bit pseudo-LRU; p.104)
 ////
 
 /*
     The bypass keeps replacement decisions bit-exact with the dclk ordering: a
     same-set access right after an MRU update must see the updated pseudo-LRU,
     else victim choices (and thus external write-back traffic) would diverge.
+    DOUBLE depth like the VU RAM: addr MSB is the shadow-swap bank select.
 */
 
 module cache_lru_ram_wt (
     input   wire            i_CLK,
     input   wire            i_EN,
-    input   wire    [7:0]   i_RADDR,
+    input   wire    [8:0]   i_RADDR,    //{bank, set}
     input   wire            i_WE,
-    input   wire    [7:0]   i_WADDR,
+    input   wire    [8:0]   i_WADDR,
     input   wire    [5:0]   i_DI,
     output  wire    [5:0]   o_DO
 );
 
-(* ramstyle = "M10K, no_rw_check" *) logic [5:0] ram [0:255];
+(* ramstyle = "M10K, no_rw_check" *) logic [5:0] ram [0:511];
 
 logic   [5:0]   rd_q;
 logic           byp_q;
