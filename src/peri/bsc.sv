@@ -379,7 +379,7 @@ wire            pbs_ready;          //P-bus bridge idle (defined in its section)
 //previous call's response consumed (the sd_ready continuation twin)
 assign  I_BUS.req_ready = fe_gen  ? (ord_bcont ? !(ob_wait || ord_wr_ack) :
                                      !(ord_busy || ordb_act || ordw_act ||
-                                       eng_busy || eng_go || bus_blk || i_MEM_HOLD)) :
+                                       eng_pins_busy || eng_go || bus_blk || i_MEM_HOLD)) :
                           fe_eng  ? sd_ready  :
                           fe_pbus ? pbs_ready : loc_ready;
 
@@ -644,7 +644,7 @@ always_ff @(posedge i_CLK or negedge i_POR_n) begin
             turn_v    <= 1'b1;
             turn_gap  <= 2'd0;
         end
-        else if(eng_wr_done) begin
+        else if(eng_wr_done_z) begin        //write data closes one cycle after issue
             turn_area <= e_cs3 ? 3'd3 : 3'd2;
             turn_read <= 1'b0;
             turn_v    <= 1'b1;
@@ -1077,8 +1077,10 @@ wire            eng_start_tk;                   //engine takes the op (BUS_PCEN 
 always_ff @(posedge i_CLK or negedge i_RST_n) begin
     if(!i_RST_n) eng_go <= 1'b0;
     else begin if(i_CEN) begin
-        if(fe_eng_start)      eng_go <= 1'b1;
-        else if(eng_start_tk) eng_go <= 1'b0;   //i_BUS_PCEN implies i_CEN
+        //take outranks set: a PCEN-edge accept that dispatches live
+        //(eng_start_tk same edge) must never park in the slot
+        if(eng_start_tk)      eng_go <= 1'b0;   //i_BUS_PCEN implies i_CEN
+        else if(fe_eng_start) eng_go <= 1'b1;
     end end
 end
 
@@ -1219,12 +1221,15 @@ end end
 //are re-computed flat here: the shared functional nets pack into the engine
 //FSM's own selector cones and would re-serialize the export launch
 (* keep *) wire mon_ebusy    = (est != E_IDLE) && (est != E_SLF);
+(* keep *) wire mon_etailf   = (est == E_RD_TPC) ||
+                               (((est == E_WR_TRWL) || (est == E_WR_TPC)) && eng_wtail_z);
 (* keep *) wire mon_blk      = (brq || bus_rel) && !(fe_lock_hold || e_lock_hold);
 (* keep *) wire mon_wrp_est  = e_write && (est == E_BA_DISP || est == E_PRE_WAIT ||
                                            est == E_ACTV    || est == E_RCD ||
                                            est == E_WR);
 (* keep *) wire mon_gen_ok   = !(ord_busy || ordb_act || ordw_act ||
-                                 mon_ebusy || eng_go || mon_blk || i_MEM_HOLD);
+                                 (mon_ebusy && !mon_etailf) ||
+                                 eng_go || mon_blk || i_MEM_HOLD);
 (* keep *) wire mon_sdh_ok   = !(eng_go || mon_ebusy || self_active || mon_blk ||
                                  sd_rd_wait || sd_wr_ack || i_MEM_HOLD);  //head/single op
 (* keep *) wire mon_sdc_ok   = !(sd_rd_wait || sd_wr_ack ||
@@ -1582,13 +1587,31 @@ wire    [12:0]  e_row    = amx_rowv(e_sd16, mcr[6:3], e_addr);
 wire            row_hit  = ba_v[e_bank] && (ba_row[e_bank] == e_row);
 wire            row_conf = ba_v[e_bank] && (ba_row[e_bank] != e_row);
 
+//dispatch source: the parked op (eng_go) or the accept edge's LIVE request -
+//an op accepted AT a PCEN edge issues its first command THAT edge instead of
+//parking one bus cycle in eng_go (LA law: ACTV lands one idle after the
+//preceding read closes). Off-grid accepts still park; fields then come
+//registered as before. WRITES/MRS only: a live CS3 READ pulls the capture
+//rise one CKIO early, onto the edge the DQ transport first presents data
+//(one c102 edge instead of two - silicon BOARDTAP fail); reads always park
+wire            disp_live = !eng_go && fe_eng_start && (I_BUS.req_write || fe_sdmr);
+wire            disp_v    = eng_go || disp_live;
+wire            dsp_write = eng_go ? eng_op_write : (I_BUS.req_write && !fe_sdmr);
+wire            dsp_burst = eng_go ? eng_op_burst : (I_BUS.req_burst && !fe_sdmr);
+wire            dsp_mrs   = eng_go ? eng_op_mrs   : fe_sdmr;
+wire            dsp_lock  = eng_go ? eng_op_lock  : I_BUS.req_lock;
+wire    [1:0]   dsp_size  = eng_go ? eng_op_size  : I_BUS.req_size;
+wire            dsp_cs3   = eng_go ? eng_cs3      : (fe_sdmr ? (fa[13:12] == 2'b10)
+                                                             : (fe_area == 3'd3));
+wire    [31:0]  dsp_addr  = eng_go ? eng_addr     : fa;
+
 //live twins on the un-dispatched op (the E_IDLE fold decides from these)
-wire            eng_sd16    = eng_cs3 ? sd16_a3 : sd16_a2;
-wire    [1:0]   eng_bank    = amx_bank(eng_sd16, mcr[6:3], eng_addr);
-wire    [12:0]  eng_rowv    = amx_rowv(eng_sd16, mcr[6:3], eng_addr);
+wire            eng_sd16    = dsp_cs3 ? sd16_a3 : sd16_a2;
+wire    [1:0]   eng_bank    = amx_bank(eng_sd16, mcr[6:3], dsp_addr);
+wire    [12:0]  eng_rowv    = amx_rowv(eng_sd16, mcr[6:3], dsp_addr);
 wire            row_hit_nx  = ba_v[eng_bank] && (ba_row[eng_bank] == eng_rowv);
 wire            row_conf_nx = ba_v[eng_bank] && (ba_row[eng_bank] != eng_rowv);
-wire    [1:0]   e_cl_nx     = eng_cs3 ? cl_a3 : cl_a2;
+wire    [1:0]   e_cl_nx     = dsp_cs3 ? cl_a3 : cl_a2;
 
 //single-rail AMX modes (table 10.13 note 1: A25 is a bank bit, one device
 //set spans the whole 64MB) never drive RAS3U/CASU; otherwise A25 picks the
@@ -1597,7 +1620,7 @@ wire            amx_nou    = (mcr[6:3] == (e_sd16   ? 4'b1110 : 4'b1101));
 wire            amx_nou_nx = (mcr[6:3] == (eng_sd16 ? 4'b1110 : 4'b1101));
 wire            amx_nou_gl = (mcr[6:3] == (sd16_gl  ? 4'b1110 : 4'b1101));
 wire            e_up       = e_addr[25]   && !amx_nou;
-wire            eng_up     = eng_addr[25] && !amx_nou_nx;
+wire            eng_up     = dsp_addr[25] && !amx_nou_nx;
 
 //bus arbitration (p.320): BREQ is granted only with the bus drained (engine
 //idle or parked in self-refresh, no ordinary cycle, no queued op) and all
@@ -1643,15 +1666,44 @@ wire            self_req = rfsh && rmode;               //MCR.RMODE level (p.300
 //BREQ row-close, refresh, self-refresh all outrank an op) + the WCR1 idle gap.
 //eng_start_tk previously ignored the higher arms - an op could be consumed by
 //a BRQ_PALL edge (lost op wedge) or double-dispatched under BREQ+refresh.
-wire            eng_idle_ok    = idle_ok(eng_cs3 ? 3'd3 : 3'd2, eng_op_write);
+wire            eng_idle_ok    = idle_ok(dsp_cs3 ? 3'd3 : 3'd2, dsp_write);
 wire            eng_dispatch_ok = !ord_busy && !(brq && ba_v != 4'd0) &&
                                   !(ref_ok && !bus_held) && !(self_req && !bus_held) &&
                                   eng_idle_ok;
-assign  eng_start_tk = (est == E_IDLE) && i_BUS_PCEN && eng_go && eng_dispatch_ok;
+assign  eng_start_tk = (est == E_IDLE) && i_BUS_PCEN && disp_v && eng_dispatch_ok;
 //E_SLF is a PARKED state: the SDRAM sits in self-refresh on CKE alone and
 //the shared bus is free for ordinary cycles (a new SDRAM op is still held
 //off by self_active). Everything else counts as bus ownership.
 assign  eng_busy     = (est != E_IDLE) && (est != E_SLF);
+
+//pins-busy vs internal-busy: the precharge/recovery tails finish INSIDE the
+//device with the shared pins at NOP, so an ordinary cycle may take the bus
+//(LA law: the next NAND read launches 2 CKIO after the WRIT command). A
+//write's DATA still rides the first tail cycle - pin registers lead the bus
+//cycle by one edge - so write tails open one bus cycle late (eng_wtail_z);
+//a read's last landing closes WITH its state change, E_RD_TPC opens at once.
+//The refresh/MRS/BRQ/self tails stay owned: unmeasured on silicon.
+logic           eng_wtail_z;        //write tail seen at the previous PCEN edge
+always_ff @(posedge i_CLK or negedge i_POR_n) begin
+    if(!i_POR_n) eng_wtail_z <= 1'b0;
+    else begin if(i_BUS_PCEN) begin
+        eng_wtail_z <= (est == E_WR_TRWL) || (est == E_WR_TPC);
+    end end
+end
+wire            eng_tail_free = (est == E_RD_TPC) ||
+                                (((est == E_WR_TRWL) || (est == E_WR_TPC)) && eng_wtail_z);
+wire            eng_pins_busy = eng_busy && !eng_tail_free;
+
+//WCR1 turn accounting: an engine write's DATA cycle closes one bus cycle
+//after its eng_wr_done issue edge - stamp the turnaround record there, so
+//the idle_ok gap math matches the ordinary controller's close-edge stamps
+logic           eng_wr_done_z;
+always_ff @(posedge i_CLK or negedge i_POR_n) begin
+    if(!i_POR_n) eng_wr_done_z <= 1'b0;
+    else begin if(i_BUS_PCEN) begin
+        eng_wr_done_z <= eng_wr_done;
+    end end
+end
 
 //per-beat views: the beat index rides A3:A2 of the column (A3:A1 on a 16-bit
 //bus, p.283); drains are position-ordered so their last beat tests ebeat
@@ -1732,29 +1784,30 @@ always_ff @(posedge i_CLK or negedge i_POR_n) begin
             else if(brq && ba_v != 4'd0) est <= E_BRQ_PALL; //close rows, then grant
             else if(ref_ok && !bus_held)   est <= E_REF_PALL;
             else if(self_req && !bus_held) est <= E_SLF_PALL;
-            else if(eng_go && eng_idle_ok) begin
-                e_write <= eng_op_write;
-                e_burst <= eng_op_burst;
-                e_cs3   <= eng_cs3;
+            else if(disp_v && eng_idle_ok) begin
+                e_write <= dsp_write;
+                e_burst <= dsp_burst;
+                e_cs3   <= dsp_cs3;
                 e_sd16  <= eng_sd16;
-                e_size  <= eng_op_size;
-                e_addr  <= eng_addr;
+                e_size  <= dsp_size;
+                e_addr  <= dsp_addr;
                 //a locked read opens the refresh-deferral window (TAS pair)
-                if(eng_op_lock && !eng_op_write) e_lock_hold <= 1'b1;
+                if(dsp_lock && !dsp_write) e_lock_hold <= 1'b1;
                 //bursts start at their own beat (fill reads wrap round the
                 //line); a 16-bit bus runs half-word beats off A3:A1
-                ebeat   <= eng_sd16 ? eng_addr[3:1] : {1'b0, eng_addr[3:2]};
+                ebeat   <= eng_sd16 ? dsp_addr[3:1] : {1'b0, dsp_addr[3:2]};
                 ebcnt   <= 3'd0;
-                e_bm1   <= eng_sd16 ? (eng_op_burst ? 3'd7 :
-                                       (eng_op_size == 2'd2 ? 3'd1 : 3'd0))
-                                    : (eng_op_burst ? 3'd3 : 3'd0);
-                rd_need <= eng_sd16 ? (eng_op_burst ? 4'd8 :
-                                       (eng_op_size == 2'd2 ? 4'd2 : 4'd1))
-                                    : (eng_op_burst ? 4'd4 : 4'd1);
+                e_bm1   <= eng_sd16 ? (dsp_burst ? 3'd7 :
+                                       (dsp_size == 2'd2 ? 3'd1 : 3'd0))
+                                    : (dsp_burst ? 3'd3 : 3'd0);
+                rd_need <= eng_sd16 ? (dsp_burst ? 4'd8 :
+                                       (dsp_size == 2'd2 ? 4'd2 : 4'd1))
+                                    : (dsp_burst ? 4'd4 : 4'd1);
                 //the first command issues AT this dispatch edge from the live
-                //op fields - the real chip overlaps dispatch with the previous
-                //op's tail, no NOP between ops (figs 10.14-10.24)
-                if(eng_op_mrs) begin
+                //op fields (a PCEN-edge accept dispatches HERE, unparked) -
+                //the real chip overlaps dispatch with the previous op's tail,
+                //no NOP between ops (figs 10.14-10.24)
+                if(dsp_mrs) begin
                     if(wr_recov == 3'd0) begin      //tWR guard (bank-active writes)
                         sd_cs2_n <= ~a2_sdram; sd_cs3_n <= ~a3_sdram;   //PALL, all devices
                         sd_rasl_n <= 1'b0; sd_rasu_n <= amx_nou_gl;
@@ -1768,19 +1821,19 @@ always_ff @(posedge i_CLK or negedge i_POR_n) begin
                 end
                 else if(rasd) begin                 //bank-active row decision, live fields
                     if(row_hit_nx) begin
-                        if(!eng_op_write && e_cl_nx == 2'd1) begin  //Tnop: DQM 2-cycle lead
+                        if(!dsp_write && e_cl_nx == 2'd1) begin  //Tnop: DQM 2-cycle lead
                             ecnt <= 4'd1;
                             est  <= E_RCD;
                         end
-                        else est <= eng_op_write ? E_WR : E_RD;
+                        else est <= dsp_write ? E_WR : E_RD;
                     end
                     else if(row_conf_nx) begin
                         if(wr_recov == 3'd0) begin  //tWR guard before the precharge
-                            sd_cs2_n <= eng_cs3; sd_cs3_n <= ~eng_cs3;
+                            sd_cs2_n <= dsp_cs3; sd_cs3_n <= ~dsp_cs3;
                             if(eng_up) sd_rasu_n <= 1'b0;           //PRE this bank
                             else       sd_rasl_n <= 1'b0;
                             sd_cmdwe_n <= 1'b0;
-                            sd_a <= amx_col(eng_sd16, mcr[6:3], eng_addr, 1'b0);
+                            sd_a <= amx_col(eng_sd16, mcr[6:3], dsp_addr, 1'b0);
                             ba_v[eng_bank] <= 1'b0;
                             if(t_tpc == 3'd1) est <= E_ACTV;
                             else begin ecnt <= {1'b0, t_tpc} - 4'd1; est <= E_PRE_WAIT; end
@@ -1788,22 +1841,22 @@ always_ff @(posedge i_CLK or negedge i_POR_n) begin
                         else est <= E_BA_DISP;      //guard draining: park and retry
                     end
                     else begin                      //bank idle: ACTV at this edge
-                        sd_cs2_n <= eng_cs3; sd_cs3_n <= ~eng_cs3;
+                        sd_cs2_n <= dsp_cs3; sd_cs3_n <= ~dsp_cs3;
                         if(eng_up) sd_rasu_n <= 1'b0;
                         else       sd_rasl_n <= 1'b0;
-                        sd_a <= amx_row(mcr[6:3], eng_addr);
+                        sd_a <= amx_row(mcr[6:3], dsp_addr);
                         ba_v[eng_bank]   <= 1'b1;
                         ba_row[eng_bank] <= eng_rowv;
-                        if(t_rcd == 3'd1) est <= eng_op_write ? E_WR : E_RD;
+                        if(t_rcd == 3'd1) est <= dsp_write ? E_WR : E_RD;
                         else begin ecnt <= {1'b0, t_rcd} - 4'd1; est <= E_RCD; end
                     end
                 end
                 else begin                          //auto-precharge: ACTV at this edge
-                    sd_cs2_n <= eng_cs3; sd_cs3_n <= ~eng_cs3;
+                    sd_cs2_n <= dsp_cs3; sd_cs3_n <= ~dsp_cs3;
                     if(eng_up) sd_rasu_n <= 1'b0;
                     else       sd_rasl_n <= 1'b0;
-                    sd_a <= amx_row(mcr[6:3], eng_addr);
-                    if(t_rcd == 3'd1) est <= eng_op_write ? E_WR : E_RD;
+                    sd_a <= amx_row(mcr[6:3], dsp_addr);
+                    if(t_rcd == 3'd1) est <= dsp_write ? E_WR : E_RD;
                     else begin ecnt <= {1'b0, t_rcd} - 4'd1; est <= E_RCD; end
                 end
             end

@@ -166,6 +166,8 @@ wire    [31:0]  ch_sar  [0:3];
 wire    [31:0]  ch_dar  [0:3];
 wire    [23:0]  ch_tcr  [0:3];
 wire    [31:0]  ch_chcr [0:3];
+wire    [31:0]  ch_sar_nx [0:3];            //post-unit SAR/DAR: the chain grant of a
+wire    [31:0]  ch_dar_nx [0:3];            //completing channel forwards these (fig 11.23)
 
 logic   [3:0]   ch_upd;                     //sequencer: unit completed on channel c
 logic   [3:0]   ch_en;                      //live channel enables (request comb below);
@@ -178,28 +180,32 @@ dmac_channel #(.CH_ID(0), .HAS_EXT(1'b1)) u_ch0 (
     .i_WR_SAR(wr_sar[0]), .i_WR_DAR(wr_dar[0]), .i_WR_TCR(wr_tcr[0]), .i_WR_CHCR(wr_chcr[0]),
     .i_WDATA(wd_lane), .i_WMASK(wm_lane),
     .i_UPD(ch_upd[0]), .i_UPD_MASK(upd_mask), .i_EN(ch_en[0]),
-    .o_SAR(ch_sar[0]), .o_DAR(ch_dar[0]), .o_TCR(ch_tcr[0]), .o_CHCR(ch_chcr[0])
+    .o_SAR(ch_sar[0]), .o_DAR(ch_dar[0]), .o_TCR(ch_tcr[0]), .o_CHCR(ch_chcr[0]),
+    .o_SAR_NX(ch_sar_nx[0]), .o_DAR_NX(ch_dar_nx[0])
 );
 dmac_channel #(.CH_ID(1), .HAS_EXT(1'b1)) u_ch1 (
     .i_RST_n(i_RST_n), .i_CLK(i_CLK), .i_CEN(i_CEN),
     .i_WR_SAR(wr_sar[1]), .i_WR_DAR(wr_dar[1]), .i_WR_TCR(wr_tcr[1]), .i_WR_CHCR(wr_chcr[1]),
     .i_WDATA(wd_lane), .i_WMASK(wm_lane),
     .i_UPD(ch_upd[1]), .i_UPD_MASK(upd_mask), .i_EN(ch_en[1]),
-    .o_SAR(ch_sar[1]), .o_DAR(ch_dar[1]), .o_TCR(ch_tcr[1]), .o_CHCR(ch_chcr[1])
+    .o_SAR(ch_sar[1]), .o_DAR(ch_dar[1]), .o_TCR(ch_tcr[1]), .o_CHCR(ch_chcr[1]),
+    .o_SAR_NX(ch_sar_nx[1]), .o_DAR_NX(ch_dar_nx[1])
 );
 dmac_channel #(.CH_ID(2), .HAS_RELOAD(1'b1)) u_ch2 (
     .i_RST_n(i_RST_n), .i_CLK(i_CLK), .i_CEN(i_CEN),
     .i_WR_SAR(wr_sar[2]), .i_WR_DAR(wr_dar[2]), .i_WR_TCR(wr_tcr[2]), .i_WR_CHCR(wr_chcr[2]),
     .i_WDATA(wd_lane), .i_WMASK(wm_lane),
     .i_UPD(ch_upd[2]), .i_UPD_MASK(upd_mask), .i_EN(ch_en[2]),
-    .o_SAR(ch_sar[2]), .o_DAR(ch_dar[2]), .o_TCR(ch_tcr[2]), .o_CHCR(ch_chcr[2])
+    .o_SAR(ch_sar[2]), .o_DAR(ch_dar[2]), .o_TCR(ch_tcr[2]), .o_CHCR(ch_chcr[2]),
+    .o_SAR_NX(ch_sar_nx[2]), .o_DAR_NX(ch_dar_nx[2])
 );
 dmac_channel #(.CH_ID(3), .HAS_INDIRECT(1'b1)) u_ch3 (
     .i_RST_n(i_RST_n), .i_CLK(i_CLK), .i_CEN(i_CEN),
     .i_WR_SAR(wr_sar[3]), .i_WR_DAR(wr_dar[3]), .i_WR_TCR(wr_tcr[3]), .i_WR_CHCR(wr_chcr[3]),
     .i_WDATA(wd_lane), .i_WMASK(wm_lane),
     .i_UPD(ch_upd[3]), .i_UPD_MASK(upd_mask), .i_EN(ch_en[3]),
-    .o_SAR(ch_sar[3]), .o_DAR(ch_dar[3]), .o_TCR(ch_tcr[3]), .o_CHCR(ch_chcr[3])
+    .o_SAR(ch_sar[3]), .o_DAR(ch_dar[3]), .o_TCR(ch_tcr[3]), .o_CHCR(ch_chcr[3]),
+    .o_SAR_NX(ch_sar_nx[3]), .o_DAR_NX(ch_dar_nx[3])
 );
 
 
@@ -311,12 +317,15 @@ end
     One transfer unit at a time: the dual-direct pair = read at SAR then
     write at DAR (figs 11.5/11.6). Per-edge dataflow (core clock, i_CEN):
 
-      IDLE     ch_req (pending&enable regs, ~2 lvl) -> priority win (~2
-               lvl: fixed orders p.349, round-robin rotation fig 11.3) ->
-               latch grant_q/addr_q(=SAR)/sarlo_q/size_q/beat_q=0, clear
-               a cycle-steal pending (request withdrawn at the FIRST
-               transfer, p.348); ch3-DI -> PT_REQ, dev->mem single ->
-               WR_REQ, else RD_REQ
+      GRANT    fires from IDLE, a GAP exit, or CHAINED at a completing
+               burst unit's own edge (figs 11.13/11.23: units back-to-
+               back, no idle beat): ch_req (pending&enable regs, ~2 lvl)
+               -> priority win (~2 lvl: fixed orders p.349, round-robin
+               rotation fig 11.3) -> latch grant_q/addr_q(=SAR)/sarlo_q/
+               size_q/beat_q=0, clear a cycle-steal pending (request
+               withdrawn at the FIRST transfer, p.348); a same-channel
+               chain forwards the post-unit SAR/DAR; ch3-DI -> PT_REQ,
+               dev->mem single -> WR_REQ, else RD_REQ
       PT_REQ/  ch3 indirect pointer fetch at SAR3, always LONG (p.339);
       PT_WAIT  rsp: addr_q <= the pointer = the data read address, size_q
                <= TS, go RD_REQ (fig 11.7; 32-bit bus, so no split reads
@@ -330,12 +339,14 @@ end
       WR_REQ   req_valid+write; accept -> WR_WAIT
       WR_WAIT  rsp_valid (posted-write ack): 16-byte plays 4 beats from
                buf_q, then ch_upd strobe (channel steps SAR/DAR/DMATCR,
-               sets TE on the last unit); burst -> IDLE (priority re-
-               resolved EVERY unit boundary: a higher-priority channel
-               preempts between units, fig 11.14, but o_BUS_HOLD keeps
-               the CPU off); cycle-steal -> GAP
+               sets TE on the last unit); burst -> chain grant at this
+               edge (priority re-resolved EVERY unit boundary: a higher-
+               priority channel preempts between units, fig 11.14, but
+               o_BUS_HOLD keeps the CPU off), IDLE if nothing requests;
+               cycle-steal -> GAP
       GAP      one request-free cycle so the arb owner returns to the CPU
-               (the fig 11.12 cycle-steal boundary), then IDLE
+               (the fig 11.12 cycle-steal boundary); the next grant may
+               fire at its exit edge
 
     Ending laws (p.374): enables are checked at grant only - clearing
     DE/DME (or an NMI setting NMIF) mid-unit lets the unit complete
@@ -387,6 +398,16 @@ always_comb begin
     end
 end
 
+//grant-view requests: a chain grant fires on the very edge the completing
+//channel's TE/pend clears land, so its stale ch_req must be masked when
+//this unit is its last (DMATCR=1) - one extra unit would run otherwise
+wire            unit_last = unit_done && (ch_tcr[grant_q] == 24'd1);
+logic   [3:0]   ch_req_g;
+always_comb begin
+    for(int c = 0; c < 4; c++)
+        ch_req_g[c] = ch_req[c] & ~(unit_last & (grant_q == c[1:0]));
+end
+
 //channel priority (p.349): three fixed orders, or PR=11 round-robin. The
 //served channel dropping to the bottom keeps the order a PURE ROTATION
 //(check fig 11.3's worked cases) - rr_head names the current top channel
@@ -394,15 +415,15 @@ logic   [1:0]   rr_head;                    //round-robin top = last served + 1
 logic   [1:0]   win;
 always_comb begin
     unique case(pr)
-        2'b01:   win = ch_req[0] ? 2'd0 : ch_req[2] ? 2'd2 : ch_req[3] ? 2'd3 : 2'd1;
-        2'b10:   win = ch_req[2] ? 2'd2 : ch_req[0] ? 2'd0 : ch_req[1] ? 2'd1 : 2'd3;
-        2'b11:   win = ch_req[rr_head        ] ? rr_head :
-                       ch_req[rr_head + 2'd1] ? rr_head + 2'd1 :
-                       ch_req[rr_head + 2'd2] ? rr_head + 2'd2 : rr_head + 2'd3;
-        default: win = ch_req[0] ? 2'd0 : ch_req[1] ? 2'd1 : ch_req[2] ? 2'd2 : 2'd3;
+        2'b01:   win = ch_req_g[0] ? 2'd0 : ch_req_g[2] ? 2'd2 : ch_req_g[3] ? 2'd3 : 2'd1;
+        2'b10:   win = ch_req_g[2] ? 2'd2 : ch_req_g[0] ? 2'd0 : ch_req_g[1] ? 2'd1 : 2'd3;
+        2'b11:   win = ch_req_g[rr_head        ] ? rr_head :
+                       ch_req_g[rr_head + 2'd1] ? rr_head + 2'd1 :
+                       ch_req_g[rr_head + 2'd2] ? rr_head + 2'd2 : rr_head + 2'd3;
+        default: win = ch_req_g[0] ? 2'd0 : ch_req_g[1] ? 2'd1 : ch_req_g[2] ? 2'd2 : 2'd3;
     endcase
 end
-wire            win_v = |ch_req;
+wire            win_v = |ch_req_g;
 
 //sequencer state ("seq"): the unit pipeline above; PT = the ch3 indirect
 //pointer fetch prologue (fig 11.7)
@@ -456,14 +477,22 @@ always_comb begin
     endcase
 end
 
+//same-channel chain forward: at a completion-edge re-grant the winner's
+//SAR/DAR step lands on this very edge - take the channel's post-unit nets.
+//Alignment is step-invariant (aligned address +/- aligned step; reload
+//restores the written image), so align_bad stays on the raw registers
+wire            fwd_g  = unit_done && (win == grant_q);
+wire    [31:0]  sar_gw = fwd_g ? ch_sar_nx[grant_q] : ch_sar[win];
+wire    [31:0]  dar_gw = fwd_g ? ch_dar_nx[grant_q] : ch_dar[win];
+
 //single-write strobes need the DAR lane at grant time (size_q registers on
 //the same edge): a small win-muxed duplicate of the wr_stb cone
 wire    [1:0]   ts_w = {ch_chcr[win][4], ch_chcr[win][3]};
 logic   [3:0]   sgw_stb;
 always_comb begin
     unique case(ts_w)
-        2'd0:    sgw_stb = 4'b1000 >> ch_dar[win][1:0];
-        2'd1:    sgw_stb = ch_dar[win][1] ? 4'b0011 : 4'b1100;
+        2'd0:    sgw_stb = 4'b1000 >> dar_gw[1:0];
+        2'd1:    sgw_stb = dar_gw[1] ? 4'b0011 : 4'b1100;
         default: sgw_stb = 4'b1111;
     endcase
 end
@@ -502,14 +531,21 @@ wire            ptr_bad   = |(I_BUS.rsp_rdata[3:0] & amask_g);
 
 wire            ae_fault  = I_BUS.rsp_valid && I_BUS.rsp_fault &&
                             ((seq == S_RD_WAIT) || (seq == S_WR_WAIT) || (seq == S_PT_WAIT));
-assign  ae_set = ((seq == S_IDLE) && win_v && align_bad) || ae_fault ||
+assign  ae_set = (grant_eval && win_v && align_bad) || ae_fault ||
                  ((seq == S_PT_WAIT) && I_BUS.rsp_valid && !I_BUS.rsp_fault && ptr_bad);
 
 wire            beat_last  = !sz16_q || (beat_q == 2'd3);   //16-byte: 4th beat ends the unit
 wire            unit_done  = (I_BUS.rsp_valid) && !I_BUS.rsp_fault && beat_last &&
                              ((seq == S_WR_WAIT) ||
                               (seq == S_RD_WAIT && mode_q == M_SGR));
-wire            grant_fire = (seq == S_IDLE) && win_v && !align_bad;
+
+//unified grant window: idle, a GAP exit, or CHAINED at a completing burst
+//unit's own edge - the fig 11.13/11.23 back-to-back train, no idle beat.
+//A same-edge NMI blocks the chain (11.3.7 stops at the unit boundary; the
+//IDLE path sees NMIF one cycle earlier - both paths equally strict)
+wire            chain_ok   = unit_done && tm_g && !i_NMI_SET;
+wire            grant_eval = (seq == S_IDLE) || (seq == S_GAP) || chain_ok;
+wire            grant_fire = grant_eval && win_v && !align_bad;
 
 always_ff @(posedge i_CLK or negedge i_RST_n) begin
     if(!i_RST_n) begin
@@ -537,41 +573,7 @@ always_ff @(posedge i_CLK or negedge i_RST_n) begin
     end
     else begin if(i_CEN) begin
         unique case(seq)
-            S_IDLE: begin
-                //a misaligned winner never launches: ae_set raises AE on this
-                //edge, ch_en (and win_v) drop on the next - no bus cycle fires
-                if(win_v && !align_bad) begin   //start-up: latch the winner's unit
-                    grant_q <= win;
-                    size_q  <= (ts_w == 2'b11) ? 2'd2 : ts_w;
-                    sz16_q  <= (ts_w == 2'b11);
-                    beat_q  <= 2'd0;
-                    rr_head <= win + 2'd1;  //served channel to the bottom (fig 11.3)
-                    //DACK tag: dual-ext per AM's cycle (p.337); single always
-                    dack_en_q <= ch_rs_ext[win];
-                    dack_rd_q <= ch_rs_sgr[win] |
-                                 (~ch_rs_sgw[win] & ~ch_chcr[win][17]);     //AM=0: read cycle
-                    if(ch_rs_sgw[win]) begin            //dev->mem: lone external-drive WRITE
-                        mode_q  <= M_SGW;
-                        addr_q  <= ch_dar[win];
-                        wstrb_q <= sgw_stb;
-                        wdata_q <= 32'd0;               //don't-care: D left undriven
-                        seq     <= S_WR_REQ;
-                    end
-                    else if(ch_chcr[win][20]) begin     //ch3 DI: pointer fetch prologue
-                        mode_q  <= M_DUAL;
-                        addr_q  <= ch_sar[win];
-                        size_q  <= 2'd2;                //pointer is always LONG (p.339)
-                        sz16_q  <= 1'b0;
-                        seq     <= S_PT_REQ;
-                    end
-                    else begin                          //dual, or single mem->dev (lone read)
-                        mode_q  <= ch_rs_sgr[win] ? M_SGR : M_DUAL;
-                        addr_q  <= ch_sar[win];
-                        sarlo_q <= ch_sar[win][1:0];
-                        seq     <= S_RD_REQ;
-                    end
-                end
-            end
+            S_IDLE: ;                       //launches ride the unified arm below
             S_PT_REQ:  if(I_BUS.req_ready) seq <= S_PT_WAIT;
             S_PT_WAIT: begin
                 if(I_BUS.rsp_valid) begin   //the fetched pointer IS the data read address
@@ -634,6 +636,41 @@ always_ff @(posedge i_CLK or negedge i_RST_n) begin
             end
             default: seq <= S_IDLE;         //S_GAP: one request-free cycle
         endcase
+
+        //unified launch, overriding the completion arms' S_IDLE/S_GAP above
+        //(non-blocking last-write-wins). A misaligned winner never launches:
+        //ae_set raises AE on this edge, ch_en (and win_v) drop on the next
+        if(grant_fire) begin                //start-up: latch the winner's unit
+            grant_q <= win;
+            size_q  <= (ts_w == 2'b11) ? 2'd2 : ts_w;
+            sz16_q  <= (ts_w == 2'b11);
+            beat_q  <= 2'd0;
+            rr_head <= win + 2'd1;          //served channel to the bottom (fig 11.3)
+            //DACK tag: dual-ext per AM's cycle (p.337); single always
+            dack_en_q <= ch_rs_ext[win];
+            dack_rd_q <= ch_rs_sgr[win] |
+                         (~ch_rs_sgw[win] & ~ch_chcr[win][17]);     //AM=0: read cycle
+            if(ch_rs_sgw[win]) begin            //dev->mem: lone external-drive WRITE
+                mode_q  <= M_SGW;
+                addr_q  <= dar_gw;
+                wstrb_q <= sgw_stb;
+                wdata_q <= 32'd0;               //don't-care: D left undriven
+                seq     <= S_WR_REQ;
+            end
+            else if(ch_chcr[win][20]) begin     //ch3 DI: pointer fetch prologue
+                mode_q  <= M_DUAL;
+                addr_q  <= sar_gw;
+                size_q  <= 2'd2;                //pointer is always LONG (p.339)
+                sz16_q  <= 1'b0;
+                seq     <= S_PT_REQ;
+            end
+            else begin                          //dual, or single mem->dev (lone read)
+                mode_q  <= ch_rs_sgr[win] ? M_SGR : M_DUAL;
+                addr_q  <= sar_gw;
+                sarlo_q <= sar_gw[1:0];
+                seq     <= S_RD_REQ;
+            end
+        end
 
         //CMT pending: match sets (outranks the clears), a cycle-steal grant
         //withdraws at the FIRST transfer, burst at the LAST (p.348)

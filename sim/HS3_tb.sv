@@ -496,7 +496,7 @@ assign  d_bus = hsk_drv ? MEM_BUS.rsp_rdata : 32'hzzzz_zzzz;
 
 //a 16-bit raw device wired to D15-D0 on area 4 (board wiring for test 37):
 //reads serve the half a_pin[1] selects; writes commit per WE1/WE0
-wire            raw16     = (raw_mode == 1) && (mem_area == 3'd4);
+wire            raw16     = (raw_mode == 1) && (mem_area == 3'd4) && !raw4_8en;
 wire            raw16_drv = raw16 && !rd_n && mem_req && !mem_write;
 wire    [31:0]  raw16_w   = dmem[mem_addr_p[9:2]];
 assign  d_bus = raw16_drv ? {2{a_pin[1] ? raw16_w[15:0] : raw16_w[31:16]}}
@@ -553,6 +553,23 @@ always_ff @(posedge clk) begin
     end
 end
 
+//an 8-bit raw device wired to D7-D0 on area 4 - the CV1k board wiring (NAND
+//data window: BCR2 A4 = 8-bit, WCR2 A4W = 3 waits); read-only in the tests
+logic           raw4_8en = 1'b0;
+wire            raw48     = (raw_mode == 1) && raw4_8en && (mem_area == 3'd4);
+wire            raw48_drv = raw48 && !rd_n && mem_req && !mem_write;
+wire    [31:0]  raw48_w   = dmem[mem_addr_p[9:2]];
+logic   [7:0]   raw48_q;
+always_comb begin
+    case(a_pin[1:0])
+        2'd0:    raw48_q = raw48_w[31:24];
+        2'd1:    raw48_q = raw48_w[23:16];
+        2'd2:    raw48_q = raw48_w[15:8];
+        default: raw48_q = raw48_w[7:0];
+    endcase
+end
+assign  d_bus[7:0] = raw48_drv ? raw48_q : 8'hzz;
+
 ///////////////////////////////////////////////////////////
 //////  Board-Bus Shape Monitors (Group B)
 ////
@@ -561,7 +578,7 @@ end
 //driver on the shared D bus at any sample edge; sticky, checked at the end
 wire            flash_drv = u_flash.Q_oe_i;
 wire            sdram_drv = u_sdram.Dq_oe_i;
-wire            tbmem_drv = raw_drv || raw16_drv || raw8_drv || hsk_drv;
+wire            tbmem_drv = raw_drv || raw16_drv || raw8_drv || raw48_drv || hsk_drv;
 wire    [2:0]   dbus_drvs = {2'd0, d_oe} + {2'd0, tbmem_drv} +
                             {2'd0, flash_drv} + {2'd0, sdram_drv};
 logic           dbus_viol = 1'b0;
@@ -634,6 +651,41 @@ always @(negedge ckio) begin
         if(sdm_td) begin
             sdm_td_cnt <= sdm_td_cnt + 1;
             if(sdm_td_t == 0) sdm_td_t <= $time;
+        end
+    end
+end
+
+//CV1k pitch monitor: CKIO-tick timestamps of a DMA unit's three pin events -
+//area-4 read launch (CS4 fall), SDRAM ACTV, SDRAM WRITE command (one sample
+//per bus cycle at the CKIO fall, the sdm detectors' cadence)
+logic           pitch_clr = 1'b0;
+integer         pitch_tick = 0;
+logic           pitch_cs4_z = 1'b1;
+integer         pitch_t1 [0:19];
+integer         pitch_ta [0:19];
+integer         pitch_tw [0:19];
+integer         pitch_n1 = 0;
+integer         pitch_na = 0;
+integer         pitch_nw = 0;
+always @(negedge ckio) begin
+    if(pitch_clr) begin
+        pitch_tick = 0; pitch_n1 = 0; pitch_na = 0; pitch_nw = 0;
+        pitch_cs4_z = 1'b1;
+    end
+    else begin
+        pitch_tick = pitch_tick + 1;
+        if(!cs4_n && pitch_cs4_z && pitch_n1 < 20) begin
+            pitch_t1[pitch_n1] = pitch_tick;
+            pitch_n1 = pitch_n1 + 1;
+        end
+        pitch_cs4_z = cs4_n;
+        if(sdm_actv && pitch_na < 20) begin
+            pitch_ta[pitch_na] = pitch_tick;
+            pitch_na = pitch_na + 1;
+        end
+        if(sdm_cas && !rd_wr && pitch_nw < 20) begin
+            pitch_tw[pitch_nw] = pitch_tick;
+            pitch_nw = pitch_nw + 1;
         end
     end
 end
@@ -907,8 +959,11 @@ end
     UNIT start (SDRAM engine dispatch / ordinary envelope open, white-box)
     pops the head and compares - LEN against the unit's physical beat count
     recomputed from the latched op (remaining beats for a resumed drain).
-    Push runs before pop - the registered strobe and the earliest grid
-    dispatch land the same cycle. The BSC's own reset (WDT flavors included)
+    Push runs before pop - the engine pop samples one cycle AFTER the
+    dispatch edge (a PCEN-edge accept now dispatches live, same edge as the
+    strobe's D; the delayed pop reads the dispatched e_* registers, valid
+    for parked and live dispatches alike) so the registered REQ strobe
+    always lands first. The BSC's own reset (WDT flavors included)
     flushes the queue: a strobed-undispatched op is legitimately dropped
     (spec R10). mon_qmax = the MEASURED R8 depth bound.
     Single writer; results checked in test_bus_monitors.
@@ -918,6 +973,7 @@ logic   [38:0]  mon_q [0:3];             //{addr[28:0], wr, size[1:0], burst, le
 logic   [38:0]  mon_exp;
 logic   [4:0]   mon_exp_len;
 logic           mon_ordbusy_z = 1'b0;    //ord_busy delay for the rise detect
+logic           mon_engtk_z   = 1'b0;    //engine dispatch, delayed to the e_* regs
 integer         mon_qn      = 0;         //queue occupancy
 integer         mon_qmax    = 0;         //occupancy high-water (measured R8)
 integer         mon_pushes  = 0;         //total strobes seen (coverage)
@@ -929,6 +985,7 @@ always @(posedge clk) begin
         mon_flushed   = mon_flushed + mon_qn;
         mon_qn        = 0;
         mon_ordbusy_z = 1'b0;
+        mon_engtk_z   = 1'b0;
     end
     else begin
         if(mon_req) begin                        //push first (same-cycle pop is legal)
@@ -942,18 +999,18 @@ always @(posedge clk) begin
             mon_pushes   = mon_pushes + 1;
             if(mon_qn > mon_qmax) mon_qmax = mon_qn;
         end
-        if((u_dut.u_bsc.eng_start_tk && !u_dut.u_bsc.eng_op_mrs) ||
+        if(mon_engtk_z ||
            (u_dut.u_bsc.ord_busy && !mon_ordbusy_z)) begin
-            if(u_dut.u_bsc.eng_start_tk) begin
+            if(mon_engtk_z) begin
                 //physical beats of the dispatched op (remaining, for a resume)
-                mon_exp_len = u_dut.u_bsc.eng_op_burst ?
-                                  (u_dut.u_bsc.eng_sd16 ?
-                                      5'd8 - {2'd0, u_dut.u_bsc.eng_addr[3:1]} :
-                                      5'd4 - {3'd0, u_dut.u_bsc.eng_addr[3:2]}) :
-                              (u_dut.u_bsc.eng_sd16 &&
-                               u_dut.u_bsc.eng_op_size == 2'd2) ? 5'd2 : 5'd1;
-                mon_exp = {u_dut.u_bsc.eng_addr[28:0], u_dut.u_bsc.eng_op_write,
-                           u_dut.u_bsc.eng_op_size,    u_dut.u_bsc.eng_op_burst,
+                mon_exp_len = u_dut.u_bsc.e_burst ?
+                                  (u_dut.u_bsc.e_sd16 ?
+                                      5'd8 - {2'd0, u_dut.u_bsc.e_addr[3:1]} :
+                                      5'd4 - {3'd0, u_dut.u_bsc.e_addr[3:2]}) :
+                              (u_dut.u_bsc.e_sd16 &&
+                               u_dut.u_bsc.e_size == 2'd2) ? 5'd2 : 5'd1;
+                mon_exp = {u_dut.u_bsc.e_addr[28:0], u_dut.u_bsc.e_write,
+                           u_dut.u_bsc.e_size,       u_dut.u_bsc.e_burst,
                            mon_exp_len, 1'b0};
             end
             else begin
@@ -983,6 +1040,7 @@ always @(posedge clk) begin
             end
         end
         mon_ordbusy_z = u_dut.u_bsc.ord_busy;    //updated last: rise detect above
+        mon_engtk_z   = u_dut.u_bsc.eng_start_tk && !u_dut.u_bsc.dsp_mrs;
     end
 end
 
@@ -3187,7 +3245,7 @@ task automatic test_sdram_latency;
         @(posedge clk);
         $display("      [LAT] auto-precharge: %0d retires / %0d cycles", bench_retires, bench_arch_cycles);
         chk("read data (AP phase)", gpr(3), 32'h1A7E_2C00);
-        chk("AP 16-load cycles", bench_arch_cycles, 32'd455);  //relocked 2026-07-07 (BSC Group A)
+        chk("AP 16-load cycles", bench_arch_cycles, 32'd455);  //relocked 2026-08-05 (reads park again: BOARDTAP DQ capture)
         //phase 2: bank-active, same row - 16 row-hit loads
         eidx = 0;
         emit_sdram_init(16'h50B8, 16'hFFDF, 32'hFFFF_E880);
@@ -3204,7 +3262,7 @@ task automatic test_sdram_latency;
         @(posedge clk);
         $display("      [LAT] bank-active row-hit: %0d retires / %0d cycles", bench_retires, bench_arch_cycles);
         chk("read data (BA phase)", gpr(3), 32'h1A7E_2C00);
-        chk("BA 16-load cycles", bench_arch_cycles, 32'd423);  //relocked 2026-07-07 (BSC Group A)
+        chk("BA 16-load cycles", bench_arch_cycles, 32'd423);  //relocked 2026-08-05 (reads park again: BOARDTAP DQ capture)
         end_test;
     end
 endtask
@@ -3269,7 +3327,7 @@ task automatic bench_ipc_sdram;
                      ((bench_retires * 1000) / bench_arch_cycles) % 1000);
         chk("SDRAM cached loop R3", gpr(3), 32'd100);
         chk("SDRAM cached retires (incl. boot)",     bench_retires,     32'd1311); //relocked 2026-07-05 (fetch-leak fix)
-        chk("SDRAM cached arch-cycles (incl. boot)", bench_arch_cycles, 32'd1721);  //relocked 2026-08-03 (shadow-swap CCR.CF: walk gone)
+        chk("SDRAM cached arch-cycles (incl. boot)", bench_arch_cycles, 32'd1721);  //relocked 2026-08-05 (reads park again; write dispatch-on-accept kept)
         end_test;
     end
 endtask
@@ -5349,7 +5407,7 @@ task automatic test_dmac_gating;
 endtask
 
 task automatic test_dmac_bus_modes;
-    integer idx, sent, c;
+    integer idx, sent, c, idle_beat;
     begin
         begin_test("DMAC bus modes: DME->TE duration laws, burst locks the CPU out vs cycle-steal");
         //phase A: cycle-steal, 8 longs, sentinel fetches interleave
@@ -5363,9 +5421,17 @@ task automatic test_dmac_bus_modes;
         do_reset;
         c = 0;
         while(!u_dut.u_dmac.dme && c < 30000) begin @(posedge clk); c = c + 1; end
-        c = 0;
-        while(!u_dut.u_dmac.u_ch0.te && c < 30000) begin @(posedge clk); c = c + 1; end
+        //no-idle-beat law (latency-insensitive): with the request standing, the
+        //sequencer never passes S_IDLE between units - a steal boundary is
+        //GAP -> grant at its exit edge (fig 11.12 keeps the one yield cycle)
+        c = 0; idle_beat = 0;
+        while(!u_dut.u_dmac.u_ch0.te && c < 30000) begin
+            @(posedge clk); c = c + 1;
+            if(!u_dut.u_dmac.u_ch0.te && u_dut.u_dmac.seq == 3'd0 &&
+               u_dut.u_dmac.u_ch0.tcr != 24'd8) idle_beat = 1;
+        end
         chk("cycle-steal 8-long DME->TE law", c[31:0], 32'd94);
+        chk("cycle-steal resumes without S_IDLE beats", idle_beat[31:0], 32'd0);
         //phase B: same transfer in burst - CPU locked out, much shorter
         clear_imem; clear_dmem;
         eidx = 0;
@@ -5378,9 +5444,16 @@ task automatic test_dmac_bus_modes;
         do_reset;
         c = 0;
         while(!u_dut.u_dmac.dme && c < 30000) begin @(posedge clk); c = c + 1; end
-        c = 0;
-        while(!u_dut.u_dmac.u_ch0.te && c < 30000) begin @(posedge clk); c = c + 1; end
+        //burst chain law: units grant back-to-back at the completion edge
+        //(figs 11.13/11.23) - S_IDLE mid-run means the chain regressed
+        c = 0; idle_beat = 0;
+        while(!u_dut.u_dmac.u_ch0.te && c < 30000) begin
+            @(posedge clk); c = c + 1;
+            if(!u_dut.u_dmac.u_ch0.te && u_dut.u_dmac.seq == 3'd0 &&
+               u_dut.u_dmac.u_ch0.tcr != 24'd8) idle_beat = 1;
+        end
         chk("burst 8-long DME->TE law", c[31:0], 32'd66);
+        chk("burst chains without S_IDLE beats", idle_beat[31:0], 32'd0);
         end_test;
     end
 endtask
@@ -6043,6 +6116,75 @@ function automatic logic [31:0] lane_put(input logic [31:0] old, input logic [31
     end
 endfunction
 
+/*
+    CV1k silicon calibration golden (scope capture 2026-08 + cv1k_config.csv):
+    the game's EXACT register programming (identical across every CV1k title)
+    + a byte-size dual-address burst DMA from the 8-bit 3-wait area 4 ("NAND
+    data window") into the area-3 SDRAM. The LA-measured law, locked on the
+    pins per steady-state unit:
+      T1 | read = T1+3Tw+T2 (5) | idle | ACTV | tRCD nop | WRIT | idle | next T1
+    unit pitch = EXACTLY 10 CKIO. Refresh off (RTCSR unprogrammed) - the
+    refresh splice law waits for its own capture.
+*/
+task automatic test_dmac_cv1k_pitch;
+    integer sent, c, i, k, ok;
+    begin
+        begin_test("CV1k golden: byte dual burst area4(8-bit,3w)->SDRAM, pitch law 10 CKIO");
+        raw_mode = 1;
+        raw4_8en = 1'b1;
+        clear_imem; clear_dmem;
+        //16 source bytes on the area-4 device (phys 0x1000_0100 -> dmem 0x40)
+        for(i = 0; i < 4; i = i + 1)
+            dmem[16'h0040 + i] = 32'h1BAD_C0DE + i * 32'h0101_0101;
+        eidx = 0;
+        //the game's BSC programming, cv1k_config.csv values verbatim
+        emit_wreg_w(32'hFFFF_FF62, 16'h39F0);               // BCR2: A4=8-bit, A3=32-bit
+        emit_wreg_w(32'hFFFF_FF64, 16'h9551);               // WCR1: WAITSEL + 1-idle codes
+        emit_sdram_init(16'h543C, 16'hFDD7, 32'hFFFF_E880); // MCR/WCR2 + SDMR CL2/BL2
+        emit_wreg_w(32'hFFFF_FF60, 16'hC008);               // BCR1: CSV value (adds PULA/PULD)
+        //DMAC ch0: byte units, inc/inc, auto-request, BURST
+        emit_poke_l(32'hA400_0020, 32'h1000_0100);          // SAR0 = area 4
+        emit_poke_l(32'hA400_0024, 32'h0C00_0400);          // DAR0 = area 3 SDRAM
+        emit_poke_l(32'hA400_0028, 32'h0000_0010);          // DMATCR0 = 16 bytes
+        emit_poke_l(32'hA400_002C, 32'h0000_5421);          // CHCR0: inc/inc auto burst byte DE
+        emit_wreg_w(32'hA400_0060, 16'h0001);               // DMAOR: DME - transfer starts
+        emit_sentinel_loop(eidx, sent);
+        do_reset;
+        c = 0;
+        while(!u_dut.u_dmac.dme && c < 60000) begin @(posedge clk); c = c + 1; end
+        pitch_clr = 1'b1; run_cycles(4); pitch_clr = 1'b0;  //boot/MRS noise dropped
+        c = 0;
+        while(!u_dut.u_dmac.u_ch0.te && c < 60000) begin @(posedge clk); c = c + 1; end
+        run_cycles(64);                                     //engine tail drains
+        //event census: burst holds the CPU off, refresh off - DMA events only
+        chk("16 area-4 read launches",  pitch_n1[31:0], 32'd16);
+        chk("16 ACTV + 16 WRIT",        pitch_na[31:0] * 32 + pitch_nw[31:0], 32'd528);
+        //the measured law over steady-state units 3-14
+        ok = 1;
+        for(k = 3; k < 15; k = k + 1) begin
+            if(pitch_t1[k+1] - pitch_t1[k] != 10) ok = 0;
+            if(pitch_ta[k]   - pitch_t1[k] != 6)  ok = 0;
+            if(pitch_tw[k]   - pitch_t1[k] != 8)  ok = 0;
+        end
+        if(ok != 1) begin
+            for(k = 3; k < 15; k = k + 1)
+                $display("      unit %0d: pitch=%0d actv=+%0d writ=+%0d", k,
+                         pitch_t1[k+1] - pitch_t1[k], pitch_ta[k] - pitch_t1[k],
+                         pitch_tw[k] - pitch_t1[k]);
+        end
+        chk("anatomy: read5 | idle | ACTV | nop | WRIT | idle = 10 CKIO", ok[31:0], 32'd1);
+        //data truth: the 16 bytes landed in the Micron image (backdoor)
+        ok = 1;
+        for(i = 0; i < 4; i = i + 1)
+            if(u_sdram.Bank0[sd_index(32'h0C00_0400 + i * 4)] !==
+               32'h1BAD_C0DE + i * 32'h0101_0101) ok = 0;
+        chk("Micron image: 16 bytes exact", ok[31:0], 32'd1);
+        raw_mode = 0;
+        raw4_8en = 1'b0;
+        end_test;
+    end
+endtask
+
 task automatic test_dmac_random_diff;
     integer r, i, k, sent, mism, ch, ts, sm, dm, tm, cnt, s, maxu, slot_s, slot_d;
     logic   [31:0]  sar0, dar0, sa, da, datum, regbase;
@@ -6522,6 +6664,9 @@ initial begin
     test_hold_defer_boot;
     test_hold_torture;
     test_hold_tas_dmac;
+
+    group("20b. CV1k silicon calibration (LA capture 2026-08 + cv1k_config.csv)");
+    test_dmac_cv1k_pitch;
 
     group("21. Board-bus shape monitors (whole run)");
     test_bus_monitors;

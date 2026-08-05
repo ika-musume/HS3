@@ -1081,3 +1081,50 @@ restored T/S/M/Q.
 - Sim gates: cpu_core_tb 122/122, HS3_tb 89/89; IPC 0.401/0.974/0.554 with
   identical retire/cycle counts; three HS3_tb whole-run laws relocked -248/-256
   (the flush walk itself). Flush cost measured: ~258 -> 2 cycles.
+
+## 2026-08-04 — OOC verdict for the DMAC chain + BSC dispatch-on-accept + tail release
+
+- Change shape: dmac.sv unified grant (S_IDLE / GAP-exit / completion-edge
+  chain, ch_req_g last-unit mask, ch_sar_nx/ch_dar_nx same-channel forward);
+  bsc.sv dsp_* parked/live dispatch muxes into the E_IDLE arm + twins,
+  eng_start_tk on disp_v, eng_pins_busy (tail release: E_RD_TPC +
+  E_WR_TRWL/TPC after eng_wtail_z) in the gen ready + mon_etailf flat EREQ
+  mirror, eng_wr_done_z turn-stamp correction.
+- 3-seed re-measure (HS3 rig, sta.rpt mtimes fresh 2026-08-04 23:37-23:45):
+  s1 -2.671 / 78.92, s5 -2.648 / 79.50, s7 -3.185 / 76.24. Mean -2.83,
+  inside the rig's documented family band (-2.1..-3.4).
+- Cone scan: eng_pins/eng_wtail/eng_wr_done_z/dsp_*/mon_etailf/ch_req_g/
+  sar_gw/dar_gw/chain_ok/grant_eval/*_nx in ZERO lines of all three FULL
+  critical_paths.rpt files (not just endpoints - no new net appears anywhere
+  in any top-20 path). Worst endpoints are the pre-existing classes only:
+  mon_pk_cls EREQ-package wall (s1/s5/s7), int_pipe r_t forwarding (s1),
+  cache FSM state~56 (s5), o_TEA export (s1).
+  NEUTRAL — CLEARED TO LAND.
+- Sim gates: HS3_tb 90/90 incl. the new CV1k golden (game-verbatim CSV
+  registers, byte dual burst area4 8-bit/3-wait -> SDRAM: pitch = 10 CKIO,
+  ACTV = T1+6, WRIT = T1+8, Micron image exact — the LA-measured silicon
+  law met by mechanism). 3 laws relocked: AP16 455->447, BA16 423->391
+  (-1 CKIO/op dispatch beat), boot 1721->1695.
+
+## 2026-08-05 — OOC verdict for the disp_live read-park qualifier (BOARDTAP fix)
+
+- Change shape: one qualifier on the BSC live-dispatch rail —
+  disp_live = !eng_go && fe_eng_start && (I_BUS.req_write || fe_sdmr)
+  (bsc.sv:1598). Writes/MRS keep accept-edge dispatch; reads park in eng_go
+  as pre-2026-08-04. Root cause: live CS3 read dispatch pulled the DQ
+  capture rise onto the first edge the transport presents data (one c102
+  edge instead of two) — CV1k BOARDTAP arm boot hang; core-side fix
+  validated by the CV1k session (datum 5167cb8a, BOARDTAP bit-identical).
+- 3-seed re-measure (HS3 rig, reports fresh 2026-08-05 11:55):
+  s1 -2.717 / 78.63, s5 -2.815 / 78.03, s7 -2.665 / 78.96. Mean -2.73 vs
+  the package's 2026-08-04 trio mean -2.83 and the -2.920 frozen baseline;
+  all inside the family band (-2.1..-3.4). s7's +0.52 swing is the usual
+  placement-coupled mon_pk seesaw, not signal.
+- Cone scan: disp_live / dsp_* / u_bsc in ZERO lines of all three FULL
+  critical_paths.rpt files. Worst endpoints all pre-existing classes:
+  mon_pk_cls EREQ-package wall (all seeds), byp_q, pair_inst, fetch_pc.
+  NEUTRAL — CLEARED TO LAND.
+- Sim gates: HS3_tb 90/90; 3 read laws relocked BACK to pre-dispatch
+  values bit-exact (AP16 447->455, BA16 391->423, boot 1695->1721 —
+  measured counts matched the old locks exactly = clean read-leg revert).
+  Write-side laws (CV1k golden pitch 10, ACTV=T1+6) unmoved.

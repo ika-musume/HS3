@@ -52,7 +52,12 @@ module dmac_channel #(
     output  wire    [31:0]  o_SAR,
     output  wire    [31:0]  o_DAR,
     output  wire    [23:0]  o_TCR,
-    output  wire    [31:0]  o_CHCR
+    output  wire    [31:0]  o_CHCR,
+
+    /* POST-UNIT VIEWS - what SAR/DAR become if i_UPD fires this edge; the
+       sequencer's completion-edge re-grant needs them (fig 11.23 chain) */
+    output  wire    [31:0]  o_SAR_NX,
+    output  wire    [31:0]  o_DAR_NX
 );
 
 ///////////////////////////////////////////////////////////
@@ -189,6 +194,10 @@ assign  o_SAR  = sar;
 assign  o_DAR  = dar;
 assign  o_TCR  = tcr;
 assign  o_CHCR = {11'd0, di, ro, rl, am, al, dm, sm, rs, 1'b0, ds, tm, ts, ie, te, de};
+
+//post-unit values: the same nets the i_UPD arm writes (reload included)
+assign  o_SAR_NX = sar_reload ? sar_init : sar_nx;
+assign  o_DAR_NX = dar_nx;
 
 endmodule
 
