@@ -552,6 +552,8 @@ integer         lbus_drsp_pends  = 0;
 integer         lbus_drsp_viol   = 0;       //D-response mutated/lost while unconsumed
 integer         mbus_req_pends   = 0;
 integer         mbus_req_viol    = 0;       //external request mutated/withdrawn while pending
+integer         mbus_ifetch_acc  = 0;       //accepted external instruction fetches
+integer         mbus_ifetch_viol = 0;       //fetch requests not longword-aligned (real chip fetches 32 bits)
 
 integer         lbus_ifetch_acc  = 0;       //accepted L-bus FETCH requests (pair-law probe)
 
@@ -919,6 +921,13 @@ always @(posedge clk) begin
 
         if(u_dut.LBUS_PIPE.req_valid && u_dut.LBUS_PIPE.req_ready && u_dut.LBUS_PIPE.req_fetch)
             lbus_ifetch_acc = lbus_ifetch_acc + 1;
+
+        //MEM-bus fetch alignment contract: an uncached fetch at an odd halfword PC must still
+        //issue the ALIGNED longword (a 16-bit area walks halfwords from the given address).
+        if(MEM_BUS.req_valid && MEM_BUS.req_ready && !req_is_data) begin
+            mbus_ifetch_acc = mbus_ifetch_acc + 1;
+            if(MEM_BUS.req_addr[1:0] != 2'b00) mbus_ifetch_viol = mbus_ifetch_viol + 1;
+        end
 
         mb_pend_z  = MEM_BUS.req_valid && !MEM_BUS.req_ready;
         mb_addr_z  = MEM_BUS.req_addr;
@@ -4046,6 +4055,8 @@ task automatic test_property_summary;
         chk("L-bus D-request stability violations", lbus_dreq_viol[31:0], 32'd0);
         chk("L-bus D-response hold violations",     lbus_drsp_viol[31:0], 32'd0);
         chk("MEM-bus request stability violations", mbus_req_viol[31:0],  32'd0);
+        chk_true("MEM-bus fetch alignment exercised",  mbus_ifetch_acc > 1000);
+        chk("MEM-bus unaligned fetch requests",        mbus_ifetch_viol[31:0], 32'd0);
         chk_true("locked-pair law exercised",       lock_pairs_checked > 50);
         chk("locked-pair violations",               lock_pair_viol[31:0], 32'd0);
         chk_true("interrupt-ack law exercised",     ack_checks > 100);

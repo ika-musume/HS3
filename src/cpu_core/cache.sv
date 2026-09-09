@@ -814,8 +814,12 @@ assign  I_BUS.req_write = (state == S_STORE_REQ) || (state == S_DRAIN_REQ) ||
                             (state == S_DBYP_REQ && cur_write);
 assign  I_BUS.req_size  = (state == S_DBYP_REQ || state == S_STORE_REQ) ? cur_size : 2'd2;
 assign  I_BUS.req_burst = st_fill || (state == S_DRAIN_REQ);    //line-aligned 4-beat fill/drain
+//Non-cacheable fetch issues the ALIGNED longword (the real chip fetches 32 bits per
+//external access, p.283 16-bit tables): the odd halfword is picked by cur_addr[1] on
+//the response. Sending the odd PC itself made a 16-bit walk start one halfword late.
 assign  I_BUS.req_addr  = st_fill                ? (fill_base + {28'd0, fill_word, 2'b00}) :
-                            (state == S_DRAIN_REQ) ? {wb_pa, wb_drain_word, 2'b00} : cur_addr;
+                            (state == S_DRAIN_REQ) ? {wb_pa, wb_drain_word, 2'b00} :
+                            (state == S_IBYP_REQ)  ? {cur_addr[31:2], 2'b00} : cur_addr;
 assign  I_BUS.req_wdata = (state == S_DRAIN_REQ) ? wb_data[wb_drain_word] : cur_wdata;
 assign  I_BUS.req_wstrb = st_fill                ? 4'b0000 :
                             (state == S_DRAIN_REQ) ? 4'b1111 : cur_wstrb;

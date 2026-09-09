@@ -112,7 +112,9 @@ access, p.454). Mechanically:
   halfword-reuse buffer (`ibyp_buf_*` in `cache.sv`) that serves the sibling of a
   non-cacheable longword read without a second external transaction. The buffer
   mirrors memory — loaded only from fault-free reads, blanket-invalidated on any
-  external write.
+  external write. The external request always carries the **longword-aligned**
+  address (A1:A0 = 00) even for a fetch at an odd halfword PC, as on the real chip;
+  the odd opcode is selected from the response.
 - A wrong-path outstanding fetch is marked by a sticky **drop flag** (`fetch_drop`)
   written at every kill/accept edge and consumed when the stale response arrives
   (consume-and-discard, so the single fetch slot can never wedge). The flag's
