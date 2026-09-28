@@ -1128,3 +1128,64 @@ restored T/S/M/Q.
   values bit-exact (AP16 447->455, BA16 391->423, boot 1695->1721 —
   measured counts matched the old locks exactly = clean read-leg revert).
   Write-side laws (CV1k golden pitch 10, ACTV=T1+6) unmoved.
+
+## 2026-09-29 — Early branch target fetch (taken-branch bubble removal)
+
+- Trigger: the CV1000 benchmark twins (`+cv1k` in both tbs) measured every taken
+  branch at one bubble more than the SW manual (chase loop 7.0 clk/step = the
+  MiSTer figure; PCB 6.0). Root: the target request fired the cycle AFTER the
+  redirect, and the 2-cycle pipelined IF made redirect-to-EX 4 slots vs 3.
+- Change shape (int_pipe.sv, agu.sv, int_pipe_pkg.sv): a taken branch in EX
+  presents its target on the L bus in its own EX cycle. Target rides the AGU
+  base/addend legs like a PC-relative load EA (ID loads base 0 / Rn+lanes / PR /
+  SPC and addend target / pc+4; pd bits bpc/bctl; idex.br_mode; agu_en_mode FORCE
+  for addr_op NONE branches) - no new mux level on the cache address cone; only
+  i_USE_BASE / i_EN_MODE gain a term. Fetch state: tgt_pend (tagged, never dropped
+  by its own redirect), tgt_open (held in the cache until the redirect edge),
+  fpc_lag (fetch_pc lags the fetched target by 2; +2 folded into AGU Y bit 1 and
+  the index twin), tgt_kill (stale r_t across a byte-RMW evaluate slot), delayed
+  branches fire only with the slot in IF/ID, EA2 hold-load -> late path.
+- Cycle laws: chase 7.0 -> 6.0 (PCB-exact); BF/S+BRA 1 bubble, BF 2 bubbles
+  (manual-exact); IPC 0.401 / 0.974->0.982 / 0.554->0.564; COPY32 86 -> 82.0
+  clk/16 B with a 5-instruction hand loop; with the benchmark's REAL 8-instruction
+  loop and the IPL's bus registers (disassembled 2026-09-29) it is 95.1 -> 93.3
+  clk/16 B = 17.5 MB/s vs the PCB's 20.1 (81.1..81.5 clk) - a real ~14% memory-path
+  gap that the early-target fix does not address. 7 whole-run laws relocked, every
+  one FEWER cycles.
+  Suites: cpu_core_tb 122/122, HS3_tb 90/90.
+- Fresh baseline trio (current RTL, HS3 rig, 2026-09-29 02:12): s1 -2.354,
+  s5 -2.652, s7 -2.933 (mean -2.65; classes fwd_shadow_b/mawb.gpr* ->
+  fetch_pending_pc, fwd_lane_a_agu -> o_TEA).
+- Round 1 (select = 2 LUT levels reading the SHARED r_t / ifid.valid): s1 -3.269,
+  s5 -2.977, s7 -2.999 (mean -3.08, -0.43). s5/s7 top-20 carry zero new nets;
+  s1 shows a NEW class r_t -> br_spec_agu -> use_base_agu -> AGU bit 0 ->
+  address_error -> i_rsp_ready -> cache state (80 top-20 lines): r_t placed at
+  the ALU cluster (X13) 1.07 ns of route from the AGU (X28), plus one extra LUT.
+- Round 2 (lever 2, localize + flatten): (* preserve *) r_t_agu/idx and
+  ifid_valid_agu/idx copies; the own-base and fired-once conditions fold INTO
+  the branch-class copies (br_mode_q/agu/idx clear on EA2 hold-load and on
+  tgt_fire), so use_base_agu is one LUT of AGU-local flops. Original expression
+  kept as a sim reference, asserted equal every cycle. cpu_core_tb 122/122,
+  HS3_tb 90/90, cycle laws identical to round 1.
+- 5-seed measure (HS3 rig, 2026-09-29, reports fresh 04:xx-06:xx):
+    seed      base      round 2
+    s1      -2.354     -3.933   (base class fwd_wbsel_a_agu -> cache state, longer routes; NO new net on it)
+    s3      -2.966     -2.872
+    s4      -2.676     -2.739
+    s5      -2.652     -2.861   (path #13 -2.800 = r_t_agu -> br_spec_agu -> AGU Y gate -> address_error
+                                 -> idex_allow -> i_req_fire -> mon_pk_cls: the new select launching into
+                                 the pre-existing lane cone at the SAME depth - co-leads, does not deepen)
+    s7      -2.933     -2.759
+    mean    -2.716     -3.033   median -2.676 vs -2.861
+  Cone scan: new nets (br_mode*/br_spec*/use_base*/tgt_*/fpc_lag*/r_t_agu|idx/
+  ifid_valid_agu|idx/fetch_pc_eff) in 1 of 100 top-20 lines across the five round-2
+  fits (the s5 path above). Class structure unchanged (lanes -> AGU -> address_error
+  -> idex_allow / i_rsp_ready -> cache state / o_TEA / fetch_pending_pc / mon_pk).
+  Delta on the median -0.19, inside the documented plateau tax (-0.3..-0.7 hits every
+  change shape) and the identical-RTL family band (-2.1..-3.9); the s1 -3.93 is the
+  family band's floor on a pre-existing class. NEUTRAL - CLEARED TO LAND (one bubble
+  per taken branch bought for no structural timing cost; round 1's 2-level shared-r_t
+  select was the measured negative and is gone).
+- Remaining lever if the s5 co-lead ever heads the list: register the armed class
+  (br_fire_q <= f(next-state of br_mode/r_t/tgt/ifid.valid)) so use_base reads one
+  flop - a deep 1-bit D on the idex_allow/id_issue cone, not tried.

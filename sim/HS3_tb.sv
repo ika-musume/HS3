@@ -1952,7 +1952,7 @@ task automatic bench_ipc_cached(input integer body, input integer iters);
         //Relocked 2026-07-05: the wrong-path fetch-leak fix (int_pipe drop_d) removed
         //~1 bogus retire per taken branch; cycle count unchanged (same real work).
         chk("cached retires (parity)",     bench_retires,     32'd1137);
-        chk("cached arch-cycles (parity)", bench_arch_cycles, 32'd1167);
+        chk("cached arch-cycles (parity)", bench_arch_cycles, 32'd1157);  //relocked 2026-09-29 (early branch target); was 1167
         do_reset;
     end
 endtask
@@ -1998,7 +1998,7 @@ task automatic bench_ipc_store(input integer nstores, input integer iters);
         //Relocked 2026-07-05 (fetch-leak fix): the old 827-cycle figure was TRUNCATED -
         //a leaked wrong-path sentinel retire ended the measurement window early.
         chk("store retires (parity)",     bench_retires,     32'd415);
-        chk("store arch-cycles (parity)", bench_arch_cycles, 32'd748);
+        chk("store arch-cycles (parity)", bench_arch_cycles, 32'd736);  //relocked 2026-09-29 (early branch target); was 748
         do_reset;
     end
 endtask
@@ -3267,6 +3267,162 @@ task automatic test_sdram_latency;
     end
 endtask
 
+
+///////////////////////////////////////////////////////////
+//////  CV1000 Benchmark Twins (real-silicon calibration, +cv1k)
+////
+
+//CPU MEMORY twin: two 64 KB P0 SDRAM buffers (4x the 16 KB cache) streamed
+//through the copy-back cache (CCR=CE|CF, WT=0). Two passes are run and only
+//pass 2 is timed, so the dirty lines pass 1 leaves in the cache are evicted
+//inside the window (steady state, as the 3-second benchmark loop sees it).
+//  kind 0 = COPY32  mov.l @r4+,r0 / mov.l r0,@r5 / dt r6 / bf.s / add #4,r5
+//  kind 1 = MEMCPY  byte-wise copy, same shape (mov.b, add #1)
+//  kind 2 = FILL32  mov.l r0,@r5 / dt r6 / bf.s / add #4,r5
+//PCB COPY32 = 20.1 MB/s at 102.4 MHz (MiSTer 16.1, MAME 14.7).
+//32-bit constant into Rn from SDRAM code: MOV #0,R0 then 4x (SHLL8 R0; OR #byte,R0), MOV R0,Rn.
+//(Unrolled: Verilator 5.032 faults on a constant-bound loop that calls emit_sd.)
+task automatic emit_sd_const(input integer rn, input logic [31:0] v);
+    begin
+        emit_sd(16'hE000);                                  // MOV   #0,R0
+        emit_sd(16'h4018); emit_sd(16'hCB00 | {8'd0, v[31:24]});  // SHLL8 R0; OR #byte,R0
+        emit_sd(16'h4018); emit_sd(16'hCB00 | {8'd0, v[23:16]});
+        emit_sd(16'h4018); emit_sd(16'hCB00 | {8'd0, v[15:8]});
+        emit_sd(16'h4018); emit_sd(16'hCB00 | {8'd0, v[7:0]});
+        emit_sd(16'h6003 | (rn[3:0] << 8));                 // MOV   R0,Rn
+    end
+endtask
+
+//CPU MEMORY twin - the CV1000 benchmark's OWN loops, transcribed from the ibara
+//benchmark ROM (u4, byte-swapped; ROM 0x53cc/0x53b0/0x15fc, RAM base +0x2dc4):
+//  COPY32  B->A : add #4,r2 / mov r2,r7 / add #-64,r7 / mov.l @(60,r7),r7 / dt r1 /
+//                 mov.l r7,@r3 / bf.s / add #4,r3        (8 instr, load-use pair)
+//  MEMCPY  A->B : add #1,r5 / mov r5,r0 / add #-16,r0 / mov.b @(15,r0),r0 / dt r6 /
+//                 mov.b r0,@r1 / bf.s / add #1,r1          (the SDK's bytewise memcpy)
+//  FILL32  B    : add #4,r2 / mov r2,r3 / add #-64,r3 / dt r1 / bf.s / mov.l r4,@(60,r3)
+//A = 0x8C291A98, B = 0x8C2B1A98 (P1, 128 KB each, the ROM's own addresses), CCR =
+//CE|CB|CF (P1 copy-back, as the SDK runs it). One pass = COPY32, MEMCPY, FILL32 - the
+//benchmark's order - timed per phase; pass 2 is measured so pass 1's dirty lines are
+//evicted inside the window. The benchmark prints bytes*1e6/us / 1e5 truncated to tenths
+//(MB = 1e6, time = TMU2 ticks calibrated to 8 vblanks = 133.28 ms).
+//PCB: COPY32 20.1 MB/s (= 81.1..81.5 clk/16 B at 102.4 MHz), MiSTer 16.1, MAME 14.7.
+//NOTE: the MON oracle prints six "head mismatch got len 4 / exp len 2" lines here: the
+//first miss of each phase enters its line at offset 8 and the fill WRAPS from the
+//missed word (p.110); the oracle's remaining-beats formula (written for resumes) does
+//not model a wrapped head. Pre-existing, tb-only (same six on the pre-early-target RTL).
+integer cv1k_mark [0:5];        //retire indices: pass-1/2 x {COPY32, MEMCPY, FILL32} starts
+task automatic emit_cv1k_pass(input integer pass, input logic [7:0] fillv);
+    integer loop_h, bf_h, disp;
+    begin
+        //COPY32: r2 = B (load side), r3 = A (store side), r1 = 0x8000 longwords
+        cv1k_mark[pass*3 + 0] = eidx;
+        emit_sd_const(2, 32'h8C2B_1A98);
+        emit_sd_const(3, 32'h8C29_1A98);
+        emit_sd_const(1, 32'h0000_8000);
+        loop_h = eidx;
+        emit_sd(16'h7204);                          // ADD   #4,R2
+        emit_sd(16'h6723);                          // MOV   R2,R7
+        emit_sd(16'h77C0);                          // ADD   #-64,R7
+        emit_sd(16'h577F);                          // MOV.L @(60,R7),R7
+        emit_sd(16'h4110);                          // DT    R1
+        emit_sd(16'h2372);                          // MOV.L R7,@R3
+        bf_h = eidx; disp = loop_h - bf_h - 2;
+        emit_sd(16'h8F00 | (disp & 8'hFF));         // BF/S  loop
+        emit_sd(16'h7304);                          // ADD   #4,R3 (slot)
+        //MEMCPY: r1 = B (dst), r5 = A (src), r6 = 0x20000 bytes
+        cv1k_mark[pass*3 + 1] = eidx;
+        emit_sd_const(1, 32'h8C2B_1A98);
+        emit_sd_const(5, 32'h8C29_1A98);
+        emit_sd_const(6, 32'h0002_0000);
+        loop_h = eidx;
+        emit_sd(16'h7501);                          // ADD   #1,R5
+        emit_sd(16'h6053);                          // MOV   R5,R0
+        emit_sd(16'h70F0);                          // ADD   #-16,R0
+        emit_sd(16'h840F);                          // MOV.B @(15,R0),R0
+        emit_sd(16'h4610);                          // DT    R6
+        emit_sd(16'h2100);                          // MOV.B R0,@R1
+        bf_h = eidx; disp = loop_h - bf_h - 2;
+        emit_sd(16'h8F00 | (disp & 8'hFF));         // BF/S  loop
+        emit_sd(16'h7101);                          // ADD   #1,R1 (slot)
+        //FILL32: r2 = B, r1 = 0x8000, r4 = fill value
+        cv1k_mark[pass*3 + 2] = eidx;
+        emit_sd_const(2, 32'h8C2B_1A98);
+        emit_sd_const(1, 32'h0000_8000);
+        emit_sd(16'hE400 | {8'd0, fillv});          // MOV   #fillv,R4
+        loop_h = eidx;
+        emit_sd(16'h7204);                          // ADD   #4,R2
+        emit_sd(16'h6323);                          // MOV   R2,R3
+        emit_sd(16'h73C0);                          // ADD   #-64,R3
+        emit_sd(16'h4110);                          // DT    R1
+        bf_h = eidx; disp = loop_h - bf_h - 2;
+        emit_sd(16'h8F00 | (disp & 8'hFF));         // BF/S  loop
+        emit_sd(16'h134F);                          // MOV.L R4,@(60,R3) (slot)
+    end
+endtask
+
+task automatic bench_cv1k_mem;
+    integer i, guard, sent, c_copy, c_memcpy, c_fill, ms, ok, ph;
+    logic [31:0] w;
+    begin
+        begin_test("CV1000 CPU MEMORY twin: the benchmark's own COPY32/MEMCPY/FILL32 loops, 128 KB, P1 copy-back");
+        for(i = 0; i < 32768; i = i + 1) begin
+            sdram_poke(32'h0C29_1A98 + i*4, 32'h0000_0000);          //A
+            sdram_poke(32'h0C2B_1A98 + i*4, 32'hA500_0000 + i);      //B (COPY32 source)
+        end
+        eidx = 'h400;                               //code at P0/P1 phys 0x800
+        emit_cv1k_pass(0, 8'h11);
+        emit_cv1k_pass(1, 8'h22);
+        sent = eidx;
+        emit_sd(16'hE65A);                          // MOV   #0x5A,R6 (sentinel)
+        emit_sd(16'hAFFE);                          // BRA   self
+        emit_sd(16'h0009);                          // NOP
+        eidx = 0;
+        //the CV1000 IPL's own bus programming (ibara u4 ROM offset 0x20-0x44): MCR 0x543C
+        //(TPC 2, RCD 2, TRWL 2, TRAS 2, AMX 7, RFSH on), WCR2 0xFDD7 (area-3 CL 2), SDMR via
+        //0xFFFFE880, refresh RTCSR 0xA510 (CKS 010) / RTCOR 0x60
+        emit_sdram_init(16'h543C, 16'hFDD7, 32'hFFFF_E880);
+        emit_wreg_w(32'hFFFF_FF72, 16'hA560);        // RTCOR = 0x60
+        emit_wreg_w(32'hFFFF_FF6E, 16'hA510);        // RTCSR: CKS=010
+        imem[eidx] = 16'hE0EC; eidx = eidx + 1;     // MOV   #0xEC,R0    ; CCR
+        imem[eidx] = 16'hE10D; eidx = eidx + 1;     // MOV   #0x0D,R1    ; CE|CB|CF (P1 copy-back, = IPL's CCR 0x05 + flush)
+        imem[eidx] = 16'h2012; eidx = eidx + 1;     // MOV.L R1,@R0
+        emit_ldrn(2, 32'h8C00_0800);
+        imem[eidx] = 16'h422B; eidx = eidx + 1;     // JMP   @R2
+        imem[eidx] = 16'h0009; eidx = eidx + 1;
+        do_reset;
+        //pass 2, phase by phase: arm at each phase's start marker, stop at the next
+        guard = 0;
+        while(retire_count[cv1k_mark[3]] < 1 && guard < 8000000) begin @(posedge clk); guard = guard + 1; end
+        bench_arm = 1'b1; run_until_retire(cv1k_mark[4], 8000000); c_copy = bench_arch_cycles;
+        bench_arm = 1'b0; @(posedge clk);
+        bench_arm = 1'b1; run_until_retire(cv1k_mark[5], 8000000); c_memcpy = bench_arch_cycles;
+        bench_arm = 1'b0; @(posedge clk);
+        bench_arm = 1'b1; run_until_retire(sent, 8000000);         c_fill = bench_arch_cycles;
+        bench_arm = 1'b0; @(posedge clk);
+        for(ph = 0; ph < 3; ph = ph + 1) begin
+            i  = (ph == 0) ? c_copy : (ph == 1) ? c_memcpy : c_fill;
+            ms = (i * 100) / (131072 / 16);                       //clk per 16 B, x100
+            $display("  [CV1K] %s: %0d arch-cycles for 128 KB -> %0d.%02d clk per 16 B -> %0d.%01d MB/s @102.4MHz (bench print: %0d.%0d)",
+                     (ph == 0) ? "COPY32" : (ph == 1) ? "MEMCPY" : "FILL32", i, ms/100, ms%100,
+                     (102400 * 16 * 100 / (ms > 0 ? ms : 1)) / 1000,
+                     ((102400 * 16 * 100 / (ms > 0 ? ms : 1)) / 100) % 10,
+                     (102400 * 16 * 100 / (ms > 0 ? ms : 1)) / 1000,
+                     ((102400 * 16 * 100 / (ms > 0 ? ms : 1)) / 100) % 10);
+        end
+        //integrity: A = pass-1 fill (COPY32 of pass 2 copied fill 0x11 into A), B = pass-2 fill,
+        //sampled over the first 64 KB (beyond the cache's reach = written back)
+        ok = 1;
+        for(i = 0; i < 16384; i = i + 64) begin
+            w = sdram_peek(32'h0C29_1A98 + i*4); if(w !== 32'h0000_0011) ok = 0;
+            w = sdram_peek(32'h0C2B_1A98 + i*4); if(w !== 32'h0000_0022) ok = 0;
+        end
+        chk_true("A = pass-1 fill, B = pass-2 fill (written back)", ok == 1);
+        chk("sentinel reached", gpr(6), 32'h5A);
+        chk_true("no exception", !exc_seen);
+        end_test;
+    end
+endtask
+
 task automatic bench_ipc_sdram;
     integer idx, sent, j, hidx, loop_h, bf_h, disp;
     begin
@@ -3293,7 +3449,7 @@ task automatic bench_ipc_sdram;
                      ((bench_retires * 1000) / bench_arch_cycles) / 1000,
                      ((bench_retires * 1000) / bench_arch_cycles) % 1000);
         chk("SDRAM uncached retires (incl. boot)",     bench_retires,     32'd131);
-        chk("SDRAM uncached arch-cycles (incl. boot)", bench_arch_cycles, 32'd655);  //relocked 2026-07-07 (BSC Group A)
+        chk("SDRAM uncached arch-cycles (incl. boot)", bench_arch_cycles, 32'd651);  //relocked 2026-09-29 (early branch target); was 655 (2026-07-07 BSC Group A)
         //cached phase: add-loop (body 100, iters 12) at P1 0x8C000800, CCR on
         eidx = 'h400;
         emit_sd(16'hE50C);                          // MOV #12,R5
@@ -3327,7 +3483,7 @@ task automatic bench_ipc_sdram;
                      ((bench_retires * 1000) / bench_arch_cycles) % 1000);
         chk("SDRAM cached loop R3", gpr(3), 32'd100);
         chk("SDRAM cached retires (incl. boot)",     bench_retires,     32'd1311); //relocked 2026-07-05 (fetch-leak fix)
-        chk("SDRAM cached arch-cycles (incl. boot)", bench_arch_cycles, 32'd1721);  //relocked 2026-08-05 (reads park again; write dispatch-on-accept kept)
+        chk("SDRAM cached arch-cycles (incl. boot)", bench_arch_cycles, 32'd1711);  //relocked 2026-09-29 (early branch target); was 1721 (2026-08-05)
         end_test;
     end
 endtask
@@ -3435,8 +3591,8 @@ task automatic test_burst_rom;
         end
         $display("      [ROM] no-burst: %0d (%0d CS falls)   burst pitch: %0d (%0d CS falls)",
                  c_nb, f_nb, c_bst, f_bst);
-        chk("no-burst fill cycles", c_nb,  32'd731);  //relocked 2026-08-03 (shadow-swap CCR.CF:
-        chk("burst-ROM fill cycles", c_bst, 32'd695); //flush walk gone, -256 each; prev relock
+        chk("no-burst fill cycles", c_nb,  32'd712);  //relocked 2026-09-29 (early branch target; was 731 from 2026-08-03 shadow-swap CCR.CF:
+        chk("burst-ROM fill cycles", c_bst, 32'd676); //was 695; flush walk gone, -256 each; prev relock
                                                       //2026-07-09, burst envelope fig 10.30)
         chk_true("burst pitch is faster", c_bst < c_nb);
         //envelope law (p.304/fig 23.19): a burst-ROM line fill asserts CS0 ONCE
@@ -6531,6 +6687,16 @@ initial begin
     init_knobs;
     clear_imem;
     clear_dmem;
+
+    //+cv1k: CV1000 benchmark twins (real-silicon calibration points).
+    if($test$plusargs("cv1k")) begin
+        group("cv1k: CPU MEMORY twin (the benchmark's own loops vs Micron SDRAM)");
+        bench_cv1k_mem;
+        $display("");
+        if(errors == 0) $display("HS3_tb: PASS (cv1k subset)");
+        else            $display("HS3_tb: FAIL (cv1k subset, %0d errors)", errors);
+        $finish;
+    end
 
     group("1. Bring-up and IPC parity (splitter must add zero beats)");
     test_boot_smoke;

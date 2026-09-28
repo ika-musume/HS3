@@ -212,6 +212,11 @@ typedef struct packed {
     logic           apc;         //a-side PC override: ADDR_PC_WORD or ADDR_PC_LONG
     logic           pdec;        //ADDR_PREDEC (@-Rn store forms; b rides the -step)
     logic           gbrx;        //ADDR_GBR_INDEX (byte RMW @(R0,GBR); b rides a's pick)
+    //Fetch-time BRANCH-TARGET source class (sim-asserted vs id_decode.branch_op): the
+    //taken target rides the AGU base/addend legs like a PC-relative load address, so the
+    //target fetch can fire in the branch's own EX cycle (see int_pipe "early target").
+    logic           bpc;         //PC-relative branch (BT/BF/BT/S/BF/S/BRA/BSR): base 0, addend = target
+    logic           bctl;        //RTS/RTE: base = PR / SPC (control-register target)
 } pd_route_t;
 
 //IF/ID means the register between instruction-fetch and instruction-decode stages.
@@ -266,6 +271,7 @@ typedef struct packed {
     byte_op_t       byte_op;        //memory byte test or modification
     logic           is_data;        //= valid && mem_op!=NONE, PRE-DECODED in ID; AGU time-share select (off the mem_op decode)
     logic   [1:0]   agu_en_mode;    //AGU addend gate, PRE-DECODED in ID (0 NULL: REG/POSTINC/MAC; 1 FORCE: disp/index/predec); off the EX addr_op decode
+    logic   [1:0]   br_mode;        //early-target class, PRE-DECODED in ID: 0 none, 1 always taken, 2 taken on T, 3 taken on !T
 
     //Control-flow controls consumed by the branch circuit
     branch_op_t     branch_op;
@@ -638,6 +644,11 @@ function automatic pd_route_t pd_route(input logic [15:0] inst);
         pd_route.pdec = (hi == 4'h2 && (lo == 4'h4 || lo == 4'h5 || lo == 4'h6)) ||
                         (hi == 4'h4 && lo == 4'h2 && inst[7:4] <= 4'h2) ||
                         (hi == 4'h4 && lo == 4'h3 && (inst[7] || inst[7:4] <= 4'h4));
+        //bpc: BT (8.9) / BF (8.B) / BT/S (8.D) / BF/S (8.F) / BRA (A) / BSR (B) - the ID
+        //immediate is the full target. bctl: RTS (000B) / RTE (002B) - PR / SPC base.
+        pd_route.bpc  = (hi == 4'h8 && (nn == 4'h9 || nn == 4'hB || nn == 4'hD || nn == 4'hF)) ||
+                        hi == 4'hA || hi == 4'hB;
+        pd_route.bctl = (inst == 16'h00_0B) || (inst == 16'h00_2B);
     end
 endfunction
 

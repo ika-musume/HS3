@@ -796,6 +796,16 @@ always @(posedge clk) begin
         $display("        [trace %0t] EXC cause=%0d pc=%08h aaddr=%08h wr=%b slot=%b inst_at_pc=%04h",
                  $time, exc_cause, exc_pc, exc_access_addr, exc_access_write,
                  exc_in_delay_slot, imem[exc_pc[11:1]]);
+    if(dbg_trace && (u_dut.u_int_pipe.i_req_fire || u_dut.u_int_pipe.if_accept ||
+                     u_dut.u_int_pipe.branch_redirect || u_dut.u_int_pipe.i_REDIRECT_VALID))
+        $display("        [trace %0t] IF  fire=%b tgt=%b addr=%08h | acc=%b drop=%b pend=%b/%08h tgtp=%b lag=%b fpc=%08h | brdir=%b ext=%b ifid=%b/%08h pair=%b spec=%b own=%b", $time,
+                 u_dut.u_int_pipe.i_req_fire, u_dut.u_int_pipe.tgt_fire, u_dut.LBUS_PIPE.req_addr,
+                 u_dut.u_int_pipe.if_accept, u_dut.u_int_pipe.fetch_drop,
+                 u_dut.u_int_pipe.fetch_pending, u_dut.u_int_pipe.fetch_pending_pc,
+                 u_dut.u_int_pipe.tgt_pend, u_dut.u_int_pipe.fpc_lag, u_dut.u_int_pipe.fetch_pc,
+                 u_dut.u_int_pipe.branch_redirect, u_dut.u_int_pipe.i_REDIRECT_VALID,
+                 u_dut.u_int_pipe.ifid.valid, u_dut.u_int_pipe.ifid.pc, u_dut.u_int_pipe.pair_ready,
+                 u_dut.u_int_pipe.br_spec, u_dut.u_int_pipe.agu_base_own);
     if(dbg_trace && u_dut.u_int_pipe.ex_advance)
         $display("        [trace %0t] EX  pc=%08h inst=%04h ea=%08h a=%08h b=%08h", $time,
                  u_dut.u_int_pipe.idex.pc, u_dut.u_int_pipe.idex.inst,
@@ -2086,10 +2096,12 @@ task automatic test_pair_fetch_law;
         imem['h46] = 16'h0009;
         do_reset;
         n0 = lbus_ifetch_acc;
+        dbg_trace = $test$plusargs("t84");
         run_until_retire('h44, 20000);
+        dbg_trace = 1'b0;
         $display("      odd-entry fetch accepts = %0d", lbus_ifetch_acc - n0);
         chk("odd-entry ALU block result", gpr(2), 32'd32);
-        chk("odd-entry fetch accepts (law)", lbus_ifetch_acc - n0, 32'd30);
+        chk("odd-entry fetch accepts (law)", lbus_ifetch_acc - n0, 32'd31);  //relocked 2026-09-29 (early branch target: the faster guard spin lands one more fetch in the tail window)
         do_reset;
         end_test;
     end
@@ -7016,6 +7028,151 @@ task automatic test_int_nested_trapa;
 endtask
 
 
+
+///////////////////////////////////////////////////////////
+//////  CV1000 Benchmark Twins (real-silicon calibration, +cv1k)
+////
+
+//CPU CACHE HIT twin: the benchmark's exact 4-instruction dependent chase
+//(shll2 r0 / dt r4 / bf.s / mov.l @(r0,r1),r0 in the slot). PCB: ~6 clk/step.
+//The table is a single random cycle over 128 longwords at P0 0x200 (dmem 0x80..)
+//- 512 B, so after pass 1 every load hits. Variants strip one mechanism each:
+//  0 = exact loop            (issue + load-use + taken BF/S)
+//  1 = load into R2, R0<-#0  (no load-use dependency)
+//  2 = NOP in the slot       (no load at all: issue + taken BF/S only)
+//  3 = load moved above DT   (dependent, one instruction between load and use)
+//  4 = load first, use next   (dependent at distance 1, outside the slot)
+//  5 = independent load, NOP slot
+//  6 = non-delayed BF loop, no load (3 instructions: taken BF cost alone)
+//  7 = BRA loop with a BT exit, no load (4 instructions: taken BRA cost alone)
+task automatic bench_cv1k_chase(input integer variant);
+    integer idx, loop_idx, bf_idx, bt_idx, sentinel_idx, disp, i, j, k, guard, ninst;
+    integer order [0:127];
+    integer perm  [0:127];
+    integer lcg, exp_idx, iters, ms;
+    begin
+        clear_imem;
+        imem[0] = 16'hE0EC; // MOV   #0xEC,R0  ; CCR
+        imem[1] = 16'hE109; // MOV   #9,R1     ; CE|CF (P0 copy-back)
+        imem[2] = 16'h2012; // MOV.L R1,@R0
+        imem[3] = 16'h0009; // NOP
+        imem[4] = 16'h0009; // NOP
+        imem[5] = 16'hE240; // MOV   #0x40,R2  ; P0 cacheable entry
+        imem[6] = 16'h422B; // JMP   @R2
+        imem[7] = 16'h0009; // NOP
+
+        idx = 'h20;
+        imem[idx] = 16'hE102; idx = idx + 1;   // MOV   #2,R1
+        imem[idx] = 16'h4118; idx = idx + 1;   // SHLL8 R1        ; R1 = 0x200 table base
+        imem[idx] = 16'hE404; idx = idx + 1;   // MOV   #4,R4
+        imem[idx] = 16'h4418; idx = idx + 1;   // SHLL8 R4        ; R4 = 1024 steps
+        imem[idx] = 16'hE000; idx = idx + 1;   // MOV   #0,R0
+        loop_idx = idx;
+        case(variant)
+            0: begin
+                imem[idx] = 16'h4008; idx = idx + 1;   // SHLL2 R0
+                imem[idx] = 16'h4410; idx = idx + 1;   // DT    R4
+                bf_idx = idx;         idx = idx + 1;   // BF/S  loop
+                imem[idx] = 16'h001E; idx = idx + 1;   // MOV.L @(R0,R1),R0
+                ninst = 4;
+            end
+            1: begin
+                imem[idx] = 16'hE000; idx = idx + 1;   // MOV   #0,R0
+                imem[idx] = 16'h4410; idx = idx + 1;   // DT    R4
+                bf_idx = idx;         idx = idx + 1;   // BF/S  loop
+                imem[idx] = 16'h021E; idx = idx + 1;   // MOV.L @(R0,R1),R2
+                ninst = 4;
+            end
+            2: begin
+                imem[idx] = 16'hE000; idx = idx + 1;   // MOV   #0,R0
+                imem[idx] = 16'h4410; idx = idx + 1;   // DT    R4
+                bf_idx = idx;         idx = idx + 1;   // BF/S  loop
+                imem[idx] = 16'h0009; idx = idx + 1;   // NOP
+                ninst = 4;
+            end
+            3: begin
+                imem[idx] = 16'h4008; idx = idx + 1;   // SHLL2 R0
+                imem[idx] = 16'h001E; idx = idx + 1;   // MOV.L @(R0,R1),R0
+                imem[idx] = 16'h4410; idx = idx + 1;   // DT    R4
+                bf_idx = idx;         idx = idx + 1;   // BF/S  loop
+                imem[idx] = 16'h0009; idx = idx + 1;   // NOP
+                ninst = 5;
+            end
+            4: begin                                   //load-use at distance 1, outside the slot
+                imem[idx] = 16'h001E; idx = idx + 1;   // MOV.L @(R0,R1),R0
+                imem[idx] = 16'h4008; idx = idx + 1;   // SHLL2 R0
+                imem[idx] = 16'h4410; idx = idx + 1;   // DT    R4
+                bf_idx = idx;         idx = idx + 1;   // BF/S  loop
+                imem[idx] = 16'h0009; idx = idx + 1;   // NOP
+                ninst = 5;
+            end
+            5: begin                                   //independent load outside the slot
+                imem[idx] = 16'hE000; idx = idx + 1;   // MOV   #0,R0
+                imem[idx] = 16'h021E; idx = idx + 1;   // MOV.L @(R0,R1),R2
+                imem[idx] = 16'h4410; idx = idx + 1;   // DT    R4
+                bf_idx = idx;         idx = idx + 1;   // BF/S  loop
+                imem[idx] = 16'h0009; idx = idx + 1;   // NOP
+                ninst = 5;
+            end
+            6: begin                                   //NON-delayed BF loop (3 instructions)
+                imem[idx] = 16'hE000; idx = idx + 1;   // MOV   #0,R0
+                imem[idx] = 16'h4410; idx = idx + 1;   // DT    R4
+                bf_idx = idx;         idx = idx + 1;   // BF    loop (patched below)
+                ninst = 3;
+            end
+            default: begin                             //BRA loop, BT exit (4 instructions)
+                imem[idx] = 16'h4410; idx = idx + 1;   // DT    R4
+                bt_idx = idx;         idx = idx + 1;   // BT    sentinel (patched below)
+                bf_idx = idx;         idx = idx + 1;   // BRA   loop (patched below)
+                imem[idx] = 16'h0009; idx = idx + 1;   // NOP   (slot)
+                ninst = 4;
+            end
+        endcase
+        disp = loop_idx - bf_idx - 2;
+        if(variant == 6)      imem[bf_idx] = 16'h8B00 | (disp & 8'hFF);   // BF  loop
+        else if(variant == 7) imem[bf_idx] = 16'hA000 | (disp & 12'hFFF); // BRA loop (delayed)
+        else                  imem[bf_idx] = 16'h8F00 | (disp & 8'hFF);   // BF/S loop (delayed)
+        sentinel_idx = idx;
+        imem[idx] = 16'hE65A; idx = idx + 1;           // MOV #0x5A,R6 ; sentinel
+        if(variant == 7) imem[bt_idx] = 16'h8900 | ((sentinel_idx - bt_idx - 2) & 8'hFF); // BT sentinel
+
+        //single random cycle over 128 slots (fixed-seed LCG shuffle)
+        lcg = 20260928;
+        for(i = 0; i < 128; i = i + 1) order[i] = i;
+        for(i = 127; i > 0; i = i - 1) begin
+            lcg = lcg * 1103515245 + 12345;
+            k = ((lcg >> 8) & 32'h7FFF_FFFF) % (i + 1);
+            j = order[i]; order[i] = order[k]; order[k] = j;
+        end
+        for(i = 0; i < 128; i = i + 1) perm[order[i]] = order[(i + 1) % 128];
+
+        do_reset;
+        for(i = 0; i < 128; i = i + 1) dmem['h80 + i] = perm[i];   //after the reset clear
+
+        guard = 0;                                  //pass 1 fills the 32 table lines
+        while(retire_count[loop_idx] < 300 && guard < 40000) begin
+            @(posedge clk); guard = guard + 1;
+        end
+        bench_arm = 1'b1;
+        run_until_retire(sentinel_idx, 200000);
+        bench_arm = 1'b0;
+        @(posedge clk);
+
+        iters = bench_retires / ninst;
+        ms = (bench_arch_cycles * 100) / (iters > 0 ? iters : 1);
+        $display("  [CV1K] chase variant %0d: %0d retires / %0d arch-cycles -> %0d.%02d clk/step (PCB 6.0, MAME 6.0, MiSTer 7.0)",
+                 variant, bench_retires, bench_arch_cycles, ms/100, ms%100);
+
+        exp_idx = 0;
+        for(i = 0; i < 1024; i = i + 1) exp_idx = perm[exp_idx];
+        if(variant == 0 || variant == 3 || variant == 4) chk("chase end index", gpr(0), exp_idx);
+        else if(variant == 1 || variant == 5)            chk("chase slot load", gpr(2), perm[0]);
+        chk("chase step count", gpr(4), 32'd0);
+        chk("chase: no exception", {31'd0, exc_seen}, 32'd0);
+        do_reset;
+    end
+endtask
+
 ///////////////////////////////////////////////////////////
 //////  Test Sequencer
 ////
@@ -7032,6 +7189,33 @@ initial begin
     i_latency      = 0;    //IPC baselines were locked with instant instruction reads
 
     $display("######## cpu_core_tb ########");
+
+    //+cv1k: CV1000 benchmark twins (real-silicon calibration points).
+    if($test$plusargs("cv1k")) begin
+        group("cv1k: CPU CACHE HIT twin");
+        bench_cv1k_chase(0);
+        bench_cv1k_chase(1);
+        bench_cv1k_chase(2);
+        bench_cv1k_chase(3);
+        bench_cv1k_chase(4);
+        bench_cv1k_chase(5);
+        bench_cv1k_chase(6);
+        bench_cv1k_chase(7);
+        $display("");
+        if(errors == 0) $display("cpu_core_tb: PASS (cv1k subset)");
+        else            $display("cpu_core_tb: FAIL (cv1k subset, %0d errors)", errors);
+        $finish;
+    end
+
+    //+t90 / +t84: one test alone (early-target debug).
+    if($test$plusargs("t90")) begin
+        test_int_miss_sweep;
+        $finish;
+    end
+    if($test$plusargs("t84")) begin
+        test_pair_fetch_law;
+        $finish;
+    end
 
     //+fnew: run only the new (final-session) collision/law tests while iterating.
     if($test$plusargs("fnew")) begin

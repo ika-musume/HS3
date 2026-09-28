@@ -230,6 +230,17 @@ logic           fetch_drop;       //discard stale response after redirect
 logic           fault_hold;       //wait for external exception redirect
 logic   [31:0]  fetch_pc;          //address used by the next fetch request
 logic   [31:0]  fetch_pending_pc;  //PC paired with the outstanding response
+//Early branch target (see the "Early Target Fetch" note in the IF section): the taken
+//target rides the AGU in the branch's own EX cycle, one cycle before the redirect.
+logic           tgt_pend;         //the outstanding fetch IS the EX branch's target (never dropped by its redirect)
+logic           tgt_open;         //that branch has redirected: the tagged response may now enter IF/ID
+logic           fpc_lag;          //fetch_pc holds the LAST fired (target) address: true next = fetch_pc + 2
+logic           agu_base_own;     //sim reference only: agu_base_q still holds idex's own ID-loaded base
+logic           tgt_fired_q;      //sim reference only: the EX branch already fired its early target
+//Early-target class of the branch in EX, valid-folded AND armed: cleared when an EA2
+//hold-load clobbers agu_base_q or once the target has fired (tgt_fire), so the AGU
+//select needs neither an own-base nor a tgt_pend input. Three copies, one per cluster.
+logic   [1:0]   br_mode_q;
 
 //FETCH-PAIR slot: every fetch response carries the full longword (LBus rsp_inst_sib);
 //an even fetch's sibling (PC+2) is held here as ONE extra in-order fetch-queue entry
@@ -268,6 +279,15 @@ logic           ma_second_pending_agu; //the MAC/RMW second access is presenting
 //WB-fault flush); its only load is l_is_data_agu. The single-consumer idex.agu_en_mode
 //needs no copy - the AGU reads the packet field directly.
 (* preserve *) logic            idex_is_data_agu;
+//Early-target select duplicates (same pattern): the AGU i_USE_BASE / i_EN_MODE / i_PC_INC
+//legs read ONLY these copies, so the whole select is ONE LUT of AGU-local flops (the
+//shared r_t / ifid.valid sit at the ALU / issue clusters, a die-crossing away).
+//D-cones identical to the originals (sim-checked equal).
+(* preserve *) logic    [1:0]   br_mode_agu;       //br_mode_q copy
+(* preserve *) logic            fpc_lag_agu;
+(* preserve *) logic            idex_br_dslot_agu; //idex.branch_delayed copy (slot-secured gate)
+(* preserve *) logic            r_t_agu;           //running SR.T copy
+(* preserve *) logic            ifid_valid_agu;    //ifid.valid copy
 
 //EX-head forward state (one set per operand port a/b/st). The lane pick is latched
 //at issue from REGISTERED compares (fwd_lane_pick). The WB view: a producer's word
@@ -295,8 +315,13 @@ logic   [31:0]  fwd_shadow_a, fwd_shadow_b, fwd_shadow_st; //deposited operand w
 (* preserve *) logic      fwd_wbsel_a_idx, fwd_wbsel_b_idx;
 (* preserve *) logic      fwd_dep_a_idx,  fwd_dep_b_idx;
 (* preserve *) logic      idex_is_data_idx;
+(* preserve *) logic [1:0] br_mode_idx;
+(* preserve *) logic      fpc_lag_idx, idex_br_dslot_idx, r_t_idx, ifid_valid_idx;
 
-assign  o_FETCH_PC = fetch_pc;
+//True next-fetch address: fetch_pc, plus one halfword while it lags (fpc_lag). Every
+//PC reader (pending/pair PC records, export) uses this; the AGU folds the +2 itself.
+wire    [31:0]  fetch_pc_eff = fetch_pc + {30'd0, fpc_lag, 1'b0};
+assign  o_FETCH_PC = fetch_pc_eff;
 
 //gpr_read_address_a/b are the BRAM read addresses for the n- and m-field operands.
 //active_gpr_id() and gpr_bram_address() yield identical encodings (see pp.19-22), so
@@ -399,6 +424,11 @@ always_comb begin
         $fatal(1, "pd.pdec mismatch: inst=%04x pd=%b", ifid.inst, ifid.pd.pdec);
     if(ifid.valid && ifid.pd.gbrx !== (id_decode.addr_op == ADDR_GBR_INDEX))
         $fatal(1, "pd.gbrx mismatch: inst=%04x pd=%b", ifid.inst, ifid.pd.gbrx);
+    if(ifid.valid && ifid.pd.bpc  !== (id_decode.branch_op == BR_BT  || id_decode.branch_op == BR_BF ||
+                                       id_decode.branch_op == BR_BRA || id_decode.branch_op == BR_BSR))
+        $fatal(1, "pd.bpc mismatch: inst=%04x pd=%b", ifid.inst, ifid.pd.bpc);
+    if(ifid.valid && ifid.pd.bctl !== (id_decode.branch_op == BR_RTS || id_decode.branch_op == BR_RTE))
+        $fatal(1, "pd.bctl mismatch: inst=%04x pd=%b", ifid.inst, ifid.pd.bctl);
 end
 
 //The registered bank mirror must equal the live SR-derived select on every live packet
@@ -423,6 +453,10 @@ end
 
 /*
     IF permits one outstanding request. Request PC advances after acceptance.
+    A taken branch in EX fires its target in that same cycle (EARLY TARGET FETCH,
+    see the br_spec note in the EX section): the request is tagged (tgt_pend), held
+    in the cache until the redirect edge (tgt_open), never dropped by that redirect,
+    and fetch_pc then lags the fetched target by one halfword (fpc_lag).
     External redirect has priority over an EX branch redirect.
     Redirected outstanding responses are accepted and discarded with fetch_drop.
 */
@@ -1355,6 +1389,16 @@ assign  ex_advance = idex.valid && ex_complete && exma_allow && !wb_kill_issue;
 logic   [31:0]  id_src_a_value, id_src_b_value, id_store_value;
 logic   [31:0]  id_mem_step;     //decoded transfer byte count for predecrement
 
+//Early-target class of the decoded branch (-> idex.br_mode, and the AGU addend gate for
+//addr_op NONE): 0 none, 1 always taken, 2 taken on T, 3 taken on !T. The addend forms
+//are the PC-relative branches (base 0 + target) and BRAF/BSRF (Rn + pc+4).
+wire    [1:0]   id_br_mode   = (id_decode.branch_op == BR_NONE) ? 2'd0 :
+                               (id_decode.branch_op == BR_BT)   ? 2'd2 :
+                               (id_decode.branch_op == BR_BF)   ? 2'd3 : 2'd1;
+wire            id_br_addend = id_decode.branch_op == BR_BT   || id_decode.branch_op == BR_BF   ||
+                               id_decode.branch_op == BR_BRA  || id_decode.branch_op == BR_BSR  ||
+                               id_decode.branch_op == BR_BRAF || id_decode.branch_op == BR_BSRF;
+
 
 ///////////////////////////////////////////////////////////
 //////  Operand Select - LAST-LEVEL flat mux: every LATE word crosses exactly ONE level
@@ -1383,7 +1427,7 @@ wire            ma_take_st = ma_take_only(ifid.pd.st_used, hz_st_id, exma);
 //PREDEC / immediate legs never patch.
 fwd_lane_t  id_lane_a_raw, id_lane_a, id_lane_b, id_lane_st;
 assign  id_lane_a_raw = fwd_lane_pick(ifid.pd.a_used, hz_a_id, idex, exma);
-assign  id_lane_a  = (ifid.pd.agbr || ifid.pd.apc) ? FWD_NONE : id_lane_a_raw;
+assign  id_lane_a  = (ifid.pd.agbr || ifid.pd.apc || ifid.pd.bpc || ifid.pd.bctl) ? FWD_NONE : id_lane_a_raw;
 assign  id_lane_b  = ifid.pd.pdec ? FWD_NONE :
                      ifid.pd.gbrx ? id_lane_a_raw :
                                     fwd_lane_pick(ifid.pd.b_used, hz_b_id, idex, exma);
@@ -1476,8 +1520,9 @@ wire            src_dob_st = !ma_take_st && !wb_hit_st && !doa_hit_st && dob_hit
 //All REGISTERED pd bits (fetch-time addr-op class, asserted above): the id_decode.addr_op
 //forms kept the live ifid.inst case cone on every sel_a/sel_b/sel_st leg (fit4).
 wire            addr_a_gbr  = ifid.pd.agbr;
-wire            addr_a_pc   = ifid.pd.apc;
-wire            addr_a_ovr  = addr_a_gbr || addr_a_pc;
+wire            addr_a_pc   = ifid.pd.apc || ifid.pd.bpc;   //PC-rel load EA and PC-rel branch target both ride the immediate
+wire            addr_a_ctl  = ifid.pd.bctl;                  //RTS/RTE: PR / SPC is the AGU base (target)
+wire            addr_a_ovr  = addr_a_gbr || addr_a_pc || addr_a_ctl;
 wire            addr_b_gbrx = ifid.pd.gbrx;
 wire            addr_b_pdec = ifid.pd.pdec;
 wire            st_use_imm  = ifid.pd.gbrx || !ifid.pd.st_used;
@@ -1488,7 +1533,8 @@ wire            st_use_imm  = ifid.pd.gbrx || !ifid.pd.st_used;
 wire    [1:0]   sel_a = (!addr_a_ovr && src_doa_a) ? 2'd1 :
                         (!addr_a_ovr && src_dob_a) ? 2'd2 : 2'd3;
 wire    [31:0]  early_a_final = addr_a_gbr ? i_GBR :
-                                addr_a_pc  ? 32'd0 : early_src_a;    //PC-rel addr rides the immediate
+                                addr_a_ctl ? (ifid.inst[5] ? i_SPC : pr) :  //RTE (002B) / RTS (000B) target base
+                                addr_a_pc  ? 32'd0 : early_src_a;    //PC-rel addr/target rides the immediate
 
 wire    [1:0]   sel_b =  addr_b_pdec                                          ? 2'd3 :
                         (addr_b_gbrx ? src_doa_a : ifid.pd.b_used && src_doa_b) ? 2'd1 :
@@ -1967,6 +2013,13 @@ wire            ma_second_pending_idx = ma_second_access_idx && !data_req_sent_i
 //bram_addr path. ma_second_access is live MA-seq state (MAC/RMW 2nd access) and cannot pre-register.
 wire            l_is_data     = idex.is_data || ma_second_access;
 wire            l_is_data_agu = idex_is_data_agu || ma_second_access_agu; //AGU-only copy (i_USE_BASE/i_EN_MODE)
+//Early branch target on the AGU (see br_spec): the base leg carries the target base
+//(0 / Rn with lanes / PR / SPC, loaded by ID like a data EA) and the addend gate adds
+//the immediate for the PC-relative and BRAF/BSRF forms. AGU-cluster copy of br_spec.
+wire            br_spec_agu   = (br_mode_agu == 2'd1 ||
+                                 (br_mode_agu == 2'd2 &&  r_t_agu) ||
+                                 (br_mode_agu == 2'd3 && !r_t_agu)) && (!idex_br_dslot_agu || ifid_valid_agu);
+wire            use_base_agu  = l_is_data_agu || br_spec_agu;          //i_USE_BASE: data EA / 2nd access / early target
 
 //Shared time-shared AGU (agu.sv) - the SINGLE address source for the L bus. On a data cycle
 //(l_is_data=1) i_USE_BASE=1 selects agu_base_q (EA base, or the held EA2/write addr while a 2nd
@@ -1982,10 +2035,10 @@ agu u_agu_d (
     .i_AGU_A    (ea_addr_base                  ),  //pre-selected base: EA base / EA2 (agu_base_q)
     .i_AGU_B    (ea_addr_addend                ),
     .i_FETCH_PC (fetch_pc                      ),  //IF sequential PC (data/fetch time-share mux)
-    .i_USE_BASE (l_is_data_agu                 ),  //1: EX/2nd base (MA); 0: fetch PC (IF)
-    .i_EN_MODE  ((l_is_data_agu && !ma_second_pending_agu) ? idex.agu_en_mode : 2'd0),  //ID-decoded gate; NULL on 2nd/fetch
+    .i_USE_BASE (use_base_agu                  ),  //1: EX/2nd base (MA) or early branch target; 0: fetch PC (IF)
+    .i_EN_MODE  (((l_is_data_agu && !ma_second_pending_agu) || br_spec_agu) ? idex.agu_en_mode : 2'd0),  //ID-decoded gate; NULL on 2nd/fetch
     .i_R_T      (1'b0                          ),
-    .i_PC_INC   (1'b0                          ),
+    .i_PC_INC   (fpc_lag_agu                   ),  //fetch PC lags the target by 2 (gated by !USE_BASE inside)
     .o_ADDR     (ea_addr_sum                   )
 );
 
@@ -2012,9 +2065,14 @@ always_comb begin
     endcase
 end
 wire            l_is_data_idx = idex_is_data_idx || ma_second_access_idx;
-wire            agu_en_idx    = (l_is_data_idx && !ma_second_pending_idx) && idex.agu_en_mode[0];
-wire    [11:0]  agu_x_idx     = l_is_data_idx ? ea_base_idx : fetch_pc[11:0];
-wire    [11:0]  l_addr_idx    = agu_x_idx + (agu_en_idx ? ea_addend_idx : 12'd0);
+wire            br_spec_idx   = (br_mode_idx == 2'd1 ||
+                                 (br_mode_idx == 2'd2 &&  r_t_idx) ||
+                                 (br_mode_idx == 2'd3 && !r_t_idx)) && (!idex_br_dslot_idx || ifid_valid_idx);
+wire            use_base_idx  = l_is_data_idx || br_spec_idx;
+wire            agu_en_idx    = ((l_is_data_idx && !ma_second_pending_idx) || br_spec_idx) && idex.agu_en_mode[0];
+wire    [11:0]  agu_x_idx     = use_base_idx ? ea_base_idx : fetch_pc[11:0];
+wire    [11:0]  l_addr_idx    = agu_x_idx + (agu_en_idx ? ea_addend_idx :
+                                             {10'd0, fpc_lag_idx && !use_base_idx, 1'b0}); //lagging fetch PC +2
 
 `ifdef HS3_TEST
 // synthesis translate_off
@@ -2024,6 +2082,18 @@ always_comb begin
     if(l_addr_idx !== ea_addr_sum[11:0])
         $fatal(1, "cache-index slice twin mismatch: idx=%03x agu=%03x",
                l_addr_idx, ea_addr_sum[11:0]);
+    //Early-target invariants: the duplicates equal the originals; a tagged fire presents
+    //exactly the EX branch target; a tagged redirect finds fetch_pc == that target.
+    if(br_spec_agu !== br_spec || br_spec_idx !== br_spec)
+        $fatal(1, "br_spec duplicate mismatch: %b %b %b", br_spec, br_spec_agu, br_spec_idx);
+    if(br_spec !== ((idex.br_mode == 2'd1 || (idex.br_mode == 2'd2 && r_t) || (idex.br_mode == 2'd3 && !r_t)) &&
+                    !tgt_fired_q && agu_base_own && (!idex.branch_delayed || ifid.valid)))
+        $fatal(1, "br_spec != reference (mode_q=%0d mode=%0d own=%b fired=%b)", br_mode_q, idex.br_mode, agu_base_own, tgt_fired_q);
+    if(tgt_fire && (ea_addr_sum !== branch_target))
+        $fatal(1, "early target fire address %08x != branch_target %08x (op %0d)",
+               ea_addr_sum, branch_target, idex.branch_op);
+    if(branch_redirect && tgt_pend && (fetch_pc !== branch_target))
+        $fatal(1, "tagged redirect: fetch_pc %08x != branch_target %08x", fetch_pc, branch_target);
 end
 // synthesis translate_on
 `endif
@@ -2110,6 +2180,31 @@ end
 
 assign branch_event    = ex_advance && idex.branch_op != BR_NONE;
 assign branch_redirect = branch_event && branch_taken;
+
+/*
+    EARLY TARGET FETCH. A taken branch in EX presents its target on the L bus in
+    this very cycle (the AGU base/addend legs carry it, see u_agu_d), one cycle
+    before branch_redirect updates fetch_pc: the target reaches ID one slot after
+    the delay slot, which is the manual's 1-bubble BF/S / BRA cost (SW manual figs
+    10.42/10.44) and 2 bubbles for non-delayed BT/BF (fig 10.40). The request is
+    speculative w.r.t. ex_advance only: it fires whether or not the branch leaves EX
+    this cycle, and is tagged (tgt_pend) so the later redirect keeps it instead of
+    dropping it. br_spec is SHALLOW on purpose (registered mode + r_t + two flags):
+    the deep ex_advance / hazard cones never touch the AGU select or the L-bus valid.
+      !tgt_pend     : the target is already in flight - fetch sequentially from it
+      agu_base_own  : agu_base_q is this branch's own ID-loaded base (an older MAC /
+                      byte-RMW second-access hold-load clobbers it -> late path)
+      slot secured  : a delayed branch fires only once its slot sits in IF/ID - the
+                      fetch stream must not jump to the target before the slot
+    Stale T: r_t lags ex_t only inside a byte-RMW evaluate slot (TAS/TST in MA); a
+    tagged fetch that speculated across one is killed there (tgt_kill). The tagged
+    response is HELD in the cache until the redirect edge (tgt_open): before it, IF/ID
+    belongs to the slot / the fall-through, and inserting the target there would run
+    it as the slot (seen on RTE with an unfetched slot).
+*/
+wire            br_spec = (br_mode_q == 2'd1 ||
+                           (br_mode_q == 2'd2 &&  r_t) ||
+                           (br_mode_q == 2'd3 && !r_t)) && (!idex.branch_delayed || ifid.valid);
 
 always_comb begin
     //Build one registered EX result; fault handling below removes every side effect.
@@ -2344,8 +2439,10 @@ wire            agu_hold_mac  = exma.mem_op == MEM_MAC;   //2nd-addr source sele
 //Insert leg gated on !pair_ready: the held sibling is OLDER than any waiting response,
 //so it must reach IF/ID first (the response holds loss-free in the cache meanwhile).
 //The drop/redirect consume legs stay pair-blind.
+//A tagged target response is held until its branch redirects (tgt_open, or the redirect
+//edge itself); after that it inserts under the normal IF/ID-free rule.
 assign  i_rsp_ready = fetch_pending &&
-                      (fetch_drop || ((!ifid.valid || id_issue) && !pair_ready) ||
+                      (fetch_drop || ((!ifid.valid || id_issue) && !pair_ready && !(tgt_pend && !tgt_open)) ||
                        i_REDIRECT_VALID || branch_redirect);
 assign  if_accept   = i_rsp_valid && i_rsp_ready;
 
@@ -2355,7 +2452,7 @@ assign  if_accept   = i_rsp_valid && i_rsp_ready;
 //under a redirect the fire is the TARGET fetch and proceeds (drop_d marks wrong-path).
 wire            rsp_pair_ok = i_rsp_valid && L_BUS.rsp_pair && !i_rsp_fault &&
                               fetch_pending && !fetch_drop &&
-                              !i_REDIRECT_VALID && !branch_redirect && !wb_fault_kill;
+                              !i_REDIRECT_VALID && !(branch_redirect && !tgt_pend) && !wb_fault_kill;
 
 //Pipelined fetch "want to issue". A wrong-path fetch is marked via fetch_drop and its
 //line fill aborted (o_I_SQUASH).
@@ -2365,9 +2462,12 @@ assign  i_req_fire  = early_i_req_raw_valid && !l_is_data && L_BUS.req_ready;
 
 wire            ifid_clr  = branch_redirect ||
                             (branch_event && !branch_delayed && branch_taken);
-wire            ifid_ld   = !i_REDIRECT_VALID && !wb_fault_kill && !ifid_clr &&
+//A tagged (early-target) response is INSERTED at its branch's redirect edge instead of
+//being cleared with the wrong path: the clear applies only to untagged fetches.
+wire            ifid_clr_u = ifid_clr && !tgt_pend;   //clear that also blocks the insert
+wire            ifid_ld   = !i_REDIRECT_VALID && !wb_fault_kill && !ifid_clr_u &&
                             if_accept && !fetch_drop;               //response insert into IF/ID
-(* keep *) wire ifid_ld_dat = !i_REDIRECT_VALID && !wb_fault_kill && !ifid_clr &&
+(* keep *) wire ifid_ld_dat = !i_REDIRECT_VALID && !wb_fault_kill && !ifid_clr_u &&
                     if_accept && !fetch_drop;   //data-cluster CE duplicate (placement-local)
 
 //Pair slot events. Capture = the response inserts into IF/ID this edge AND pairs
@@ -2378,22 +2478,36 @@ wire            ifid_ld   = !i_REDIRECT_VALID && !wb_fault_kill && !ifid_clr &&
 wire            pair_capture = ifid_ld && L_BUS.rsp_pair;
 wire            pair_serve   = pair_ready && !i_REDIRECT_VALID && !wb_fault_kill && !ifid_clr &&
                                (!ifid.valid || id_issue);
-wire            ifid_zero = i_REDIRECT_VALID || wb_fault_kill || ifid_clr ||
+wire            ifid_zero = i_REDIRECT_VALID || wb_fault_kill || (ifid_clr && !(tgt_pend && if_accept)) ||
                             (id_issue && !ifid_ld && !pair_serve);  //every '0 load of the IF/ID packet
-wire            fpc_ce    = i_REDIRECT_VALID || branch_redirect || i_req_fire ||
+//fetch_pc: an UNTAGGED redirect loads the target (late path); a tagged redirect leaves it
+//alone (fetch_pc already lags behind the fetched target). An early-target fire loads the
+//target too and sets fpc_lag; a sequential fire / pair capture advances past the lag.
+wire            tgt_fire  = i_req_fire && br_spec;   //this edge's request is the EX branch's target
+wire            fpc_ce    = i_REDIRECT_VALID || (branch_redirect && !tgt_pend) || i_req_fire ||
                             pair_capture;             //capture advances fetch_pc PAST the sibling
-wire            fpc_selbr = branch_redirect;      //fetch_pc source: branch target (over pc+2)
+wire            fpc_selbr = !tgt_pend && (branch_redirect || tgt_fire); //fetch_pc source: branch target (over pc+2)
 wire            fp_ce     = i_req_fire || if_accept;                //fetch_pending capture
-wire            drop_ce   = i_REDIRECT_VALID || wb_fault_kill || branch_redirect || if_accept;
+//Stale-T guard: a byte-RMW evaluate slot (TAS/TST in MA) is the one window where the
+//running r_t the early fire used can differ from ex_t; a tagged fetch of a T-conditional
+//branch STILL IN EX (idex.br_mode[1]) that crossed it is dropped and the branch takes the
+//late path. Cheap over-approximation: any 2nd access. Never after the redirect - fetch_pc
+//already lags past the target then, so the pending fetch is the only copy of it.
+wire            tgt_kill  = ma_second_access && tgt_pend && idex.br_mode[1] &&
+                            fetch_pending && !if_accept;
+wire            drop_ce   = i_REDIRECT_VALID || wb_fault_kill || branch_redirect || if_accept || tgt_kill;
 
 //accept arm: a request FIRED at a branch-redirect edge still carries the old fetch_pc
 //(the target loads at this edge) - mark it dropped, else its response inserts as if it
 //were the branch target and a wrong-path instruction RETIRES (found by the cacheable
-//squash sweep: the +3-ahead slot leaked on every full-speed taken branch).
+//squash sweep: the +3-ahead slot leaked on every full-speed taken branch). A request
+//fired WITH the target (tgt_fire) and a pending tagged target are kept.
 wire    drop_d    = i_REDIRECT_VALID ? (if_accept ? 1'b0 : fetch_pending) :
                     wb_fault_kill    ? fetch_pending :
-                    if_accept        ? (branch_redirect && i_req_fire) :
-                                       (fetch_pending || i_req_fire);   //fetch_drop next value
+                    tgt_kill         ? 1'b1 :
+                    if_accept        ? (branch_redirect && !tgt_pend && i_req_fire && !br_spec) :
+                                       (!tgt_pend && (fetch_pending ||
+                                                      (i_req_fire && !br_spec)));   //fetch_drop next value
 wire    agu_hold_sel = agu_hold_base && !ma_complete; //agu_base_q source: MA 2nd-access addr
 wire    agu_ce    = agu_hold_sel || idex_allow;       //agu_base_q capture (hold-load | advance)
 
@@ -2489,7 +2603,7 @@ wire    [4:0]   nx_hold_read0 = ifid.pd.need_a ? active_gpr_id(ifid.inst[11:8], 
                                  !(btbf_cancel_base && exma_allow);
 (* keep *) wire pair_serve_gpr = pair_ready && !i_REDIRECT_VALID && !wb_fault_kill &&
                                  !ifid_clr && (!ifid.valid || id_issue_gpr);
-(* keep *) wire ifid_ld_gpr    = !i_REDIRECT_VALID && !wb_fault_kill && !ifid_clr &&
+(* keep *) wire ifid_ld_gpr    = !i_REDIRECT_VALID && !wb_fault_kill && !ifid_clr_u &&
                                  !fetch_drop && i_rsp_valid && fetch_pending &&
                                  (!ifid.valid || id_issue_gpr) && !pair_ready;
 
@@ -2822,6 +2936,7 @@ always_ff @(posedge i_CLK or negedge i_RST_n) begin
         idex.byte_op        <= byte_op_t'(0);
         idex.is_data        <= 1'b0;
         idex.agu_en_mode    <= 2'd0;
+        idex.br_mode        <= 2'd0;
         idex.branch_op      <= branch_op_t'(0);
         idex.branch_delayed <= 1'b0;
         idex.pr_link        <= 1'b0;
@@ -2843,6 +2958,17 @@ always_ff @(posedge i_CLK or negedge i_RST_n) begin
         idex.privileged     <= 1'b0;
         idex_is_data_agu <= 1'b0;
         idex_is_data_idx <= 1'b0;
+        br_mode_q        <= 2'd0;
+        br_mode_agu      <= 2'd0;
+        br_mode_idx      <= 2'd0;
+        idex_br_dslot_agu <= 1'b0;
+        idex_br_dslot_idx <= 1'b0;
+        agu_base_own     <= 1'b0;
+        tgt_fired_q      <= 1'b0;
+        r_t_agu          <= 1'b0;
+        r_t_idx          <= 1'b0;
+        ifid_valid_agu   <= 1'b0;
+        ifid_valid_idx   <= 1'b0;
         exma.valid        <= 1'b0;
         exma.delay_slot   <= 1'b0;
         exma.gpr0_we      <= 1'b0;
@@ -2898,6 +3024,11 @@ always_ff @(posedge i_CLK or negedge i_RST_n) begin
         mawb.fault_write  <= 1'b0;
         fetch_pending   <= 1'b0;
         fetch_drop      <= 1'b0;
+        tgt_pend        <= 1'b0;
+        tgt_open        <= 1'b0;
+        fpc_lag         <= 1'b0;
+        fpc_lag_agu     <= 1'b0;
+        fpc_lag_idx     <= 1'b0;
         fault_hold      <= 1'b0;
         fetch_pc        <= RESET_PC;
         fetch_pending_pc<= 32'd0;
@@ -2953,6 +3084,8 @@ always_ff @(posedge i_CLK or negedge i_RST_n) begin
             idex          <= '0;
             idex_is_data_agu <= 1'b0;
             idex_is_data_idx <= 1'b0;
+            idex_br_dslot_agu <= 1'b0;
+            idex_br_dslot_idx <= 1'b0;
             fwd_lane_a    <= FWD_NONE;
             fwd_lane_b    <= FWD_NONE;
             fwd_lane_st   <= FWD_NONE;
@@ -2978,6 +3111,8 @@ always_ff @(posedge i_CLK or negedge i_RST_n) begin
             mawb          <= '0;
             fault_hold    <= 1'b0;
             r_t           <= i_SR[0];   //exception/RTE entry: resync running flags to committed SR
+            r_t_agu       <= i_SR[0];
+            r_t_idx       <= i_SR[0];
             r_s           <= i_SR[1];   //SR.S
             r_m           <= i_SR[9];   //SR.M
             r_q           <= i_SR[8];   //SR.Q
@@ -3073,10 +3208,12 @@ always_ff @(posedge i_CLK or negedge i_RST_n) begin
             //bubbles. A drained pipeline (nothing in MA/WB) resyncs to the committed SR.T;
             //ALU/compare T is known leaving EX; byte-RMW T only when leaving MA. Listed
             //oldest-to-newest so the newest write (EX) wins when several land the same edge.
-            if(!exma.valid && !mawb.valid) r_t <= i_SR[0];
+            if(!exma.valid && !mawb.valid) begin r_t <= i_SR[0]; r_t_agu <= i_SR[0]; r_t_idx <= i_SR[0]; end
             if(ma_complete && exma.valid && !exma.fault && !wb_fault_pending &&
-               exma.mem_op == MEM_RMW && ma_result.t_we) r_t <= ma_result.t_data;
-            if(ex_advance && alu_t_we) r_t <= alu_t_value;
+               exma.mem_op == MEM_RMW && ma_result.t_we) begin
+                r_t <= ma_result.t_data; r_t_agu <= ma_result.t_data; r_t_idx <= ma_result.t_data;
+            end
+            if(ex_advance && alu_t_we) begin r_t <= alu_t_value; r_t_agu <= alu_t_value; r_t_idx <= alu_t_value; end
 
             //Running SR.S/M/Q latches - same model as r_t (deposit leaving EX, hold across
             //bubbles, resync to committed SR on drain). SETS/CLRS (S) and DIV0S/DIV0U/DIV1
@@ -3098,7 +3235,7 @@ always_ff @(posedge i_CLK or negedge i_RST_n) begin
             //resync. A same-edge ALU deposit cannot coexist (one packet in EX); a later
             //kill of the RTE heals through the i_REDIRECT_VALID resync above.
             if(ex_advance && idex.event_rte) begin
-                r_t <= i_SSR[0];
+                r_t <= i_SSR[0]; r_t_agu <= i_SSR[0]; r_t_idx <= i_SSR[0];
                 r_s <= i_SSR[1];
                 r_m <= i_SSR[9];
                 r_q <= i_SSR[8];
@@ -3116,13 +3253,19 @@ always_ff @(posedge i_CLK or negedge i_RST_n) begin
                 //AGU addend gate, pre-decoded in ID: base-only modes (REG/POSTINC/MAC, and NONE)
                 //NULL the addend, all others FORCE it. Registered so the EX addr_op decode leaves the
                 //idex.addr_op -> AGU i_AGU_B/o_ADDR carry cone (the 5 ns bram_addr path). See 1a/1b.
-                idex.agu_en_mode <= (id_decode.addr_op == ADDR_REG     ||
+                //Branches (addr_op NONE) reuse the gate for their EARLY TARGET: PC-relative
+                //forms and BRAF/BSRF add the immediate (target / pc+4) to the base (0 / Rn);
+                //JMP/JSR/RTS/RTE take the base alone.
+                idex.agu_en_mode <= (id_decode.addr_op == ADDR_NONE) ? {1'b0, id_br_addend} :
+                                    (id_decode.addr_op == ADDR_REG     ||
                                      id_decode.addr_op == ADDR_POSTINC ||
-                                     id_decode.addr_op == ADDR_MAC     ||
-                                     id_decode.addr_op == ADDR_NONE) ? 2'd0 : 2'd1;
+                                     id_decode.addr_op == ADDR_MAC) ? 2'd0 : 2'd1;
+                idex.br_mode     <= id_issue ? id_br_mode : 2'd0;
                 //preserved AGU-only duplicate: same cone as idex.is_data above
                 idex_is_data_agu <= id_issue && (id_decode.mem_op != MEM_NONE);
                 idex_is_data_idx <= id_issue && (id_decode.mem_op != MEM_NONE);
+                idex_br_dslot_agu <= id_decode.branch_delayed;
+                idex_br_dslot_idx <= id_decode.branch_delayed;
                 //Pre-decoded address-update addend (see au_addend_q declaration).
                 au_addend_q <= (id_decode.addr_op == ADDR_PREDEC)  ? (~id_mem_step + 32'd1) :
                                (id_decode.addr_op == ADDR_POSTINC) ? id_mem_step :
@@ -3228,6 +3371,8 @@ always_ff @(posedge i_CLK or negedge i_RST_n) begin
                 idex          <= '0;
                 idex_is_data_agu <= 1'b0;
                 idex_is_data_idx <= 1'b0;
+                idex_br_dslot_agu <= 1'b0;
+                idex_br_dslot_idx <= 1'b0;
                 fwd_lane_a    <= FWD_NONE;
                 fwd_lane_b    <= FWD_NONE;
                 fwd_lane_st   <= FWD_NONE;
@@ -3280,28 +3425,86 @@ always_ff @(posedge i_CLK or negedge i_RST_n) begin
             ifid.pd          <= pair_pd;
         end
         else if(ifid_ld_dat) begin
-            ifid.pc          <= fetch_pending_pc;
+            ifid.pc          <= tgt_pend ? fetch_pc : fetch_pending_pc; //a tagged target's PC is fetch_pc itself (lagging)
             ifid.inst        <= i_rsp_inst;
             ifid.fetch_fault <= i_rsp_fault;
             ifid.delay_slot  <= 1'b0;
             ifid.pd          <= pd_fetch; //predecoded source routing rides the instruction
         end
 
-        //Fetch-pair slot: kill > capture > serve-consume.
-        if(i_REDIRECT_VALID || wb_fault_kill || ifid_clr) pair_ready <= 1'b0;
-        else if(pair_capture)                             pair_ready <= 1'b1;
-        else if(pair_serve)                               pair_ready <= 1'b0;
+        //Fetch-pair slot: kill > capture > serve-consume. A tagged-target capture at its
+        //branch's redirect edge wins over the branch clear (the held wrong-path pair dies,
+        //the target's sibling takes the slot); pair_capture is 0 on every untagged clear.
+        if(i_REDIRECT_VALID || wb_fault_kill) pair_ready <= 1'b0;
+        else if(pair_capture)                 pair_ready <= 1'b1;
+        else if(ifid_clr)                     pair_ready <= 1'b0;
+        else if(pair_serve)                   pair_ready <= 1'b0;
         if(pair_capture) begin
-            pair_pc   <= fetch_pc;        //= the sibling's PC (see the rails invariant)
+            pair_pc   <= fetch_pc_eff;    //= the sibling's PC (see the rails invariant)
             pair_inst <= i_rsp_sib;
             pair_pd   <= pd_fetch_sib;
         end
 
         if(fpc_ce)  fetch_pc <= i_REDIRECT_VALID ? i_REDIRECT_PC :
-                                fpc_selbr        ? branch_target : fetch_pc + 32'd2;
+                                fpc_selbr        ? branch_target :
+                                                   fetch_pc + (fpc_lag ? 32'd4 : 32'd2);
+        //fpc_lag: set by an early-target fire (fetch_pc <= target = the address just
+        //fetched), cleared by any other fetch_pc load. Same CE as fetch_pc.
+        if(fpc_ce) begin
+            fpc_lag     <= !i_REDIRECT_VALID && tgt_fire && !tgt_pend;
+            fpc_lag_agu <= !i_REDIRECT_VALID && tgt_fire && !tgt_pend;
+            fpc_lag_idx <= !i_REDIRECT_VALID && tgt_fire && !tgt_pend;
+        end
         if(fp_ce)   fetch_pending <= i_req_fire;
-        if(i_req_fire) fetch_pending_pc <= fetch_pc;
+        if(i_req_fire) fetch_pending_pc <= fetch_pc_eff;
         if(drop_ce) fetch_drop <= drop_d;
+        //tgt_pend: the outstanding fetch is the EX branch's target. Set by a tagged fire,
+        //cleared at its accept, killed with the fetch on any flush or the stale-T guard.
+        if(i_REDIRECT_VALID || wb_fault_kill || tgt_kill) begin
+            tgt_pend     <= 1'b0;
+            tgt_open     <= 1'b0;
+        end
+        else if(fp_ce) begin
+            tgt_pend     <= tgt_fire;
+            tgt_open     <= tgt_fire && branch_redirect;   //fired AT the redirect edge: open at once
+        end
+        else if(branch_redirect && tgt_pend) begin
+            tgt_open     <= 1'b1;                          //fired earlier (stalled branch): open now
+        end
+        //Armed early-target class (three cluster copies, one D). Loaded with the issuing
+        //branch's class unless the same edge's EA2 hold-load takes agu_base_q instead;
+        //cleared by a later hold-load (base clobbered -> late path), by the target fire
+        //(one early fetch per branch; tgt_pend then guards the redirect), and by kills.
+        if(i_REDIRECT_VALID || wb_fault_kill) begin
+            br_mode_q   <= 2'd0;
+            br_mode_agu <= 2'd0;
+            br_mode_idx <= 2'd0;
+        end
+        else if(idex_allow) begin
+            br_mode_q   <= (agu_hold_sel || !id_issue) ? 2'd0 : id_br_mode;
+            br_mode_agu <= (agu_hold_sel || !id_issue) ? 2'd0 : id_br_mode;
+            br_mode_idx <= (agu_hold_sel || !id_issue) ? 2'd0 : id_br_mode;
+        end
+        else if(agu_hold_sel || tgt_fire) begin
+            br_mode_q   <= 2'd0;
+            br_mode_agu <= 2'd0;
+            br_mode_idx <= 2'd0;
+        end
+        //ifid.valid cluster copies (same rails as the IF/ID valid bit above).
+        if(ifid_zero) begin
+            ifid_valid_agu <= 1'b0;
+            ifid_valid_idx <= 1'b0;
+        end
+        else if(ifid_ld || pair_serve) begin
+            ifid_valid_agu <= 1'b1;
+            ifid_valid_idx <= 1'b1;
+        end
+        //agu_base_own (sim reference for the br_spec assertion; no synthesized load):
+        //agu_base_q was loaded with idex's own ID base at the last agu_ce.
+        if(i_REDIRECT_VALID || wb_fault_kill) agu_base_own <= 1'b0;
+        else if(agu_ce)                       agu_base_own <= !agu_hold_sel;
+        if(i_REDIRECT_VALID || wb_fault_kill || idex_allow) tgt_fired_q <= 1'b0;
+        else if(tgt_fire)                                   tgt_fired_q <= 1'b1;
     end end
 end
 

@@ -179,14 +179,33 @@ redirect mux is gone. PC-relative targets are precomputed in ID
 
 | Case | Penalty | Reference |
 |---|---|---|
-| Non-delayed `BT`/`BF`, **taken** | **2 fetch bubbles** | SW manual Fig 10.40, p.476 |
+| Non-delayed `BT`/`BF`, **taken** | **2 fetch bubbles** (3 cycles) | SW manual Fig 10.40, p.476; table 2/1, 3/1 |
 | Non-delayed `BT`/`BF`, **not-taken** | 0 | Fig 10.41 |
-| Delayed branches (`BRA/BSR/JMP/JSR/RTS/RTE/BRAF/BSRF`) | 0 (delay-slot slack) | §10.2.3, p.432 |
+| Delayed `BT/S`/`BF/S`, **taken** | **1 bubble** (2 cycles, the slot fills the other) | Fig 10.42, p.478 |
+| `BRA/BSR/JMP/JSR/RTS/RTE/BRAF/BSRF` | **1 bubble** (2 cycles) | Fig 10.44/10.45 |
+| Load in a taken branch's delay slot | +1 (its MA takes the L bus the target fetch wanted) | §10.2.1 IF/MA contention |
 
-The 2-bubble taken penalty is itself the *proof* that IF is a single 1-cycle stage
-fetching back-to-back at one instruction/cycle (the condition resolves in EX; the two
-shadow-fetched instructions are discarded). `RTS` reads PR through the existing ID
-control-register interlock — no new PR forward path.
+Measured to the clock against a real SH7709S (the CV1000 CPU CACHE HIT benchmark,
+`sim/cpu_core_tb.sv +cv1k`): the 4-instruction dependent chase runs 6.0 clocks a step
+on the PCB and in HS3. Until 2026-09-29 every taken branch cost one bubble more
+(7.0): the target request only fired the cycle *after* the redirect, and the 2-cycle
+pipelined IF (request, then response into IF/ID) made the redirect-to-EX distance 4
+slots instead of the chip's 3.
+
+**Early target fetch** (int_pipe, "EARLY TARGET FETCH"): a taken branch in EX now
+presents its target on the L bus in its own EX cycle. The target rides the time-shared
+AGU exactly like a PC-relative load address — ID loads the base (0 for PC-relative
+forms, Rn with the EX-head forward lanes for `JMP/JSR/BRAF/BSRF`, PR/SPC for
+`RTS/RTE`) and the addend (the full target / pc+4) — so no new mux level lands on the
+cache address cone; only the AGU's `i_USE_BASE` select gains a shallow term
+(registered branch class + the running `r_t`). The request is tagged (`tgt_pend`):
+the redirect keeps it instead of dropping it, the response is held in the cache until
+the redirect edge, and `fetch_pc` lags the fetched target by one halfword (`fpc_lag`,
+folded into bit 1 of the AGU's addend leg) so no `target + 2` adder sits on the
+branch-target path. A delayed branch fires only once its slot is in IF/ID; a
+speculation across a byte-RMW evaluate slot (stale `r_t`) or over a clobbered AGU
+base falls back to the late path. `RTS` still reads PR through the ID control-register
+interlock — no new PR forward path.
 
 ### Load-use
 
@@ -216,8 +235,8 @@ holds bus ownership across the pair (§4).
 | Workload | Retires / cycles | IPC | Meaning |
 |---|---|---|---|
 | Straight-line NOPs, **non-cacheable** (P2 bypass) | 203 / 506 | **0.401** | front-end ceiling with pair fetch over the external bus |
-| Dependent add loop, **cacheable hit** | 1137 / 1167 | **0.974** | ≈ 1.0; the 2.6 % gap is the 2 taken-branch bubbles per iteration |
-| 100 %-store loop, **cacheable hit** | 415 / 748 | **0.554** | the unified-single-port ceiling, softened by pair fetch (a fetched longword covers two stores' issue slots) |
+| Dependent add loop, **cacheable hit** | 1137 / 1157 | **0.982** | ≈ 1.0; the gap is the taken `BF` (2 bubbles) per iteration |
+| 100 %-store loop, **cacheable hit** | 415 / 736 | **0.564** | the unified-single-port ceiling, softened by pair fetch (a fetched longword covers two stores' issue slots) |
 
 The core bench measures these ratios on every run; `HS3_tb` **asserts** them as
 cycle-exact parity laws (the SoC fabric must add zero beats), so any structural
